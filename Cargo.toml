@@ -1,0 +1,11 @@
+[package]
+name = "lassoink-capture-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Minimal Winit shell for the LassoInk Gate 0 capture probe"
+publish = false
+
+[dependencies]
+winit = { version = "=0.30.13", default-features = false }

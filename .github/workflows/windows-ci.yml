@@ -1,0 +1,50 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify M0 on Windows x64
+    runs-on: windows-2025
+    steps:
+      - name: Check out exact PR head or pushed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out head SHA
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:EXPECTED_HEAD_SHA) {
+            throw "Expected $env:EXPECTED_HEAD_SHA; got $actual"
+          }
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.100.0 --profile minimal --component clippy --component rustfmt --target x86_64-pc-windows-msvc
+
+      - name: Check formatting
+        shell: pwsh
+        run: cargo +1.100.0 fmt --all -- --check
+
+      - name: Run Clippy
+        shell: pwsh
+        run: cargo +1.100.0 clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        shell: pwsh
+        run: cargo +1.100.0 test --locked --workspace
+
+      - name: Build
+        shell: pwsh
+        run: cargo +1.100.0 build --locked --workspace
