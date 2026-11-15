@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   verify:
-    name: Verify M0 on Windows x64
+    name: Verify M1 stage 1 on Windows x64
     runs-on: windows-2025
     steps:
       - name: Check out exact PR head or pushed commit

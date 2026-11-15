@@ -2,10 +2,19 @@
 name = "lassoink-capture-probe"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.100"
 license = "Apache-2.0"
 description = "Minimal Winit shell for the LassoInk Gate 0 capture probe"
 publish = false
 
 [dependencies]
 winit = { version = "=0.30.13", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "=0.52.0", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_WindowsAndMessaging",
+] }
