@@ -30,10 +30,10 @@ use windows_sys::Win32::{
 };
 
 use crate::win32_pointer::{
-    CaptureMode, CaptureSource, HookMessageMetadata, ProbeRecord, ProbeState, WintabContextConfig,
-    WintabControlNotification, WintabCoordinateSpace, WintabFunction, WintabIssue,
-    WintabPacketBatch, WintabPacketOperation, WintabPacketSample, WintabPacketTimeMode,
-    WintabStatus,
+    CaptureMode, CaptureSource, HookMessageMetadata, LifecycleEventKind, LifecycleEventRecord,
+    ProbeRecord, ProbeState, WintabContextConfig, WintabControlNotification, WintabCoordinateSpace,
+    WintabFunction, WintabIssue, WintabPacketBatch, WintabPacketOperation, WintabPacketSample,
+    WintabPacketTimeMode, WintabStatus, wintab_packet_hook_may_drain,
 };
 
 const SYSTEM_DIRECTORY_CAPACITY: usize = 260;
@@ -158,6 +158,18 @@ struct QueueRange {
     available: u32,
     issue: Option<WintabIssue>,
     zero_range_ambiguous: bool,
+}
+
+#[derive(Clone, Copy)]
+struct WintabIssueProvenance {
+    message_sequence: u64,
+    message_id_raw: u32,
+    message_hwnd_raw_session_scoped: Option<isize>,
+    message_wparam_raw: Option<usize>,
+    message_lparam_raw: Option<isize>,
+    message_time_ms_raw: Option<u32>,
+    app_observed_elapsed_ns: Option<u128>,
+    status: WintabStatus,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -481,10 +493,15 @@ pub(crate) struct WintabCapture {
     queue_capacity_raw: Option<i32>,
     message_base_raw: Option<u32>,
     last_packet_serial_raw: Option<u32>,
+    app_clock_origin: Option<Instant>,
 }
 
 impl WintabCapture {
-    pub(crate) fn new(mode: CaptureMode, state: &mut ProbeState) -> Self {
+    pub(crate) fn new(
+        mode: CaptureMode,
+        app_clock_origin: Instant,
+        state: &mut ProbeState,
+    ) -> Self {
         if mode != CaptureMode::Wintab {
             let capture = Self::empty(WintabStatus::NotSelected);
             capture.update_probe_configuration(state);
@@ -513,18 +530,26 @@ impl WintabCapture {
                     queue_capacity_raw: None,
                     message_base_raw: None,
                     last_packet_serial_raw: None,
+                    app_clock_origin: Some(app_clock_origin),
                 };
                 capture.update_probe_configuration(state);
                 capture
             }
-            Err(issue) => {
-                let mut capture = Self::empty(WintabStatus::Unavailable);
-                capture.latest_issue = Some(issue);
-                capture.update_probe_configuration(state);
-                capture.record_issue(state, issue, 0, 0, None, WintabStatus::Unavailable);
-                capture
-            }
+            Err(issue) => Self::unavailable_from_load_error(issue, app_clock_origin, state),
         }
+    }
+
+    fn unavailable_from_load_error(
+        issue: WintabIssue,
+        app_clock_origin: Instant,
+        state: &mut ProbeState,
+    ) -> Self {
+        let mut capture = Self::empty(WintabStatus::Unavailable);
+        capture.app_clock_origin = Some(app_clock_origin);
+        capture.latest_issue = Some(issue);
+        capture.update_probe_configuration(state);
+        capture.record_issue(state, issue, 0, 0, None, WintabStatus::Unavailable);
+        capture
     }
 
     fn empty(status: WintabStatus) -> Self {
@@ -548,6 +573,7 @@ impl WintabCapture {
             queue_capacity_raw: None,
             message_base_raw: None,
             last_packet_serial_raw: None,
+            app_clock_origin: None,
         }
     }
 
@@ -756,6 +782,7 @@ impl WintabCapture {
             message_hwnd_raw_session_scoped: notification.message_hwnd_raw_session_scoped,
             wparam_raw: notification.wparam_raw,
             lparam_raw: notification.lparam_raw,
+            message_time_ms_raw: None,
             pointer_id: 0,
         };
 
@@ -769,18 +796,32 @@ impl WintabCapture {
                 self.context = None;
                 self.context_configuration_stale = true;
                 self.stop_requested = true;
-                self.record_issue(
+                self.record_issue_with_raw(
                     state,
                     WintabIssue::ContextClosed,
-                    0,
-                    notification.message_id_raw,
-                    Some(notification.message_hwnd_raw_session_scoped),
-                    WintabStatus::Unavailable,
+                    WintabIssueProvenance {
+                        message_sequence: 0,
+                        message_id_raw: notification.message_id_raw,
+                        message_hwnd_raw_session_scoped: Some(
+                            notification.message_hwnd_raw_session_scoped,
+                        ),
+                        message_wparam_raw: Some(notification.wparam_raw),
+                        message_lparam_raw: Some(notification.lparam_raw),
+                        message_time_ms_raw: None,
+                        app_observed_elapsed_ns: Some(notification.app_observed_elapsed_ns),
+                        status: WintabStatus::Unavailable,
+                    },
                 );
             } else if notification.message_id_raw == message_base + 3 && context_matches {
                 self.context_configuration_stale = true;
                 self.stop_requested = true;
-                self.set_partial(WintabIssue::ContextConfigurationChanged, 0, metadata, state);
+                self.set_partial_at(
+                    WintabIssue::ContextConfigurationChanged,
+                    0,
+                    metadata,
+                    Some(notification.app_observed_elapsed_ns),
+                    state,
+                );
             } else if notification.message_id_raw == message_base + 4 {
                 if let Some(context) = self.context {
                     let related_context = notification.wparam_raw as isize;
@@ -795,13 +836,14 @@ impl WintabCapture {
                     if disposition == ContextOverlapDisposition::Changed {
                         self.context_configuration_stale = true;
                         self.stop_requested = true;
-                        self.set_partial(
+                        self.set_partial_at(
                             WintabIssue::ContextOverlapChanged {
                                 related_context_raw_session_scoped: related_context,
                                 context_status_raw: notification.lparam_raw as u32,
                             },
                             0,
                             metadata,
+                            Some(notification.app_observed_elapsed_ns),
                             state,
                         );
                     }
@@ -809,13 +851,21 @@ impl WintabCapture {
             } else if notification.message_id_raw == message_base + 6 {
                 self.context_configuration_stale = true;
                 self.stop_requested = true;
-                self.record_issue(
+                self.record_issue_with_raw(
                     state,
                     WintabIssue::ContextInformationChanged,
-                    0,
-                    notification.message_id_raw,
-                    Some(notification.message_hwnd_raw_session_scoped),
-                    WintabStatus::Partial,
+                    WintabIssueProvenance {
+                        message_sequence: 0,
+                        message_id_raw: notification.message_id_raw,
+                        message_hwnd_raw_session_scoped: Some(
+                            notification.message_hwnd_raw_session_scoped,
+                        ),
+                        message_wparam_raw: Some(notification.wparam_raw),
+                        message_lparam_raw: Some(notification.lparam_raw),
+                        message_time_ms_raw: None,
+                        app_observed_elapsed_ns: Some(notification.app_observed_elapsed_ns),
+                        status: WintabStatus::Partial,
+                    },
                 );
             }
         }
@@ -855,9 +905,6 @@ impl WintabCapture {
         if !self.packet_capture_enabled() {
             return;
         }
-        if control_pending.load(Ordering::Acquire) {
-            return;
-        }
         let Some(queue_trigger) = queue_trigger(metadata, message_base, context) else {
             return;
         };
@@ -871,11 +918,42 @@ impl WintabCapture {
             }
             WintabQueueTrigger::Proximity => None,
         };
-        if control_pending.load(Ordering::Acquire) {
+        let lifecycle_kind = match queue_trigger {
+            WintabQueueTrigger::Packet { .. } => LifecycleEventKind::WintabPacketNotification,
+            WintabQueueTrigger::Proximity => {
+                if (metadata.lparam_raw as u32 & 0xffff) != 0 {
+                    LifecycleEventKind::WintabProximityEnter
+                } else {
+                    LifecycleEventKind::WintabProximityLeave
+                }
+            }
+        };
+        state.record(ProbeRecord::Lifecycle(LifecycleEventRecord {
+            source: CaptureSource::WintabPacket,
+            kind: lifecycle_kind,
+            app_observed_elapsed_ns,
+            message_id_raw: Some(metadata.message_id_raw),
+            message_hwnd_raw_session_scoped: Some(metadata.message_hwnd_raw_session_scoped),
+            wparam_raw: Some(metadata.wparam_raw),
+            lparam_raw: Some(metadata.lparam_raw),
+            native_message_time_ms_raw: metadata.message_time_ms_raw,
+            pointer_id_raw: None,
+            winit_device_id_debug: None,
+            event_loop_wait_start_elapsed_ns: None,
+            event_loop_requested_resume_elapsed_ns: None,
+            event_loop_wake_lateness_ns: None,
+            controlled_stall_duration_ns: None,
+            issue_debug: None,
+        }));
+        if !state.can_capture() {
+            self.request_close_after_storage_limit(state);
+            return;
+        }
+        if !wintab_packet_hook_may_drain(control_pending) {
             return;
         }
         let initial_range_result = self.queue_range(context, api, notification_serial_raw);
-        if control_pending.load(Ordering::Acquire) {
+        if !wintab_packet_hook_may_drain(control_pending) {
             self.note_control_transition_during_drain(
                 WintabPacketOperation::QueueQuery,
                 None,
@@ -958,13 +1036,13 @@ impl WintabCapture {
         let mut batch_control_transition_observed = false;
         let mut interrupted_by_control: Option<(WintabPacketOperation, Option<u32>)> = None;
         while drain_rounds < MAX_DRAIN_ROUNDS && drained_packets < output_capacity {
-            if control_pending.load(Ordering::Acquire) {
+            if !wintab_packet_hook_may_drain(control_pending) {
                 interrupted_by_control = Some((WintabPacketOperation::QueueQuery, None));
                 break;
             }
             drain_rounds = drain_rounds.saturating_add(1);
             let current_range_result = self.queue_range(context, api, notification_serial_raw);
-            if control_pending.load(Ordering::Acquire) {
+            if !wintab_packet_hook_may_drain(control_pending) {
                 if let Err(issue) = current_range_result {
                     retain_issue(&mut packet_issue, &mut secondary_issue, issue);
                 }
@@ -998,7 +1076,7 @@ impl WintabCapture {
             if request_count == 0 {
                 break;
             }
-            if control_pending.load(Ordering::Acquire) {
+            if !wintab_packet_hook_may_drain(control_pending) {
                 interrupted_by_control = Some((WintabPacketOperation::PacketRead, None));
                 break;
             }
@@ -1012,7 +1090,7 @@ impl WintabCapture {
                     packet_buffer.as_mut_ptr().cast::<WintabPacketLayout>(),
                 )
             };
-            if control_pending.load(Ordering::Acquire) {
+            if !wintab_packet_hook_may_drain(control_pending) {
                 let reported_packets = if returned >= 0 && returned as u32 <= request_count {
                     let count = returned as u32;
                     if count > 0 {
@@ -1119,6 +1197,7 @@ impl WintabCapture {
                 message_sequence,
                 message_id_raw: metadata.message_id_raw,
                 message_hwnd_raw_session_scoped: metadata.message_hwnd_raw_session_scoped,
+                message_time_ms_raw: metadata.message_time_ms_raw,
                 message_wparam_raw: metadata.wparam_raw,
                 message_lparam_raw: metadata.lparam_raw,
                 context_handle_raw_session_scoped: context,
@@ -1157,7 +1236,7 @@ impl WintabCapture {
             return;
         }
         if drained_packets == output_capacity || drain_rounds == MAX_DRAIN_ROUNDS {
-            if control_pending.load(Ordering::Acquire) {
+            if !wintab_packet_hook_may_drain(control_pending) {
                 self.note_control_transition_during_drain(
                     WintabPacketOperation::QueueQuery,
                     None,
@@ -1168,7 +1247,7 @@ impl WintabCapture {
                 return;
             }
             let after_drain_result = self.queue_range(context, api, notification_serial_raw);
-            if control_pending.load(Ordering::Acquire) {
+            if !wintab_packet_hook_may_drain(control_pending) {
                 if let Some(issue) = packet_issue {
                     self.set_partial(issue, message_sequence, metadata, state);
                 }
@@ -1230,6 +1309,7 @@ impl WintabCapture {
                         .unwrap_or(0),
                     wparam_raw: 0,
                     lparam_raw: 0,
+                    message_time_ms_raw: None,
                     pointer_id: 0,
                 },
                 state,
@@ -1399,6 +1479,10 @@ impl WintabCapture {
         self.latest_issue
     }
 
+    pub(crate) fn context_config_snapshot(&self) -> Option<WintabContextConfig> {
+        self.context_config
+    }
+
     fn packet_capture_enabled(&self) -> bool {
         self.context.is_some() && !self.context_configuration_stale && !self.stop_requested
     }
@@ -1430,6 +1514,23 @@ impl WintabCapture {
         metadata: HookMessageMetadata,
         state: &mut ProbeState,
     ) {
+        self.set_partial_at(
+            issue,
+            message_sequence,
+            metadata,
+            self.app_elapsed_now(),
+            state,
+        );
+    }
+
+    fn set_partial_at(
+        &mut self,
+        issue: WintabIssue,
+        message_sequence: u64,
+        metadata: HookMessageMetadata,
+        app_observed_elapsed_ns: Option<u128>,
+        state: &mut ProbeState,
+    ) {
         self.status = WintabStatus::Partial;
         self.latest_issue = Some(issue);
         self.update_probe_configuration(state);
@@ -1438,6 +1539,10 @@ impl WintabCapture {
             message_sequence,
             message_id_raw: metadata.message_id_raw,
             message_hwnd_raw_session_scoped: Some(metadata.message_hwnd_raw_session_scoped),
+            message_wparam_raw: Some(metadata.wparam_raw),
+            message_lparam_raw: Some(metadata.lparam_raw),
+            message_time_ms_raw: metadata.message_time_ms_raw,
+            app_observed_elapsed_ns,
             issue,
         });
         if !state.can_capture() {
@@ -1475,19 +1580,50 @@ impl WintabCapture {
         message_hwnd_raw_session_scoped: Option<isize>,
         status: WintabStatus,
     ) {
-        self.status = status;
+        self.record_issue_with_raw(
+            state,
+            issue,
+            WintabIssueProvenance {
+                message_sequence,
+                message_id_raw,
+                message_hwnd_raw_session_scoped,
+                message_wparam_raw: None,
+                message_lparam_raw: None,
+                message_time_ms_raw: None,
+                app_observed_elapsed_ns: self.app_elapsed_now(),
+                status,
+            },
+        );
+    }
+
+    fn record_issue_with_raw(
+        &mut self,
+        state: &mut ProbeState,
+        issue: WintabIssue,
+        provenance: WintabIssueProvenance,
+    ) {
+        self.status = provenance.status;
         self.latest_issue = Some(issue);
         self.update_probe_configuration(state);
         state.record(ProbeRecord::WintabIssue {
             source: CaptureSource::WintabPacket,
-            message_sequence,
-            message_id_raw,
-            message_hwnd_raw_session_scoped,
+            message_sequence: provenance.message_sequence,
+            message_id_raw: provenance.message_id_raw,
+            message_hwnd_raw_session_scoped: provenance.message_hwnd_raw_session_scoped,
+            message_wparam_raw: provenance.message_wparam_raw,
+            message_lparam_raw: provenance.message_lparam_raw,
+            message_time_ms_raw: provenance.message_time_ms_raw,
+            app_observed_elapsed_ns: provenance.app_observed_elapsed_ns,
             issue,
         });
         if !state.can_capture() {
             self.request_close_after_storage_limit(state);
         }
+    }
+
+    fn app_elapsed_now(&self) -> Option<u128> {
+        self.app_clock_origin
+            .map(|origin| origin.elapsed().as_nanos())
     }
 
     fn update_probe_configuration(&self, state: &mut ProbeState) {
@@ -2200,6 +2336,7 @@ mod tests {
             message_hwnd_raw_session_scoped: 0x3344,
             wparam_raw: context as usize,
             lparam_raw: 0x0001_0001,
+            message_time_ms_raw: None,
             pointer_id: 0,
         };
         assert_eq!(
@@ -2216,6 +2353,7 @@ mod tests {
             message_hwnd_raw_session_scoped: 0x3344,
             wparam_raw: 0xffff,
             lparam_raw: context,
+            message_time_ms_raw: None,
             pointer_id: 0,
         };
         assert_eq!(
@@ -2271,6 +2409,49 @@ mod tests {
 
         assert!(capture.stop_close_attempted);
         assert_eq!(capture.status(), WintabStatus::Partial);
+    }
+
+    #[test]
+    fn unavailable_wintab_startup_issue_has_app_arrival_and_null_message_fields() {
+        let mut state = ProbeState::default();
+        state.set_capture_mode(CaptureMode::Wintab);
+        let issue = WintabIssue::SystemPathUnavailable { win32_error: 2 };
+        let origin = Instant::now() - Duration::from_secs(1);
+        let capture = WintabCapture::unavailable_from_load_error(issue, origin, &mut state);
+
+        assert_eq!(capture.status(), WintabStatus::Unavailable);
+        let issue_record = state
+            .retained_records()
+            .iter()
+            .find_map(|record| match record {
+                ProbeRecord::WintabIssue {
+                    issue: recorded_issue,
+                    app_observed_elapsed_ns,
+                    message_id_raw,
+                    message_hwnd_raw_session_scoped,
+                    message_wparam_raw,
+                    message_lparam_raw,
+                    message_time_ms_raw,
+                    ..
+                } => Some((
+                    *recorded_issue,
+                    *app_observed_elapsed_ns,
+                    *message_id_raw,
+                    *message_hwnd_raw_session_scoped,
+                    *message_wparam_raw,
+                    *message_lparam_raw,
+                    *message_time_ms_raw,
+                )),
+                _ => None,
+            })
+            .expect("Wintab load failure should be retained as a startup issue");
+        assert_eq!(issue_record.0, issue);
+        assert!(issue_record.1.is_some_and(|elapsed| elapsed > 0));
+        assert_eq!(issue_record.2, 0);
+        assert_eq!(issue_record.3, None);
+        assert_eq!(issue_record.4, None);
+        assert_eq!(issue_record.5, None);
+        assert_eq!(issue_record.6, None);
     }
 
     #[test]
@@ -2530,6 +2711,7 @@ mod tests {
                 message_hwnd_raw_session_scoped: message.hwnd,
                 wparam_raw: message.wParam,
                 lparam_raw: message.lParam,
+                message_time_ms_raw: Some(message.time),
                 pointer_id: 0,
             },
             10,
@@ -2608,6 +2790,7 @@ mod tests {
                     message_hwnd_raw_session_scoped: packet_message.hwnd,
                     wparam_raw: packet_message.wParam,
                     lparam_raw: packet_message.lParam,
+                    message_time_ms_raw: Some(packet_message.time),
                     pointer_id: 0,
                 },
                 20,
@@ -2665,6 +2848,7 @@ mod tests {
                 message_hwnd_raw_session_scoped: window.0,
                 wparam_raw: 1,
                 lparam_raw: context,
+                message_time_ms_raw: None,
                 pointer_id: 0,
             },
             41,
@@ -2724,6 +2908,7 @@ mod tests {
                 message_hwnd_raw_session_scoped: window.0,
                 wparam_raw: 1,
                 lparam_raw: context,
+                message_time_ms_raw: None,
                 pointer_id: 0,
             },
             42,
@@ -2889,6 +3074,7 @@ mod tests {
             message_hwnd_raw_session_scoped: 0x3344,
             wparam_raw: context as usize,
             lparam_raw: 1,
+            message_time_ms_raw: None,
             pointer_id: 0,
         };
         assert_eq!(

@@ -22,13 +22,15 @@ use windows_sys::Win32::{
     Foundation::{BOOL, GetLastError, HMODULE},
     System::{
         LibraryLoader::{GetModuleHandleW, GetProcAddress},
-        Performance::QueryPerformanceFrequency,
+        Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
     },
     UI::{
         Input::Pointer::POINTER_PEN_INFO,
         WindowsAndMessaging::{
             MSG, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, POINTER_INPUT_TYPE, PT_PEN,
-            WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
+            WM_POINTERCAPTURECHANGED, WM_POINTERDEVICECHANGE, WM_POINTERDEVICEINRANGE,
+            WM_POINTERDEVICEOUTOFRANGE, WM_POINTERDOWN, WM_POINTERENTER, WM_POINTERLEAVE,
+            WM_POINTERUP, WM_POINTERUPDATE,
         },
     },
 };
@@ -64,7 +66,9 @@ const MAX_RETAINED_SAMPLES: u64 = 131_072;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CaptureSource {
     DirectWmPointerPenHistory,
+    DirectWin32Lifecycle,
     PublicWinitWindowEvent,
+    ApplicationLifecycle,
     WintabPacket,
     WintabControlNotification,
 }
@@ -369,6 +373,7 @@ pub(crate) struct WintabPacketBatch {
     pub message_id_raw: u32,
     /// Opaque Wintab-message owner HWND value scoped to this process/session.
     pub message_hwnd_raw_session_scoped: isize,
+    pub message_time_ms_raw: Option<u32>,
     pub message_wparam_raw: usize,
     pub message_lparam_raw: isize,
     /// Opaque pointer-sized HCTX value scoped to this context/session.
@@ -440,6 +445,12 @@ pub(crate) enum CaptureIssue {
     QpcFrequencyUnavailable {
         win32_error: u32,
     },
+    QpcCounterUnavailable {
+        win32_error: u32,
+    },
+    SessionOutputFailed {
+        stage: SessionOutputStage,
+    },
     NullMessagePointer,
     InvalidPointerId,
     EmptyHistory,
@@ -479,6 +490,16 @@ pub(crate) enum CaptureIssue {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionOutputStage {
+    CreateDirectory,
+    CreateFile,
+    Write,
+    Flush,
+    Sync,
+    Finalize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PressureValidity {
     NotReported,
     Valid,
@@ -493,6 +514,14 @@ fn pressure_validity(pen_mask: u32, pressure_raw: u32) -> PressureValidity {
     } else {
         PressureValidity::Valid
     }
+}
+
+pub(crate) fn is_valid_direct_pen_sample(sample: &OwnedPointerSample) -> bool {
+    sample.pointer_type_raw == PT_PEN
+        && sample.attribution == PointerAttribution::MatchesRequestedPointer
+        && sample.pen_mask_raw & PEN_MASK_PRESSURE != 0
+        && sample.pressure_validity == PressureValidity::Valid
+        && sample.pressure_raw <= MAX_NATIVE_PRESSURE
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -535,8 +564,57 @@ pub(crate) enum PointerAttribution {
 pub(crate) enum SampleValidationIssue {
     PointerIdMismatch { requested: u32, reported: u32 },
     UnexpectedPointerType { reported: POINTER_INPUT_TYPE },
+    PressureMaskMissing,
     PressureOutOfRange { raw: u32 },
     UnexpectedTiltMask { raw_mask: u32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LifecycleEventKind {
+    DirectPointerEnter,
+    DirectPointerLeave,
+    DirectPointerCaptureChanged,
+    DirectPointerDeviceChanged,
+    DirectPointerDeviceInRange,
+    DirectPointerDeviceOutOfRange,
+    WintabPacketNotification,
+    WintabProximityEnter,
+    WintabProximityLeave,
+    WindowFocusGained,
+    WindowFocusLost,
+    WindowCloseRequested,
+    InputDeviceAdded,
+    InputDeviceRemoved,
+    EventLoopWake,
+    ControlledStallStart,
+    ControlledStallEnd,
+    StartupIssue,
+    WindowInitializationFailed,
+    EventLoopFailed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LifecycleEventRecord {
+    pub source: CaptureSource,
+    pub kind: LifecycleEventKind,
+    /// Application monotonic-arrival time only; never a native sample clock.
+    pub app_observed_elapsed_ns: u128,
+    pub message_id_raw: Option<u32>,
+    /// Opaque process/session-scoped HWND; never dereferenced or owned.
+    pub message_hwnd_raw_session_scoped: Option<isize>,
+    pub wparam_raw: Option<usize>,
+    pub lparam_raw: Option<isize>,
+    /// Raw wrapping `MSG.time` for queued messages only. Sent subclass events
+    /// leave this null because no hook `MSG` timestamp exists.
+    pub native_message_time_ms_raw: Option<u32>,
+    pub pointer_id_raw: Option<u32>,
+    /// Winit device ID's diagnostic representation; not stable across runs.
+    pub winit_device_id_debug: Option<String>,
+    pub event_loop_wait_start_elapsed_ns: Option<u128>,
+    pub event_loop_requested_resume_elapsed_ns: Option<u128>,
+    pub event_loop_wake_lateness_ns: Option<u128>,
+    pub controlled_stall_duration_ns: Option<u128>,
+    pub issue_debug: Option<String>,
 }
 
 /// One owned `POINTER_PEN_INFO` record. `frame_id_raw` is the uninterpreted,
@@ -591,10 +669,14 @@ pub(crate) struct DirectPenHistoryBatch {
     /// Opaque `MSG.hwnd` value scoped to this process/session only. Do not
     /// dereference, own, close, or treat it as stable across sessions.
     pub message_hwnd_raw_session_scoped: isize,
+    pub message_time_ms_raw: Option<u32>,
     pub message_kind: PointerMessageKind,
     pub pointer_id_requested: u32,
     /// App `Instant` elapsed time observed at hook entry; not mixed with native time.
     pub hook_observed_elapsed_ns: u128,
+    /// Host QPC sampled in the hook for message-receipt-to-hook queue age only.
+    pub hook_qpc_count_raw: Option<u64>,
+    pub hook_qpc_issue: Option<CaptureIssue>,
     /// QPC counts per second sampled once at probe startup.
     pub qpc_frequency_hz: Option<u64>,
     pub native_history_count: u32,
@@ -607,6 +689,7 @@ pub(crate) enum ProbeRecord {
     StartupIssue(CaptureIssue),
     DirectPenHistory(DirectPenHistoryBatch),
     PublicWinitEvent(PublicWinitEventRecord),
+    Lifecycle(LifecycleEventRecord),
     WintabPackets(WintabPacketBatch),
     WintabControlNotification(WintabControlNotification),
     WintabIssue {
@@ -614,6 +697,10 @@ pub(crate) enum ProbeRecord {
         message_sequence: u64,
         message_id_raw: u32,
         message_hwnd_raw_session_scoped: Option<isize>,
+        message_wparam_raw: Option<usize>,
+        message_lparam_raw: Option<isize>,
+        message_time_ms_raw: Option<u32>,
+        app_observed_elapsed_ns: Option<u128>,
         issue: WintabIssue,
     },
     IgnoredNonPenPointer {
@@ -622,6 +709,9 @@ pub(crate) enum ProbeRecord {
         message_id_raw: u32,
         /// Opaque `MSG.hwnd` value scoped to this process/session only.
         message_hwnd_raw_session_scoped: isize,
+        message_wparam_raw: usize,
+        message_lparam_raw: isize,
+        message_time_ms_raw: Option<u32>,
         message_kind: PointerMessageKind,
         pointer_id: u32,
         pointer_type_raw: POINTER_INPUT_TYPE,
@@ -634,6 +724,9 @@ pub(crate) enum ProbeRecord {
         /// `None` means no readable `MSG` pointer was supplied by Winit.
         /// Otherwise this is an opaque process/session-scoped HWND value.
         message_hwnd_raw_session_scoped: Option<isize>,
+        message_wparam_raw: Option<usize>,
+        message_lparam_raw: Option<isize>,
+        message_time_ms_raw: Option<u32>,
         message_kind: Option<PointerMessageKind>,
         pointer_id: Option<u32>,
         hook_observed_elapsed_ns: u128,
@@ -648,6 +741,18 @@ pub(crate) struct ProbeSummary {
     pub qpc_frequency_hz: Option<u64>,
     pub history_batches: u64,
     pub samples: u64,
+    pub valid_direct_pen_samples: u64,
+    pub invalid_direct_pen_samples: u64,
+    pub validation_anomaly_samples: u64,
+    pub validation_issue_count: u64,
+    pub pressure_mask_missing_samples: u64,
+    pub pressure_out_of_range_samples: u64,
+    pub pointer_id_mismatch_samples: u64,
+    pub unexpected_pointer_type_samples: u64,
+    pub unexpected_tilt_mask_samples: u64,
+    pub uncertain_wintab_packets: u64,
+    pub qpc_counter_failures: u64,
+    pub lifecycle_events: u64,
     pub issues: u64,
     pub ignored_non_pen_pointers: u64,
     pub public_events: u64,
@@ -679,6 +784,7 @@ pub(crate) enum StorageLimit {
     Samples,
     NativeHistory,
     Allocation,
+    SessionOutput,
     Multiple,
 }
 
@@ -921,6 +1027,26 @@ impl ProbeState {
         &self.records
     }
 
+    pub(crate) fn pending_records(&self) -> &[ProbeRecord] {
+        &self.records
+    }
+
+    pub(crate) fn clear_pending_records_after_write(&mut self) {
+        self.records.clear();
+    }
+
+    pub(crate) fn mark_session_output_failed(&mut self, stage: SessionOutputStage) {
+        let issue = CaptureIssue::SessionOutputFailed { stage };
+        self.summary.issues = self.summary.issues.saturating_add(1);
+        self.summary.latest_startup_issue = Some(issue);
+        self.summary.latest_incomplete_issue = Some(issue);
+        self.summary.storage_limit = Some(if self.summary.storage_limit.is_some() {
+            StorageLimit::Multiple
+        } else {
+            StorageLimit::SessionOutput
+        });
+    }
+
     pub(crate) fn remaining_sample_capacity(&self) -> u64 {
         MAX_RETAINED_SAMPLES.saturating_sub(
             self.summary
@@ -943,7 +1069,7 @@ impl ProbeState {
             ProbeRecord::WintabPackets(batch) => batch.packets.len() as u64,
             _ => 0,
         };
-        let record_limit_reached = self.records.len() >= max_records;
+        let record_limit_reached = self.summary.records_retained >= max_records as u64;
         let retained_sample_count = self
             .summary
             .samples
@@ -974,7 +1100,8 @@ impl ProbeState {
         if record_limit_reached || sample_limit_exceeded {
             self.summary.records_not_retained = self.summary.records_not_retained.saturating_add(1);
             if incoming_samples > 0 {
-                let remaining_records = max_records.saturating_sub(self.records.len()) as u64;
+                let remaining_records =
+                    (max_records as u64).saturating_sub(self.summary.records_retained);
                 let remaining_samples = max_samples.saturating_sub(retained_sample_count);
                 if let ProbeRecord::WintabPackets(_) = &record {
                     let issue = WintabIssue::RetainedDataLimitExceeded {
@@ -1026,9 +1153,7 @@ impl ProbeState {
         }
 
         if self.records.try_reserve(1).is_err() {
-            let requested_records = u64::try_from(self.records.len())
-                .unwrap_or(u64::MAX)
-                .saturating_add(1);
+            let requested_records = self.summary.records_retained.saturating_add(1);
             self.account_record_allocation_failure(
                 &record,
                 CaptureIssue::RecordAllocationFailed { requested_records },
@@ -1070,12 +1195,70 @@ impl ProbeState {
                     .summary
                     .samples
                     .saturating_add(batch.samples.len() as u64);
+                if batch.hook_qpc_issue.is_some() {
+                    self.summary.qpc_counter_failures =
+                        self.summary.qpc_counter_failures.saturating_add(1);
+                }
+                for sample in &batch.samples {
+                    let issues = &sample.validation_issues;
+                    if !issues.is_empty() {
+                        self.summary.validation_anomaly_samples =
+                            self.summary.validation_anomaly_samples.saturating_add(1);
+                        self.summary.validation_issue_count = self
+                            .summary
+                            .validation_issue_count
+                            .saturating_add(issues.len() as u64);
+                    }
+                    if issues.contains(&SampleValidationIssue::PressureMaskMissing) {
+                        self.summary.pressure_mask_missing_samples =
+                            self.summary.pressure_mask_missing_samples.saturating_add(1);
+                    }
+                    if issues.iter().any(|issue| {
+                        matches!(issue, SampleValidationIssue::PressureOutOfRange { .. })
+                    }) {
+                        self.summary.pressure_out_of_range_samples =
+                            self.summary.pressure_out_of_range_samples.saturating_add(1);
+                    }
+                    if issues.iter().any(|issue| {
+                        matches!(issue, SampleValidationIssue::PointerIdMismatch { .. })
+                    }) {
+                        self.summary.pointer_id_mismatch_samples =
+                            self.summary.pointer_id_mismatch_samples.saturating_add(1);
+                    }
+                    if issues.iter().any(|issue| {
+                        matches!(issue, SampleValidationIssue::UnexpectedPointerType { .. })
+                    }) {
+                        self.summary.unexpected_pointer_type_samples = self
+                            .summary
+                            .unexpected_pointer_type_samples
+                            .saturating_add(1);
+                    }
+                    if issues.iter().any(|issue| {
+                        matches!(issue, SampleValidationIssue::UnexpectedTiltMask { .. })
+                    }) {
+                        self.summary.unexpected_tilt_mask_samples =
+                            self.summary.unexpected_tilt_mask_samples.saturating_add(1);
+                    }
+                    if is_valid_direct_pen_sample(sample) {
+                        self.summary.valid_direct_pen_samples =
+                            self.summary.valid_direct_pen_samples.saturating_add(1);
+                    } else {
+                        self.summary.invalid_direct_pen_samples =
+                            self.summary.invalid_direct_pen_samples.saturating_add(1);
+                    }
+                }
             }
             ProbeRecord::WintabPackets(batch) => {
                 self.summary.wintab_packets = self
                     .summary
                     .wintab_packets
                     .saturating_add(batch.packets.len() as u64);
+                if batch.control_transition_observed_during_read {
+                    self.summary.uncertain_wintab_packets = self
+                        .summary
+                        .uncertain_wintab_packets
+                        .saturating_add(batch.packets.len() as u64);
+                }
             }
             ProbeRecord::WintabControlNotification(_) => {
                 self.summary.wintab_control_messages =
@@ -1087,6 +1270,9 @@ impl ProbeState {
                     self.summary.public_touch_events =
                         self.summary.public_touch_events.saturating_add(1);
                 }
+            }
+            ProbeRecord::Lifecycle(_) => {
+                self.summary.lifecycle_events = self.summary.lifecycle_events.saturating_add(1);
             }
             ProbeRecord::IgnoredNonPenPointer { .. } => {
                 self.summary.ignored_non_pen_pointers =
@@ -1115,7 +1301,7 @@ impl ProbeState {
             _ => false,
         });
         self.mark_storage_limit(
-            self.records.len() >= max_records || wintab_record_limit,
+            self.summary.records_retained >= max_records as u64 || wintab_record_limit,
             self.summary
                 .samples
                 .saturating_add(self.summary.wintab_packets)
@@ -1194,6 +1380,11 @@ impl ProbeState {
                     self.summary.public_touch_events =
                         self.summary.public_touch_events.saturating_add(1);
                 }
+                self.summary.latest_incomplete_issue = Some(issue);
+            }
+            ProbeRecord::Lifecycle(_) => {
+                self.summary.issues = self.summary.issues.saturating_add(1);
+                self.summary.lifecycle_events = self.summary.lifecycle_events.saturating_add(1);
                 self.summary.latest_incomplete_issue = Some(issue);
             }
             ProbeRecord::WintabIssue {
@@ -1363,12 +1554,19 @@ struct PointerApi {
     get_pen_history: GetPointerPenInfoHistoryFn,
 }
 
+#[derive(Clone, Copy)]
+struct HookQpcObservation {
+    count_raw: Option<u64>,
+    issue: Option<CaptureIssue>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HookMessageMetadata {
     pub message_id_raw: u32,
     pub message_hwnd_raw_session_scoped: isize,
     pub wparam_raw: usize,
     pub lparam_raw: isize,
+    pub message_time_ms_raw: Option<u32>,
     pub pointer_id: u32,
 }
 
@@ -1378,6 +1576,7 @@ fn hook_message_metadata(message: &MSG) -> HookMessageMetadata {
         message_hwnd_raw_session_scoped: message.hwnd,
         wparam_raw: message.wParam,
         lparam_raw: message.lParam,
+        message_time_ms_raw: Some(message.time),
         pointer_id: (message.wParam & 0xffff) as u32,
     }
 }
@@ -1454,6 +1653,51 @@ fn query_qpc_frequency() -> Result<u64, CaptureIssue> {
     Ok(frequency as u64)
 }
 
+fn query_qpc_counter() -> Result<u64, CaptureIssue> {
+    let mut count = 0i64;
+    // SAFETY: `count` is a valid writable LARGE_INTEGER-compatible output buffer.
+    let succeeded = unsafe { QueryPerformanceCounter(&mut count) };
+    if succeeded == 0 || count < 0 {
+        return Err(CaptureIssue::QpcCounterUnavailable {
+            win32_error: win32_last_error(),
+        });
+    }
+    Ok(count as u64)
+}
+
+fn direct_lifecycle_message(message_id_raw: u32) -> Option<(LifecycleEventKind, bool)> {
+    let event = match message_id_raw {
+        WM_POINTERENTER => (LifecycleEventKind::DirectPointerEnter, true),
+        WM_POINTERLEAVE => (LifecycleEventKind::DirectPointerLeave, true),
+        WM_POINTERCAPTURECHANGED => (LifecycleEventKind::DirectPointerCaptureChanged, true),
+        WM_POINTERDEVICECHANGE => (LifecycleEventKind::DirectPointerDeviceChanged, false),
+        WM_POINTERDEVICEINRANGE => (LifecycleEventKind::DirectPointerDeviceInRange, false),
+        WM_POINTERDEVICEOUTOFRANGE => (LifecycleEventKind::DirectPointerDeviceOutOfRange, false),
+        _ => return None,
+    };
+    Some(event)
+}
+
+fn startup_issue_event(issue: CaptureIssue, app_observed_elapsed_ns: u128) -> LifecycleEventRecord {
+    LifecycleEventRecord {
+        source: CaptureSource::ApplicationLifecycle,
+        kind: LifecycleEventKind::StartupIssue,
+        app_observed_elapsed_ns,
+        message_id_raw: None,
+        message_hwnd_raw_session_scoped: None,
+        wparam_raw: None,
+        lparam_raw: None,
+        native_message_time_ms_raw: None,
+        pointer_id_raw: None,
+        winit_device_id_debug: None,
+        event_loop_wait_start_elapsed_ns: None,
+        event_loop_requested_resume_elapsed_ns: None,
+        event_loop_wake_lateness_ns: None,
+        controlled_stall_duration_ns: None,
+        issue_debug: Some(format!("{issue:?}")),
+    }
+}
+
 /// Install a synchronous Winit hook. Copy pointer history before returning
 /// `false`, which allows Winit to dispatch the public window event normally.
 pub(crate) fn install_message_hook(
@@ -1476,6 +1720,12 @@ pub(crate) fn install_message_hook(
         .set_public_pointer_type_api(public_pointer_type_api);
     if let Some(issue) = pointer_api_issue {
         state.borrow_mut().record(ProbeRecord::StartupIssue(issue));
+        state
+            .borrow_mut()
+            .record(ProbeRecord::Lifecycle(startup_issue_event(
+                issue,
+                app_clock_origin.elapsed().as_nanos(),
+            )));
     }
     let (qpc_frequency, qpc_frequency_issue) = if mode == CaptureMode::DirectWmPointer {
         match query_qpc_frequency() {
@@ -1490,6 +1740,12 @@ pub(crate) fn install_message_hook(
         .set_qpc_frequency(qpc_frequency, qpc_frequency_issue);
     if let Some(issue) = qpc_frequency_issue {
         state.borrow_mut().record(ProbeRecord::StartupIssue(issue));
+        state
+            .borrow_mut()
+            .record(ProbeRecord::Lifecycle(startup_issue_event(
+                issue,
+                app_clock_origin.elapsed().as_nanos(),
+            )));
     }
 
     let mut message_sequence = 0u64;
@@ -1506,9 +1762,14 @@ pub(crate) fn install_message_hook(
         let remaining_samples = state.borrow().remaining_sample_capacity();
         let current_sequence = message_sequence;
         let Some(next_sequence) = message_sequence.checked_add(1) else {
-            state.borrow_mut().record(ProbeRecord::StartupIssue(
-                CaptureIssue::MessageSequenceExhausted,
-            ));
+            let issue = CaptureIssue::MessageSequenceExhausted;
+            state.borrow_mut().record(ProbeRecord::StartupIssue(issue));
+            state
+                .borrow_mut()
+                .record(ProbeRecord::Lifecycle(startup_issue_event(
+                    issue,
+                    app_clock_origin.elapsed().as_nanos(),
+                )));
             return false;
         };
         message_sequence = next_sequence;
@@ -1516,8 +1777,57 @@ pub(crate) fn install_message_hook(
         // SAFETY: Winit's pointer is the current live MSG for this hook call.
         // Copy only its numeric fields; no pointer or handle ownership is kept.
         let message_metadata = unsafe { copy_message_metadata(message_pointer) };
+        let hook_qpc_observation = if mode == CaptureMode::DirectWmPointer
+            && message_metadata
+                .is_some_and(|metadata| pointer_message_kind(metadata.message_id_raw).is_some())
+        {
+            match query_qpc_counter() {
+                Ok(count) => HookQpcObservation {
+                    count_raw: Some(count),
+                    issue: None,
+                },
+                Err(issue) => HookQpcObservation {
+                    count_raw: None,
+                    issue: Some(issue),
+                },
+            }
+        } else {
+            HookQpcObservation {
+                count_raw: None,
+                issue: None,
+            }
+        };
         let mut probe_state = state.borrow_mut();
         probe_state.begin_native_dispatch(current_sequence, message_metadata);
+        if let Some(metadata) = message_metadata
+            && let Some((kind, has_pointer_id)) = direct_lifecycle_message(metadata.message_id_raw)
+        {
+            probe_state.record(ProbeRecord::Lifecycle(LifecycleEventRecord {
+                source: CaptureSource::DirectWin32Lifecycle,
+                kind,
+                app_observed_elapsed_ns: hook_observed_elapsed_ns,
+                message_id_raw: Some(metadata.message_id_raw),
+                message_hwnd_raw_session_scoped: Some(metadata.message_hwnd_raw_session_scoped),
+                wparam_raw: Some(metadata.wparam_raw),
+                lparam_raw: Some(metadata.lparam_raw),
+                native_message_time_ms_raw: metadata.message_time_ms_raw,
+                pointer_id_raw: has_pointer_id.then_some(metadata.pointer_id),
+                winit_device_id_debug: None,
+                event_loop_wait_start_elapsed_ns: None,
+                event_loop_requested_resume_elapsed_ns: None,
+                event_loop_wake_lateness_ns: None,
+                controlled_stall_duration_ns: None,
+                issue_debug: None,
+            }));
+        }
+        if !probe_state.can_capture() {
+            if mode == CaptureMode::Wintab {
+                wintab
+                    .borrow_mut()
+                    .request_close_after_storage_limit(&mut probe_state);
+            }
+            return false;
+        }
         // SAFETY: Winit's Windows hook receives a pointer to its current, live MSG
         // after PeekMessageW and before DispatchMessageW/another message retrieval.
         // capture_message borrows it only for this callback and copies all fields.
@@ -1531,6 +1841,7 @@ pub(crate) fn install_message_hook(
                         pointer_api,
                         qpc_frequency,
                         remaining_samples,
+                        hook_qpc_observation,
                     )
                 };
                 if let Some(record) = record {
@@ -1538,9 +1849,7 @@ pub(crate) fn install_message_hook(
                 }
             }
             CaptureMode::Wintab => {
-                if let Some(metadata) = message_metadata
-                    && wintab_packet_hook_may_drain(&wintab_control_pending)
-                {
+                if let Some(metadata) = message_metadata {
                     wintab.borrow_mut().handle_message(
                         metadata,
                         current_sequence,
@@ -1581,6 +1890,7 @@ unsafe fn capture_message(
     pointer_api_result: Result<PointerApi, CaptureIssue>,
     qpc_frequency_hz: Option<u64>,
     remaining_sample_capacity: u64,
+    hook_qpc_observation: HookQpcObservation,
 ) -> Option<ProbeRecord> {
     if message_pointer.is_null() {
         return Some(ProbeRecord::MessageIssue {
@@ -1588,6 +1898,9 @@ unsafe fn capture_message(
             message_sequence,
             message_id_raw: 0,
             message_hwnd_raw_session_scoped: None,
+            message_wparam_raw: None,
+            message_lparam_raw: None,
+            message_time_ms_raw: None,
             message_kind: None,
             pointer_id: None,
             hook_observed_elapsed_ns,
@@ -1649,6 +1962,9 @@ unsafe fn capture_message(
             message_sequence,
             message_id_raw,
             message_hwnd_raw_session_scoped: metadata.message_hwnd_raw_session_scoped,
+            message_wparam_raw: metadata.wparam_raw,
+            message_lparam_raw: metadata.lparam_raw,
+            message_time_ms_raw: metadata.message_time_ms_raw,
             message_kind,
             pointer_id,
             pointer_type_raw: pointer_type,
@@ -1732,9 +2048,12 @@ unsafe fn capture_message(
         message_sequence,
         message_id_raw,
         message_hwnd_raw_session_scoped: metadata.message_hwnd_raw_session_scoped,
+        message_time_ms_raw: metadata.message_time_ms_raw,
         message_kind,
         pointer_id_requested: pointer_id,
         hook_observed_elapsed_ns,
+        hook_qpc_count_raw: hook_qpc_observation.count_raw,
+        hook_qpc_issue: hook_qpc_observation.issue,
         qpc_frequency_hz,
         native_history_count,
         samples,
@@ -1754,6 +2073,9 @@ fn message_issue(
         message_sequence,
         message_id_raw: metadata.message_id_raw,
         message_hwnd_raw_session_scoped: Some(metadata.message_hwnd_raw_session_scoped),
+        message_wparam_raw: Some(metadata.wparam_raw),
+        message_lparam_raw: Some(metadata.lparam_raw),
+        message_time_ms_raw: metadata.message_time_ms_raw,
         message_kind: Some(message_kind),
         pointer_id,
         hook_observed_elapsed_ns,
@@ -1916,13 +2238,22 @@ fn own_sample(
     }
 
     let pressure_validity = pressure_validity(native.penMask, native.pressure);
-    if pressure_validity == PressureValidity::OutOfRange {
-        push_validation_issue(
-            &mut validation_issues,
-            SampleValidationIssue::PressureOutOfRange {
-                raw: native.pressure,
-            },
-        )?;
+    match pressure_validity {
+        PressureValidity::NotReported => {
+            push_validation_issue(
+                &mut validation_issues,
+                SampleValidationIssue::PressureMaskMissing,
+            )?;
+        }
+        PressureValidity::OutOfRange => {
+            push_validation_issue(
+                &mut validation_issues,
+                SampleValidationIssue::PressureOutOfRange {
+                    raw: native.pressure,
+                },
+            )?;
+        }
+        PressureValidity::Valid => {}
     }
     let tilt_mask = PEN_MASK_TILT_X | PEN_MASK_TILT_Y;
     if native.penMask & tilt_mask != 0 {
@@ -2003,10 +2334,11 @@ mod tests {
         NativeApi, PointerAttribution, PointerMessageKind, PressureValidity, ProbeRecord,
         ProbeState, PublicEventCapability, PublicMessageAssociation, PublicPenClassification,
         PublicUnclassifiedReason, PublicWinitEventData, PublicWinitEventRecord, RawPoint,
-        RawScreenPosition, StorageLimit, TouchPhase, WintabContextConfig, WintabCoordinateSpace,
-        WintabIssue, WintabPacketBatch, WintabPacketSample, WintabPacketTimeMode, WintabStatus,
-        ensure_native_history_fits, history_buffer_decision, hook_message_metadata,
-        normalize_newest_first, own_sample, pressure_validity,
+        RawScreenPosition, SampleValidationIssue, SessionOutputStage, StorageLimit, TouchPhase,
+        WintabContextConfig, WintabCoordinateSpace, WintabIssue, WintabPacketBatch,
+        WintabPacketSample, WintabPacketTimeMode, WintabStatus, ensure_native_history_fits,
+        history_buffer_decision, hook_message_metadata, normalize_newest_first, own_sample,
+        pressure_validity,
     };
     use windows_sys::Win32::{
         Foundation::BOOL,
@@ -2037,6 +2369,9 @@ mod tests {
             message_sequence: sequence,
             message_id_raw: WM_POINTERUPDATE,
             message_hwnd_raw_session_scoped: Some(0x2222),
+            message_wparam_raw: Some(7),
+            message_lparam_raw: Some(0),
+            message_time_ms_raw: Some(1),
             message_kind: Some(PointerMessageKind::Update),
             pointer_id: Some(7),
             hook_observed_elapsed_ns: sequence as u128,
@@ -2112,9 +2447,12 @@ mod tests {
             message_sequence: sequence,
             message_id_raw: WM_POINTERUPDATE,
             message_hwnd_raw_session_scoped: 0x2222,
+            message_time_ms_raw: Some(sequence as u32),
             message_kind: PointerMessageKind::Update,
             pointer_id_requested: 7,
             hook_observed_elapsed_ns: sequence as u128,
+            hook_qpc_count_raw: Some(sequence),
+            hook_qpc_issue: None,
             qpc_frequency_hz: Some(10_000_000),
             native_history_count: sample_count as u32,
             samples: vec![sample; sample_count],
@@ -2138,6 +2476,7 @@ mod tests {
             message_sequence: sequence,
             message_id_raw: 0x7ff0,
             message_hwnd_raw_session_scoped: 0x2222,
+            message_time_ms_raw: Some(sequence as u32),
             message_wparam_raw: sequence as usize,
             message_lparam_raw: 0x7777,
             context_handle_raw_session_scoped: 0x7777,
@@ -2228,6 +2567,45 @@ mod tests {
     }
 
     #[test]
+    fn missing_pressure_mask_is_visible_and_excluded_from_valid_pen_counts() {
+        // SAFETY: POINTER_PEN_INFO is a scalar-only native value; zeroed input
+        // is a valid synthetic fixture for the pure ownership/validation mapper.
+        let mut native: POINTER_PEN_INFO = unsafe { std::mem::zeroed() };
+        native.pointerInfo.pointerType = PT_PEN;
+        native.pointerInfo.pointerId = 7;
+        native.pressure = 777;
+        let sample = own_sample(native, 7, 0, 0).unwrap();
+        assert_eq!(sample.pressure_validity, PressureValidity::NotReported);
+        assert!(
+            sample
+                .validation_issues
+                .contains(&SampleValidationIssue::PressureMaskMissing)
+        );
+
+        let mut state = ProbeState::default();
+        state.record(ProbeRecord::DirectPenHistory(DirectPenHistoryBatch {
+            source: CaptureSource::DirectWmPointerPenHistory,
+            message_sequence: 1,
+            message_id_raw: WM_POINTERUPDATE,
+            message_hwnd_raw_session_scoped: 0x2222,
+            message_time_ms_raw: Some(10),
+            message_kind: PointerMessageKind::Update,
+            pointer_id_requested: 7,
+            hook_observed_elapsed_ns: 1,
+            hook_qpc_count_raw: Some(100),
+            hook_qpc_issue: None,
+            qpc_frequency_hz: Some(10_000_000),
+            native_history_count: 1,
+            samples: vec![sample],
+        }));
+        let summary = state.summary();
+        assert_eq!(summary.valid_direct_pen_samples, 0);
+        assert_eq!(summary.invalid_direct_pen_samples, 1);
+        assert_eq!(summary.validation_anomaly_samples, 1);
+        assert_eq!(summary.pressure_mask_missing_samples, 1);
+    }
+
+    #[test]
     fn per_batch_native_history_limit_is_enforced() {
         let issue = ensure_native_history_fits(MAX_HISTORY_ENTRIES + 1, 131_072).unwrap_err();
         assert_eq!(
@@ -2245,6 +2623,9 @@ mod tests {
                 message_sequence: 1,
                 message_id_raw: WM_POINTERUPDATE,
                 message_hwnd_raw_session_scoped: Some(0x2222),
+                message_wparam_raw: Some(7),
+                message_lparam_raw: Some(0),
+                message_time_ms_raw: Some(1),
                 message_kind: Some(PointerMessageKind::Update),
                 pointer_id: Some(7),
                 hook_observed_elapsed_ns: 1,
@@ -2294,6 +2675,23 @@ mod tests {
         assert_eq!(summary.records_not_retained, 0);
         assert_eq!(summary.storage_limit, Some(StorageLimit::Records));
         assert!(!state.can_capture());
+    }
+
+    #[test]
+    fn session_output_failure_marks_capture_incomplete_and_stops_input() {
+        let mut state = ProbeState::default();
+        state.mark_session_output_failed(SessionOutputStage::Write);
+        assert!(!state.can_capture());
+        assert_eq!(
+            state.summary().storage_limit,
+            Some(StorageLimit::SessionOutput)
+        );
+        assert_eq!(
+            state.summary().latest_startup_issue,
+            Some(CaptureIssue::SessionOutputFailed {
+                stage: SessionOutputStage::Write,
+            })
+        );
     }
 
     #[test]
@@ -2351,6 +2749,9 @@ mod tests {
                 message_sequence: 9,
                 message_id_raw: WM_POINTERUPDATE,
                 message_hwnd_raw_session_scoped: Some(0x2222),
+                message_wparam_raw: Some(7),
+                message_lparam_raw: Some(0),
+                message_time_ms_raw: Some(1),
                 message_kind: Some(PointerMessageKind::Update),
                 pointer_id: Some(7),
                 hook_observed_elapsed_ns: 9,
@@ -2421,6 +2822,10 @@ mod tests {
                 message_sequence: 12,
                 message_id_raw: 0x7ff0,
                 message_hwnd_raw_session_scoped: Some(0x2222),
+                message_wparam_raw: None,
+                message_lparam_raw: None,
+                message_time_ms_raw: None,
+                app_observed_elapsed_ns: None,
                 issue: WintabIssue::RetainedSampleCapacityExceeded {
                     reported_packets: 5,
                     remaining: 3,
@@ -2459,6 +2864,10 @@ mod tests {
             message_sequence: 14,
             message_id_raw: 0x7ff4,
             message_hwnd_raw_session_scoped: Some(0x2222),
+            message_wparam_raw: None,
+            message_lparam_raw: None,
+            message_time_ms_raw: None,
+            app_observed_elapsed_ns: None,
             issue,
         });
 
@@ -2489,6 +2898,10 @@ mod tests {
             message_sequence: 0,
             message_id_raw: 0,
             message_hwnd_raw_session_scoped: None,
+            message_wparam_raw: None,
+            message_lparam_raw: None,
+            message_time_ms_raw: None,
+            app_observed_elapsed_ns: None,
             issue,
         });
 
@@ -2508,6 +2921,9 @@ mod tests {
                 message_sequence: 3,
                 message_id_raw: WM_POINTERUPDATE,
                 message_hwnd_raw_session_scoped: Some(0x2222),
+                message_wparam_raw: Some(7),
+                message_lparam_raw: Some(0),
+                message_time_ms_raw: Some(3),
                 message_kind: Some(PointerMessageKind::Update),
                 pointer_id: Some(7),
                 hook_observed_elapsed_ns: 3,
@@ -2568,6 +2984,7 @@ mod tests {
             message_hwnd_raw_session_scoped: 0x2222,
             wparam_raw: 7,
             lparam_raw: 0,
+            message_time_ms_raw: None,
             pointer_id: 7,
         };
         state.begin_native_dispatch(41, Some(metadata));
@@ -2616,6 +3033,7 @@ mod tests {
             message_hwnd_raw_session_scoped: 0x2222,
             wparam_raw: 8,
             lparam_raw: 0,
+            message_time_ms_raw: None,
             pointer_id: 8,
         };
         state.begin_native_dispatch(50, Some(metadata));
@@ -2640,6 +3058,7 @@ mod tests {
             message_hwnd_raw_session_scoped: 0x2222,
             wparam_raw: 7,
             lparam_raw: 0,
+            message_time_ms_raw: None,
             pointer_id: 7,
         };
         state.begin_native_dispatch(41, Some(metadata));
@@ -2669,6 +3088,7 @@ mod tests {
             message_hwnd_raw_session_scoped: 0x2222,
             wparam_raw: 7,
             lparam_raw: 0,
+            message_time_ms_raw: None,
             pointer_id: 7,
         };
         state.begin_native_dispatch(60, Some(metadata));
