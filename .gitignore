@@ -1,0 +1,23 @@
+# Local-only planning and handoff artifacts
+/local_document/
+/local_*/
+
+# Rust build output
+/target/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDE/editor state
+/.idea/
+/.vscode/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Local logs and scratch output
+*.log
+*.tmp
