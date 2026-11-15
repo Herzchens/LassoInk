@@ -11,6 +11,10 @@ use std::{
     ffi::c_void,
     mem::{self, MaybeUninit},
     rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
@@ -28,7 +32,11 @@ use windows_sys::Win32::{
         },
     },
 };
-use winit::{event_loop::EventLoopBuilder, platform::windows::EventLoopBuilderExtWindows};
+use winit::{
+    event::{ElementState, Force, MouseButton, TouchPhase},
+    event_loop::EventLoopBuilder,
+    platform::windows::EventLoopBuilderExtWindows,
+};
 
 const USER32_DLL: [u16; 11] = [
     b'u' as u16,
@@ -56,6 +64,351 @@ const MAX_RETAINED_SAMPLES: u64 = 131_072;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CaptureSource {
     DirectWmPointerPenHistory,
+    PublicWinitWindowEvent,
+    WintabPacket,
+    WintabControlNotification,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum CaptureMode {
+    #[default]
+    DirectWmPointer,
+    Wintab,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum WintabStatus {
+    #[default]
+    NotSelected,
+    Loading,
+    Available,
+    Partial,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WintabFunction {
+    WTInfoA,
+    WTOpenA,
+    WTClose,
+    WTQueueSizeSet,
+    WTQueueSizeGet,
+    WTQueuePacketsEx,
+    WTPacketsGet,
+    WTEnable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WintabPacketOperation {
+    QueueQuery,
+    PacketRead,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WintabIssue {
+    SystemPathUnavailable {
+        win32_error: u32,
+    },
+    SystemPathTooLong {
+        required: u32,
+        capacity: u32,
+    },
+    LibraryLoadFailed {
+        win32_error: u32,
+    },
+    MissingFunction {
+        function: WintabFunction,
+    },
+    InvalidWindowHandle,
+    ContextInfoUnavailable {
+        returned_bytes: u32,
+    },
+    ContextConfigurationMismatch {
+        expected_packet_data: u32,
+        actual_packet_data: u32,
+    },
+    ContextOpenFailed,
+    ContextClosed,
+    ContextConfigurationChanged,
+    ContextInformationChanged,
+    ContextOverlapChanged {
+        related_context_raw_session_scoped: isize,
+        context_status_raw: u32,
+    },
+    ContextDisabledAfterCloseFailure {
+        queue_count_before_disable: Option<u32>,
+    },
+    ContextDisableFailed,
+    CaptureStoppedByStorageLimit,
+    ControlTransitionObservedDuringDrain {
+        operation: WintabPacketOperation,
+        returned_packets: Option<u32>,
+    },
+    ControlObserverInstallFailed {
+        win32_error: u32,
+    },
+    ControlObserverRemovalFailed {
+        win32_error: u32,
+    },
+    ControlObserverQueueOverflow {
+        dropped_messages: u64,
+    },
+    ControlObserverCallbackPanicked {
+        count: u64,
+    },
+    MessageBaseChanged {
+        requested: u32,
+        actual: u32,
+    },
+    QueueSizeSetFailed {
+        requested: i32,
+    },
+    QueueCapacityReduced {
+        requested: i32,
+        actual: i32,
+    },
+    QueueSizeUnavailable {
+        reported: i32,
+    },
+    PacketReadFailed {
+        reported: i32,
+    },
+    PacketCountInvalid {
+        reported: i32,
+        capacity: u32,
+    },
+    PacketContextMismatch {
+        expected_raw: isize,
+        reported_raw: isize,
+    },
+    PacketAllocationFailed {
+        capacity: u32,
+    },
+    QueueQueryFailed,
+    QueueCountExceedsCapacity {
+        reported: u32,
+        capacity: i32,
+    },
+    QueueSerialRangeInvalid {
+        oldest_raw: u32,
+        newest_raw: u32,
+    },
+    DrainLimitReached {
+        pending_packets_reported: Option<u32>,
+        drain_rounds: u8,
+    },
+    QueueOverflow {
+        status_raw: u32,
+    },
+    SerialDiscontinuity {
+        previous_raw: u32,
+        current_raw: u32,
+    },
+    RetainedDataLimitExceeded {
+        reported_packets: u32,
+        remaining_records: u64,
+        remaining_samples: u64,
+    },
+    RetainedSampleCapacityExceeded {
+        reported_packets: u32,
+        remaining: u64,
+    },
+    ContextCloseFailed,
+    RecordAllocationFailed {
+        requested_records: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WintabPacketTimeMode {
+    AbsoluteSystemTime,
+    RelativeMilliseconds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WintabCoordinateSpace {
+    DigitizerContextOutputCoordinates,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WintabContextConfig {
+    pub context_name_raw: [u8; 40],
+    pub options_raw: u32,
+    pub status_raw: u32,
+    pub locks_raw: u32,
+    pub message_base_raw: u32,
+    /// Wintab's numeric context device selector; its interpretation is driver-specific.
+    pub device_raw: u32,
+    pub packet_rate_raw: u32,
+    pub packet_data_raw: u32,
+    pub packet_mode_raw: u32,
+    pub move_mask_raw: u32,
+    pub button_down_mask_raw: u32,
+    pub button_up_mask_raw: u32,
+    pub input_origin_raw: [i32; 3],
+    pub input_extent_raw: [i32; 3],
+    pub output_origin_raw: [i32; 3],
+    pub output_extent_raw: [i32; 3],
+    pub sensitivity_fixed32_raw: [u32; 3],
+    pub system_mode_raw: i32,
+    pub system_origin_raw: [i32; 2],
+    pub system_extent_raw: [i32; 2],
+    pub system_sensitivity_fixed32_raw: [u32; 2],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicEventCapability {
+    TouchPhasePositionForce,
+    CursorPosition,
+    MouseButton,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicUnclassifiedReason {
+    NoMatchedNativeMessage,
+    AmbiguousOrReentrantDispatch,
+    AdditionalFrameEventUnjoined,
+    PointerTypeApiUnavailable,
+    PointerTypeQueryFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicPenClassification {
+    ConfirmedPen,
+    ConfirmedNonPen { pointer_type_raw: i32 },
+    Unclassified(PublicUnclassifiedReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PublicMessageAssociation {
+    /// Hook observation sequence for the matching dispatch; never a sample join ID.
+    pub message_sequence: u64,
+    pub message_id_raw: u32,
+    /// Opaque dispatch HWND raw value; not stable across process sessions.
+    pub message_hwnd_raw_session_scoped: isize,
+    /// Pointer ID from the exact dispatch message.
+    pub pointer_id_raw: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PublicTouchNativeMetadata {
+    pub message_association: Option<PublicMessageAssociation>,
+    pub native_pointer_type_raw: Option<i32>,
+    pub pen_classification: PublicPenClassification,
+    pub pointer_type_error_raw: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PublicWinitEventData {
+    Touch {
+        /// Winit's own device identity, distinct from native sourceDevice and
+        /// pointer ID; do not treat it as stable across sessions.
+        winit_device_id: winit::event::DeviceId,
+        /// Winit's public `Touch.id`, not a cross-source sample join key.
+        public_touch_id: u64,
+        phase: TouchPhase,
+        x_physical_px: f64,
+        y_physical_px: f64,
+        /// Exact Winit `Touch.force` representation, not physical ground truth.
+        public_winit_force: Option<Force>,
+        native_pointer_type_raw: Option<i32>,
+        pointer_type_error_raw: Option<u32>,
+        pen_classification: PublicPenClassification,
+        /// Winit exposes no native timestamp or CT430 tilt in this event.
+        native_timestamp_raw: Option<u64>,
+        tilt: Option<(f64, f64)>,
+    },
+    CursorMoved {
+        /// Winit's public device identity, separate from Win32 sourceDevice.
+        winit_device_id: winit::event::DeviceId,
+        x_physical_px: f64,
+        y_physical_px: f64,
+        native_timestamp_raw: Option<u64>,
+    },
+    MouseInput {
+        /// Winit's public device identity, separate from native device handles.
+        winit_device_id: winit::event::DeviceId,
+        state: ElementState,
+        button: MouseButton,
+        native_timestamp_raw: Option<u64>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PublicWinitEventRecord {
+    pub source: CaptureSource,
+    pub capability: PublicEventCapability,
+    pub public_event_sequence: u64,
+    /// Application monotonic-arrival elapsed time, separate from native clocks.
+    pub app_observed_elapsed_ns: u128,
+    /// Opaque process/session-scoped HWND; it is not stable across runs.
+    pub window_hwnd_raw_session_scoped: Option<isize>,
+    /// Present only for a same-dispatch, HWND and pointer-ID association.
+    pub message_association: Option<PublicMessageAssociation>,
+    pub data: PublicWinitEventData,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WintabPacketSample {
+    /// Opaque pointer-sized HCTX value scoped to this context/session.
+    pub context_handle_raw_session_scoped: isize,
+    pub status_raw: u32,
+    pub packet_time_raw: u32,
+    pub serial_number_raw: u32,
+    pub cursor_raw: u32,
+    pub buttons_raw: u32,
+    pub x_raw: i32,
+    pub y_raw: i32,
+    pub normal_pressure_raw: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WintabPacketBatch {
+    pub source: CaptureSource,
+    pub message_sequence: u64,
+    pub message_id_raw: u32,
+    /// Opaque Wintab-message owner HWND value scoped to this process/session.
+    pub message_hwnd_raw_session_scoped: isize,
+    pub message_wparam_raw: usize,
+    pub message_lparam_raw: isize,
+    /// Opaque pointer-sized HCTX value scoped to this context/session.
+    pub context_handle_raw_session_scoped: isize,
+    /// WT_PACKET supplies a serial in wParam; WT_PROXIMITY has no serial.
+    pub notification_serial_raw: Option<u32>,
+    pub context_config: WintabContextConfig,
+    pub queue_capacity_raw: i32,
+    pub coordinate_space: WintabCoordinateSpace,
+    pub packet_time_mode: WintabPacketTimeMode,
+    pub app_observed_elapsed_ns: u128,
+    /// True when a sent Wintab control callback was observed while a packet
+    /// retrieval was in flight. Retained packets are raw diagnostics and must
+    /// not be counted as confidently attributed pen samples.
+    pub control_transition_observed_during_read: bool,
+    pub packets: Vec<WintabPacketSample>,
+}
+
+/// Owned scalar provenance copied from a Wintab control-message window
+/// subclass. It carries app arrival only; sent messages have no `MSG` hook
+/// timestamp or durable hook sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WintabControlNotification {
+    pub source: CaptureSource,
+    pub observer_sequence: u64,
+    pub message_id_raw: u32,
+    /// Opaque process/session-scoped HWND passed to the subclass.
+    pub message_hwnd_raw_session_scoped: isize,
+    pub wparam_raw: usize,
+    pub lparam_raw: isize,
+    pub app_observed_elapsed_ns: u128,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActivePublicDispatch {
+    message_sequence: u64,
+    metadata: HookMessageMetadata,
+    association_used: bool,
+    pointer_type_query_attempted: bool,
+    pointer_type_query_result: Option<Result<i32, u32>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,10 +602,20 @@ pub(crate) struct DirectPenHistoryBatch {
     pub samples: Vec<OwnedPointerSample>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ProbeRecord {
     StartupIssue(CaptureIssue),
     DirectPenHistory(DirectPenHistoryBatch),
+    PublicWinitEvent(PublicWinitEventRecord),
+    WintabPackets(WintabPacketBatch),
+    WintabControlNotification(WintabControlNotification),
+    WintabIssue {
+        source: CaptureSource,
+        message_sequence: u64,
+        message_id_raw: u32,
+        message_hwnd_raw_session_scoped: Option<isize>,
+        issue: WintabIssue,
+    },
     IgnoredNonPenPointer {
         source: CaptureSource,
         message_sequence: u64,
@@ -280,12 +643,24 @@ pub(crate) enum ProbeRecord {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProbeSummary {
+    pub capture_mode: CaptureMode,
     pub pointer_api_available: bool,
     pub qpc_frequency_hz: Option<u64>,
     pub history_batches: u64,
     pub samples: u64,
     pub issues: u64,
     pub ignored_non_pen_pointers: u64,
+    pub public_events: u64,
+    pub public_touch_events: u64,
+    pub wintab_packets: u64,
+    pub wintab_control_messages: u64,
+    pub wintab_issues: u64,
+    pub wintab_status: WintabStatus,
+    pub wintab_packet_time_mode: Option<WintabPacketTimeMode>,
+    pub wintab_configured_packet_data_raw: Option<u32>,
+    pub wintab_configured_packet_mode_raw: Option<u32>,
+    pub wintab_queue_capacity_raw: Option<i32>,
+    pub latest_wintab_issue: Option<WintabIssue>,
     pub records_retained: u64,
     pub records_not_retained: u64,
     pub batches_not_retained: u64,
@@ -311,6 +686,11 @@ pub(crate) enum StorageLimit {
 pub(crate) struct ProbeState {
     records: Vec<ProbeRecord>,
     summary: ProbeSummary,
+    public_pointer_type_api: Option<GetPointerTypeFn>,
+    active_public_dispatch: Option<ActivePublicDispatch>,
+    public_callback_depth: u32,
+    public_association_ambiguous: bool,
+    next_public_event_sequence: u64,
 }
 
 impl ProbeState {
@@ -328,15 +708,228 @@ impl ProbeState {
         self.summary.qpc_frequency_issue = issue;
     }
 
-    fn can_capture(&self) -> bool {
+    pub(crate) fn set_capture_mode(&mut self, mode: CaptureMode) {
+        self.summary.capture_mode = mode;
+    }
+
+    pub(crate) fn set_wintab_configuration(
+        &mut self,
+        status: WintabStatus,
+        time_mode: Option<WintabPacketTimeMode>,
+        packet_data_raw: Option<u32>,
+        packet_mode_raw: Option<u32>,
+        queue_capacity_raw: Option<i32>,
+    ) {
+        self.summary.wintab_status = status;
+        self.summary.wintab_packet_time_mode = time_mode;
+        self.summary.wintab_configured_packet_data_raw = packet_data_raw;
+        self.summary.wintab_configured_packet_mode_raw = packet_mode_raw;
+        self.summary.wintab_queue_capacity_raw = queue_capacity_raw;
+    }
+
+    fn set_public_pointer_type_api(&mut self, api: Option<GetPointerTypeFn>) {
+        self.public_pointer_type_api = api;
+    }
+
+    fn begin_native_dispatch(
+        &mut self,
+        message_sequence: u64,
+        metadata: Option<HookMessageMetadata>,
+    ) {
+        if self.public_callback_depth > 0 {
+            self.active_public_dispatch = None;
+            self.public_association_ambiguous = true;
+            return;
+        }
+
+        self.public_association_ambiguous = false;
+        self.active_public_dispatch = metadata
+            .filter(|message| {
+                message.pointer_id != 0 && pointer_message_kind(message.message_id_raw).is_some()
+            })
+            .map(|metadata| ActivePublicDispatch {
+                message_sequence,
+                metadata,
+                association_used: false,
+                pointer_type_query_attempted: false,
+                pointer_type_query_result: None,
+            });
+    }
+
+    pub(crate) fn expire_public_dispatch_candidate(&mut self) {
+        self.active_public_dispatch = None;
+    }
+
+    pub(crate) fn enter_winit_callback(&mut self) {
+        if self.public_callback_depth > 0 {
+            self.public_association_ambiguous = true;
+            self.active_public_dispatch = None;
+        }
+        self.public_callback_depth = self.public_callback_depth.saturating_add(1);
+    }
+
+    pub(crate) fn leave_winit_callback(&mut self) {
+        self.public_callback_depth = self.public_callback_depth.saturating_sub(1);
+        if self.public_callback_depth == 0 {
+            // The message hook runs before Winit dispatch and has no matching
+            // post-dispatch callback. Expire the candidate after this public
+            // callback so a buffered or later event cannot reuse stale MSG data.
+            self.active_public_dispatch = None;
+        }
+    }
+
+    pub(crate) fn public_touch_native_metadata(
+        &mut self,
+        window_hwnd_raw_session_scoped: Option<isize>,
+        public_touch_id: u64,
+    ) -> PublicTouchNativeMetadata {
+        if self.public_association_ambiguous {
+            return PublicTouchNativeMetadata {
+                message_association: None,
+                native_pointer_type_raw: None,
+                pen_classification: PublicPenClassification::Unclassified(
+                    PublicUnclassifiedReason::AmbiguousOrReentrantDispatch,
+                ),
+                pointer_type_error_raw: None,
+            };
+        }
+
+        let Some(active) = self.active_public_dispatch else {
+            return PublicTouchNativeMetadata {
+                message_association: None,
+                native_pointer_type_raw: None,
+                pen_classification: PublicPenClassification::Unclassified(
+                    PublicUnclassifiedReason::NoMatchedNativeMessage,
+                ),
+                pointer_type_error_raw: None,
+            };
+        };
+        let metadata = active.metadata;
+        if window_hwnd_raw_session_scoped != Some(metadata.message_hwnd_raw_session_scoped)
+            || u64::from(metadata.pointer_id) != public_touch_id
+            || pointer_message_kind(metadata.message_id_raw).is_none()
+        {
+            return PublicTouchNativeMetadata {
+                message_association: None,
+                native_pointer_type_raw: None,
+                pen_classification: PublicPenClassification::Unclassified(
+                    PublicUnclassifiedReason::NoMatchedNativeMessage,
+                ),
+                pointer_type_error_raw: None,
+            };
+        }
+
+        if active.association_used {
+            return PublicTouchNativeMetadata {
+                message_association: None,
+                native_pointer_type_raw: None,
+                pen_classification: PublicPenClassification::Unclassified(
+                    PublicUnclassifiedReason::AdditionalFrameEventUnjoined,
+                ),
+                pointer_type_error_raw: None,
+            };
+        }
+
+        let association = Some(PublicMessageAssociation {
+            message_sequence: active.message_sequence,
+            message_id_raw: metadata.message_id_raw,
+            message_hwnd_raw_session_scoped: metadata.message_hwnd_raw_session_scoped,
+            pointer_id_raw: metadata.pointer_id,
+        });
+        let mut active = active;
+        active.association_used = true;
+        self.active_public_dispatch = Some(active);
+        if !active.pointer_type_query_attempted {
+            let query_result = if let Some(get_pointer_type) = self.public_pointer_type_api {
+                let mut pointer_type: POINTER_INPUT_TYPE = 0;
+                // SAFETY: This runs synchronously from Winit's window callback inside
+                // the WndProc for the associated live WM_POINTER dispatch. The ID,
+                // HWND and message sequence have already been matched; output is valid.
+                if unsafe { get_pointer_type(metadata.pointer_id, &mut pointer_type) } == 0 {
+                    Err(win32_last_error())
+                } else {
+                    Ok(pointer_type)
+                }
+            } else {
+                // `None` is cached as an attempted query without a result.
+                let mut active = active;
+                active.pointer_type_query_attempted = true;
+                self.active_public_dispatch = Some(active);
+                return PublicTouchNativeMetadata {
+                    message_association: association,
+                    native_pointer_type_raw: None,
+                    pen_classification: PublicPenClassification::Unclassified(
+                        PublicUnclassifiedReason::PointerTypeApiUnavailable,
+                    ),
+                    pointer_type_error_raw: None,
+                };
+            };
+
+            let mut active = active;
+            active.pointer_type_query_attempted = true;
+            active.pointer_type_query_result = Some(query_result);
+            self.active_public_dispatch = Some(active);
+        }
+
+        match self
+            .active_public_dispatch
+            .and_then(|active| active.pointer_type_query_result)
+        {
+            Some(Ok(pointer_type)) => PublicTouchNativeMetadata {
+                message_association: association,
+                native_pointer_type_raw: Some(pointer_type),
+                pen_classification: if pointer_type == PT_PEN {
+                    PublicPenClassification::ConfirmedPen
+                } else {
+                    PublicPenClassification::ConfirmedNonPen {
+                        pointer_type_raw: pointer_type,
+                    }
+                },
+                pointer_type_error_raw: None,
+            },
+            Some(Err(error)) => PublicTouchNativeMetadata {
+                message_association: association,
+                native_pointer_type_raw: None,
+                pen_classification: PublicPenClassification::Unclassified(
+                    PublicUnclassifiedReason::PointerTypeQueryFailed,
+                ),
+                pointer_type_error_raw: Some(error),
+            },
+            None => PublicTouchNativeMetadata {
+                message_association: association,
+                native_pointer_type_raw: None,
+                pen_classification: PublicPenClassification::Unclassified(
+                    PublicUnclassifiedReason::PointerTypeApiUnavailable,
+                ),
+                pointer_type_error_raw: None,
+            },
+        }
+    }
+
+    pub(crate) fn next_public_event_sequence(&mut self) -> u64 {
+        let sequence = self.next_public_event_sequence;
+        self.next_public_event_sequence = self.next_public_event_sequence.saturating_add(1);
+        sequence
+    }
+
+    pub(crate) fn can_capture(&self) -> bool {
         self.summary.storage_limit.is_none()
     }
 
-    fn remaining_sample_capacity(&self) -> u64 {
-        MAX_RETAINED_SAMPLES.saturating_sub(self.summary.samples)
+    #[cfg(test)]
+    pub(crate) fn retained_records(&self) -> &[ProbeRecord] {
+        &self.records
     }
 
-    fn record(&mut self, record: ProbeRecord) {
+    pub(crate) fn remaining_sample_capacity(&self) -> u64 {
+        MAX_RETAINED_SAMPLES.saturating_sub(
+            self.summary
+                .samples
+                .saturating_add(self.summary.wintab_packets),
+        )
+    }
+
+    pub(crate) fn record(&mut self, record: ProbeRecord) {
         self.record_with_limits(record, MAX_RETAINED_RECORDS, MAX_RETAINED_SAMPLES);
     }
 
@@ -347,11 +940,16 @@ impl ProbeState {
 
         let incoming_samples = match &record {
             ProbeRecord::DirectPenHistory(batch) => batch.samples.len() as u64,
+            ProbeRecord::WintabPackets(batch) => batch.packets.len() as u64,
             _ => 0,
         };
         let record_limit_reached = self.records.len() >= max_records;
+        let retained_sample_count = self
+            .summary
+            .samples
+            .saturating_add(self.summary.wintab_packets);
         let sample_limit_exceeded =
-            incoming_samples > max_samples.saturating_sub(self.summary.samples);
+            incoming_samples > max_samples.saturating_sub(retained_sample_count);
         let message_issue = match &record {
             ProbeRecord::MessageIssue { issue, .. } => Some(*issue),
             _ => None,
@@ -365,28 +963,56 @@ impl ProbeState {
                     | CaptureIssue::RetentionCapacitiesExceeded { .. }
             )
         );
+        let wintab_retention_limit = match &record {
+            ProbeRecord::WintabIssue {
+                message_id_raw,
+                issue,
+                ..
+            } if *message_id_raw != 0 => Some(*issue),
+            _ => None,
+        };
         if record_limit_reached || sample_limit_exceeded {
             self.summary.records_not_retained = self.summary.records_not_retained.saturating_add(1);
             if incoming_samples > 0 {
                 let remaining_records = max_records.saturating_sub(self.records.len()) as u64;
-                let remaining_samples = max_samples.saturating_sub(self.summary.samples);
-                let issue = match (record_limit_reached, sample_limit_exceeded) {
-                    (true, true) => CaptureIssue::RetentionCapacitiesExceeded {
-                        reported_samples: incoming_samples as u32,
+                let remaining_samples = max_samples.saturating_sub(retained_sample_count);
+                if let ProbeRecord::WintabPackets(_) = &record {
+                    let issue = WintabIssue::RetainedDataLimitExceeded {
+                        reported_packets: incoming_samples as u32,
                         remaining_records,
                         remaining_samples,
-                    },
-                    (true, false) => CaptureIssue::RetainedRecordCapacityExceeded {
-                        reported_samples: incoming_samples as u32,
-                        remaining_records,
-                    },
-                    (false, true) => CaptureIssue::RetainedSampleCapacityExceeded {
-                        reported: incoming_samples as u32,
-                        remaining: remaining_samples,
-                    },
-                    (false, false) => unreachable!("a record or sample cap was reached"),
-                };
-                self.note_incomplete_issue(issue, Some(incoming_samples));
+                    };
+                    self.summary.issues = self.summary.issues.saturating_add(1);
+                    self.summary.wintab_issues = self.summary.wintab_issues.saturating_add(1);
+                    self.summary.latest_wintab_issue = Some(issue);
+                    self.summary.incomplete_batches =
+                        self.summary.incomplete_batches.saturating_add(1);
+                    self.summary.batches_not_retained =
+                        self.summary.batches_not_retained.saturating_add(1);
+                    self.summary.samples_not_retained = self
+                        .summary
+                        .samples_not_retained
+                        .saturating_add(incoming_samples);
+                    self.summary.wintab_status = WintabStatus::Partial;
+                } else {
+                    let issue = match (record_limit_reached, sample_limit_exceeded) {
+                        (true, true) => CaptureIssue::RetentionCapacitiesExceeded {
+                            reported_samples: incoming_samples as u32,
+                            remaining_records,
+                            remaining_samples,
+                        },
+                        (true, false) => CaptureIssue::RetainedRecordCapacityExceeded {
+                            reported_samples: incoming_samples as u32,
+                            remaining_records,
+                        },
+                        (false, true) => CaptureIssue::RetainedSampleCapacityExceeded {
+                            reported: incoming_samples as u32,
+                            remaining: remaining_samples,
+                        },
+                        (false, false) => unreachable!("a record or sample cap was reached"),
+                    };
+                    self.note_incomplete_issue(issue, Some(incoming_samples));
+                }
             } else if let Some(issue) = message_issue {
                 self.note_incomplete_issue(issue, known_unretained_samples(issue));
             }
@@ -418,12 +1044,49 @@ impl ProbeState {
             ProbeRecord::MessageIssue { issue, .. } => {
                 self.note_incomplete_issue(*issue, known_unretained_samples(*issue));
             }
+            ProbeRecord::WintabIssue {
+                message_id_raw,
+                issue,
+                ..
+            } => {
+                self.summary.issues = self.summary.issues.saturating_add(1);
+                self.summary.wintab_issues = self.summary.wintab_issues.saturating_add(1);
+                self.summary.latest_wintab_issue = Some(*issue);
+                if *message_id_raw != 0 {
+                    self.summary.incomplete_batches =
+                        self.summary.incomplete_batches.saturating_add(1);
+                    self.summary.batches_not_retained =
+                        self.summary.batches_not_retained.saturating_add(1);
+                    if let Some(packets) = known_unretained_wintab_packets(*issue) {
+                        self.summary.samples_not_retained =
+                            self.summary.samples_not_retained.saturating_add(packets);
+                    }
+                    self.summary.wintab_status = WintabStatus::Partial;
+                }
+            }
             ProbeRecord::DirectPenHistory(batch) => {
                 self.summary.history_batches = self.summary.history_batches.saturating_add(1);
                 self.summary.samples = self
                     .summary
                     .samples
                     .saturating_add(batch.samples.len() as u64);
+            }
+            ProbeRecord::WintabPackets(batch) => {
+                self.summary.wintab_packets = self
+                    .summary
+                    .wintab_packets
+                    .saturating_add(batch.packets.len() as u64);
+            }
+            ProbeRecord::WintabControlNotification(_) => {
+                self.summary.wintab_control_messages =
+                    self.summary.wintab_control_messages.saturating_add(1);
+            }
+            ProbeRecord::PublicWinitEvent(event) => {
+                self.summary.public_events = self.summary.public_events.saturating_add(1);
+                if matches!(event.data, PublicWinitEventData::Touch { .. }) {
+                    self.summary.public_touch_events =
+                        self.summary.public_touch_events.saturating_add(1);
+                }
             }
             ProbeRecord::IgnoredNonPenPointer { .. } => {
                 self.summary.ignored_non_pen_pointers =
@@ -433,16 +1096,38 @@ impl ProbeState {
         self.records.push(record);
         self.summary.records_retained = self.summary.records_retained.saturating_add(1);
 
+        let wintab_record_limit = wintab_retention_limit.is_some_and(|issue| {
+            matches!(
+                issue,
+                WintabIssue::RetainedDataLimitExceeded {
+                    remaining_records: 0,
+                    ..
+                }
+            )
+        });
+        let wintab_sample_limit = wintab_retention_limit.is_some_and(|issue| match issue {
+            WintabIssue::RetainedSampleCapacityExceeded { .. } => true,
+            WintabIssue::RetainedDataLimitExceeded {
+                reported_packets,
+                remaining_samples,
+                ..
+            } => u64::from(reported_packets) > remaining_samples,
+            _ => false,
+        });
         self.mark_storage_limit(
-            self.records.len() >= max_records,
-            self.summary.samples >= max_samples
+            self.records.len() >= max_records || wintab_record_limit,
+            self.summary
+                .samples
+                .saturating_add(self.summary.wintab_packets)
+                >= max_samples
                 || matches!(
                     message_issue,
                     Some(
                         CaptureIssue::RetainedSampleCapacityExceeded { .. }
                             | CaptureIssue::RetentionCapacitiesExceeded { .. }
                     )
-                ),
+                )
+                || wintab_sample_limit,
             native_history_limit,
             false,
         );
@@ -469,6 +1154,74 @@ impl ProbeState {
             }
             ProbeRecord::DirectPenHistory(batch) => {
                 self.note_incomplete_issue(issue, Some(batch.samples.len() as u64));
+            }
+            ProbeRecord::WintabPackets(batch) => {
+                self.summary.issues = self.summary.issues.saturating_add(1);
+                self.summary.wintab_issues = self.summary.wintab_issues.saturating_add(1);
+                self.summary.latest_wintab_issue = Some(WintabIssue::RecordAllocationFailed {
+                    requested_records: match issue {
+                        CaptureIssue::RecordAllocationFailed { requested_records } => {
+                            requested_records
+                        }
+                        _ => 0,
+                    },
+                });
+                self.summary.incomplete_batches = self.summary.incomplete_batches.saturating_add(1);
+                self.summary.batches_not_retained =
+                    self.summary.batches_not_retained.saturating_add(1);
+                self.summary.samples_not_retained = self
+                    .summary
+                    .samples_not_retained
+                    .saturating_add(batch.packets.len() as u64);
+            }
+            ProbeRecord::WintabControlNotification(_) => {
+                self.summary.issues = self.summary.issues.saturating_add(1);
+                self.summary.incomplete_batches = self.summary.incomplete_batches.saturating_add(1);
+                self.summary.batches_not_retained =
+                    self.summary.batches_not_retained.saturating_add(1);
+                self.summary.wintab_control_messages =
+                    self.summary.wintab_control_messages.saturating_add(1);
+                self.summary.latest_incomplete_issue = Some(issue);
+                self.summary.wintab_status = WintabStatus::Partial;
+            }
+            ProbeRecord::PublicWinitEvent(event) => {
+                self.summary.issues = self.summary.issues.saturating_add(1);
+                self.summary.incomplete_batches = self.summary.incomplete_batches.saturating_add(1);
+                self.summary.batches_not_retained =
+                    self.summary.batches_not_retained.saturating_add(1);
+                self.summary.public_events = self.summary.public_events.saturating_add(1);
+                if matches!(event.data, PublicWinitEventData::Touch { .. }) {
+                    self.summary.public_touch_events =
+                        self.summary.public_touch_events.saturating_add(1);
+                }
+                self.summary.latest_incomplete_issue = Some(issue);
+            }
+            ProbeRecord::WintabIssue {
+                message_id_raw,
+                issue: wintab_issue,
+                ..
+            } => {
+                self.summary.issues = self.summary.issues.saturating_add(2);
+                self.summary.wintab_issues = self.summary.wintab_issues.saturating_add(2);
+                self.summary.latest_wintab_issue = Some(WintabIssue::RecordAllocationFailed {
+                    requested_records: match issue {
+                        CaptureIssue::RecordAllocationFailed { requested_records } => {
+                            requested_records
+                        }
+                        _ => 0,
+                    },
+                });
+                if *message_id_raw != 0 {
+                    self.summary.incomplete_batches =
+                        self.summary.incomplete_batches.saturating_add(1);
+                    self.summary.batches_not_retained =
+                        self.summary.batches_not_retained.saturating_add(1);
+                    if let Some(packets) = known_unretained_wintab_packets(*wintab_issue) {
+                        self.summary.samples_not_retained =
+                            self.summary.samples_not_retained.saturating_add(packets);
+                    }
+                    self.summary.wintab_status = WintabStatus::Partial;
+                }
             }
             ProbeRecord::IgnoredNonPenPointer { .. } => {
                 self.summary.issues = self.summary.issues.saturating_add(1);
@@ -537,6 +1290,18 @@ fn known_unretained_samples(issue: CaptureIssue) -> Option<u64> {
     }
 }
 
+fn known_unretained_wintab_packets(issue: WintabIssue) -> Option<u64> {
+    match issue {
+        WintabIssue::RetainedDataLimitExceeded {
+            reported_packets, ..
+        }
+        | WintabIssue::RetainedSampleCapacityExceeded {
+            reported_packets, ..
+        } => Some(u64::from(reported_packets)),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HistoryBufferDecision {
     Complete { initialized_len: usize },
@@ -599,16 +1364,20 @@ struct PointerApi {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HookMessageMetadata {
-    message_id_raw: u32,
-    message_hwnd_raw_session_scoped: isize,
-    pointer_id: u32,
+pub(crate) struct HookMessageMetadata {
+    pub message_id_raw: u32,
+    pub message_hwnd_raw_session_scoped: isize,
+    pub wparam_raw: usize,
+    pub lparam_raw: isize,
+    pub pointer_id: u32,
 }
 
 fn hook_message_metadata(message: &MSG) -> HookMessageMetadata {
     HookMessageMetadata {
         message_id_raw: message.message,
         message_hwnd_raw_session_scoped: message.hwnd,
+        wparam_raw: message.wParam,
+        lparam_raw: message.lParam,
         pointer_id: (message.wParam & 0xffff) as u32,
     }
 }
@@ -690,18 +1459,31 @@ fn query_qpc_frequency() -> Result<u64, CaptureIssue> {
 pub(crate) fn install_message_hook(
     builder: &mut EventLoopBuilder<()>,
     state: Rc<RefCell<ProbeState>>,
+    mode: CaptureMode,
+    wintab: Rc<RefCell<crate::wintab::WintabCapture>>,
+    app_clock_origin: Instant,
+    wintab_control_pending: Arc<AtomicBool>,
 ) {
+    state.borrow_mut().set_capture_mode(mode);
     let pointer_api = load_pointer_api();
     let pointer_api_issue = pointer_api.as_ref().err().copied();
     state
         .borrow_mut()
         .set_api_state(pointer_api.is_ok(), pointer_api_issue);
+    let public_pointer_type_api = pointer_api.as_ref().ok().map(|api| api.get_pointer_type);
+    state
+        .borrow_mut()
+        .set_public_pointer_type_api(public_pointer_type_api);
     if let Some(issue) = pointer_api_issue {
         state.borrow_mut().record(ProbeRecord::StartupIssue(issue));
     }
-    let (qpc_frequency, qpc_frequency_issue) = match query_qpc_frequency() {
-        Ok(frequency) => (Some(frequency), None),
-        Err(issue) => (None, Some(issue)),
+    let (qpc_frequency, qpc_frequency_issue) = if mode == CaptureMode::DirectWmPointer {
+        match query_qpc_frequency() {
+            Ok(frequency) => (Some(frequency), None),
+            Err(issue) => (None, Some(issue)),
+        }
+    } else {
+        (None, None)
     };
     state
         .borrow_mut()
@@ -710,10 +1492,15 @@ pub(crate) fn install_message_hook(
         state.borrow_mut().record(ProbeRecord::StartupIssue(issue));
     }
 
-    let hook_origin = Instant::now();
     let mut message_sequence = 0u64;
     builder.with_msg_hook(move |message_pointer| {
         if !state.borrow().can_capture() {
+            if mode == CaptureMode::Wintab {
+                let mut probe_state = state.borrow_mut();
+                wintab
+                    .borrow_mut()
+                    .request_close_after_storage_limit(&mut probe_state);
+            }
             return false;
         }
         let remaining_samples = state.borrow().remaining_sample_capacity();
@@ -725,25 +1512,63 @@ pub(crate) fn install_message_hook(
             return false;
         };
         message_sequence = next_sequence;
-        let hook_observed_elapsed_ns = hook_origin.elapsed().as_nanos();
+        let hook_observed_elapsed_ns = app_clock_origin.elapsed().as_nanos();
+        // SAFETY: Winit's pointer is the current live MSG for this hook call.
+        // Copy only its numeric fields; no pointer or handle ownership is kept.
+        let message_metadata = unsafe { copy_message_metadata(message_pointer) };
+        let mut probe_state = state.borrow_mut();
+        probe_state.begin_native_dispatch(current_sequence, message_metadata);
         // SAFETY: Winit's Windows hook receives a pointer to its current, live MSG
         // after PeekMessageW and before DispatchMessageW/another message retrieval.
         // capture_message borrows it only for this callback and copies all fields.
-        let record = unsafe {
-            capture_message(
-                message_pointer,
-                current_sequence,
-                hook_observed_elapsed_ns,
-                pointer_api,
-                qpc_frequency,
-                remaining_samples,
-            )
-        };
-        if let Some(record) = record {
-            state.borrow_mut().record(record);
+        match mode {
+            CaptureMode::DirectWmPointer => {
+                let record = unsafe {
+                    capture_message(
+                        message_pointer,
+                        current_sequence,
+                        hook_observed_elapsed_ns,
+                        pointer_api,
+                        qpc_frequency,
+                        remaining_samples,
+                    )
+                };
+                if let Some(record) = record {
+                    probe_state.record(record);
+                }
+            }
+            CaptureMode::Wintab => {
+                if let Some(metadata) = message_metadata
+                    && wintab_packet_hook_may_drain(&wintab_control_pending)
+                {
+                    wintab.borrow_mut().handle_message(
+                        metadata,
+                        current_sequence,
+                        hook_observed_elapsed_ns,
+                        &wintab_control_pending,
+                        &mut probe_state,
+                    );
+                }
+            }
         }
         false
     });
+}
+
+pub(crate) fn wintab_packet_hook_may_drain(control_pending: &AtomicBool) -> bool {
+    !control_pending.load(Ordering::Acquire)
+}
+
+/// # Safety
+/// `message_pointer` must be the live MSG pointer supplied by Winit's
+/// `with_msg_hook`; this helper only copies scalar fields and returns no pointer.
+unsafe fn copy_message_metadata(message_pointer: *const c_void) -> Option<HookMessageMetadata> {
+    if message_pointer.is_null() {
+        return None;
+    }
+    // SAFETY: The caller guarantees the MSG remains live throughout the hook.
+    let message = unsafe { &*message_pointer.cast::<MSG>() };
+    Some(hook_message_metadata(message))
 }
 
 /// # Safety
@@ -1174,16 +1999,37 @@ fn pointer_message_kind(message_id: u32) -> Option<PointerMessageKind> {
 mod tests {
     use super::{
         CaptureIssue, CaptureSource, CoordinateSpace, CoordinateUnits, DirectPenHistoryBatch,
-        HistoryBufferDecision, HistoryCountError, MAX_HISTORY_ENTRIES, NativeApi,
-        PointerAttribution, PointerMessageKind, PressureValidity, ProbeRecord, ProbeState,
-        RawPoint, RawScreenPosition, StorageLimit, ensure_native_history_fits,
-        history_buffer_decision, hook_message_metadata, normalize_newest_first, own_sample,
-        pressure_validity,
+        HistoryBufferDecision, HistoryCountError, HookMessageMetadata, MAX_HISTORY_ENTRIES,
+        NativeApi, PointerAttribution, PointerMessageKind, PressureValidity, ProbeRecord,
+        ProbeState, PublicEventCapability, PublicMessageAssociation, PublicPenClassification,
+        PublicUnclassifiedReason, PublicWinitEventData, PublicWinitEventRecord, RawPoint,
+        RawScreenPosition, StorageLimit, TouchPhase, WintabContextConfig, WintabCoordinateSpace,
+        WintabIssue, WintabPacketBatch, WintabPacketSample, WintabPacketTimeMode, WintabStatus,
+        ensure_native_history_fits, history_buffer_decision, hook_message_metadata,
+        normalize_newest_first, own_sample, pressure_validity,
     };
     use windows_sys::Win32::{
+        Foundation::BOOL,
         UI::Input::Pointer::POINTER_PEN_INFO,
-        UI::WindowsAndMessaging::{MSG, PEN_MASK_PRESSURE, PT_PEN, WM_POINTERUPDATE},
+        UI::WindowsAndMessaging::{
+            MSG, PEN_MASK_PRESSURE, POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, WM_POINTERUPDATE,
+        },
     };
+
+    unsafe extern "system" fn fake_get_pointer_type(
+        pointer_id: u32,
+        pointer_type: *mut POINTER_INPUT_TYPE,
+    ) -> BOOL {
+        if pointer_type.is_null() {
+            return 0;
+        }
+        // SAFETY: The test caller supplies a valid output slot through the safe
+        // ProbeState association method.
+        unsafe {
+            *pointer_type = if pointer_id == 7 { PT_PEN } else { PT_TOUCH };
+        }
+        1
+    }
 
     fn api_error_record(sequence: u64) -> ProbeRecord {
         ProbeRecord::MessageIssue {
@@ -1199,6 +2045,32 @@ mod tests {
                 win32_error: 5,
             },
         }
+    }
+
+    fn public_touch_record(sequence: u64) -> ProbeRecord {
+        ProbeRecord::PublicWinitEvent(PublicWinitEventRecord {
+            source: CaptureSource::PublicWinitWindowEvent,
+            capability: PublicEventCapability::TouchPhasePositionForce,
+            public_event_sequence: sequence,
+            app_observed_elapsed_ns: sequence as u128,
+            window_hwnd_raw_session_scoped: Some(0x2222),
+            message_association: None,
+            data: PublicWinitEventData::Touch {
+                winit_device_id: winit::event::DeviceId::dummy(),
+                public_touch_id: 7,
+                phase: TouchPhase::Moved,
+                x_physical_px: 1.0,
+                y_physical_px: 2.0,
+                public_winit_force: Some(winit::event::Force::Normalized(0.5)),
+                native_pointer_type_raw: None,
+                pointer_type_error_raw: None,
+                pen_classification: PublicPenClassification::Unclassified(
+                    PublicUnclassifiedReason::NoMatchedNativeMessage,
+                ),
+                native_timestamp_raw: None,
+                tilt: None,
+            },
+        })
     }
 
     fn direct_batch(sample_count: usize, sequence: u64) -> ProbeRecord {
@@ -1246,6 +2118,59 @@ mod tests {
             qpc_frequency_hz: Some(10_000_000),
             native_history_count: sample_count as u32,
             samples: vec![sample; sample_count],
+        })
+    }
+
+    fn wintab_batch(packet_count: usize, sequence: u64) -> ProbeRecord {
+        let packet = WintabPacketSample {
+            context_handle_raw_session_scoped: 0x7777,
+            status_raw: 0,
+            packet_time_raw: sequence as u32,
+            serial_number_raw: sequence as u32,
+            cursor_raw: 0,
+            buttons_raw: 0,
+            x_raw: 1,
+            y_raw: 2,
+            normal_pressure_raw: 0,
+        };
+        ProbeRecord::WintabPackets(WintabPacketBatch {
+            source: CaptureSource::WintabPacket,
+            message_sequence: sequence,
+            message_id_raw: 0x7ff0,
+            message_hwnd_raw_session_scoped: 0x2222,
+            message_wparam_raw: sequence as usize,
+            message_lparam_raw: 0x7777,
+            context_handle_raw_session_scoped: 0x7777,
+            notification_serial_raw: Some(sequence as u32),
+            context_config: WintabContextConfig {
+                context_name_raw: [0; 40],
+                options_raw: 0x0004,
+                status_raw: 0,
+                locks_raw: 0,
+                message_base_raw: 0x7ff0,
+                device_raw: 1,
+                packet_rate_raw: 220,
+                packet_data_raw: 0x5f7,
+                packet_mode_raw: 0,
+                move_mask_raw: 0x580,
+                button_down_mask_raw: 0,
+                button_up_mask_raw: 0,
+                input_origin_raw: [0; 3],
+                input_extent_raw: [10_000; 3],
+                output_origin_raw: [0; 3],
+                output_extent_raw: [10_000; 3],
+                sensitivity_fixed32_raw: [0; 3],
+                system_mode_raw: 0,
+                system_origin_raw: [0; 2],
+                system_extent_raw: [0; 2],
+                system_sensitivity_fixed32_raw: [0; 2],
+            },
+            queue_capacity_raw: 1024,
+            coordinate_space: WintabCoordinateSpace::DigitizerContextOutputCoordinates,
+            packet_time_mode: WintabPacketTimeMode::AbsoluteSystemTime,
+            app_observed_elapsed_ns: sequence as u128,
+            control_transition_observed_during_read: false,
+            packets: vec![packet; packet_count],
         })
     }
 
@@ -1357,6 +2282,21 @@ mod tests {
     }
 
     #[test]
+    fn public_event_records_obey_the_shared_record_cap() {
+        let mut state = ProbeState::default();
+        state.record_with_limits(public_touch_record(1), 1, 8);
+        state.record_with_limits(public_touch_record(2), 1, 8);
+
+        let summary = state.summary();
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(summary.public_events, 1);
+        assert_eq!(summary.public_touch_events, 1);
+        assert_eq!(summary.records_not_retained, 0);
+        assert_eq!(summary.storage_limit, Some(StorageLimit::Records));
+        assert!(!state.can_capture());
+    }
+
+    #[test]
     fn record_cap_rejection_does_not_claim_sample_capacity_was_exhausted() {
         let mut state = ProbeState::default();
         state.record_with_limits(
@@ -1456,6 +2396,110 @@ mod tests {
     }
 
     #[test]
+    fn wintab_packets_share_the_native_sample_cap_without_becoming_direct_samples() {
+        let mut state = ProbeState::default();
+        state.record_with_limits(wintab_batch(2, 1), 4, 3);
+        state.record_with_limits(wintab_batch(2, 2), 4, 3);
+
+        let summary = state.summary();
+        assert_eq!(summary.samples, 0);
+        assert_eq!(summary.wintab_packets, 2);
+        assert_eq!(summary.samples_not_retained, 2);
+        assert_eq!(summary.batches_not_retained, 1);
+        assert_eq!(summary.storage_limit, Some(StorageLimit::Samples));
+        assert_eq!(state.records.len(), 1);
+        assert!(!state.can_capture());
+    }
+
+    #[test]
+    fn wintab_capacity_issue_keeps_source_and_unretained_packet_count() {
+        let mut state = ProbeState::default();
+        state.set_capture_mode(super::CaptureMode::Wintab);
+        state.record_with_limits(
+            ProbeRecord::WintabIssue {
+                source: CaptureSource::WintabPacket,
+                message_sequence: 12,
+                message_id_raw: 0x7ff0,
+                message_hwnd_raw_session_scoped: Some(0x2222),
+                issue: WintabIssue::RetainedSampleCapacityExceeded {
+                    reported_packets: 5,
+                    remaining: 3,
+                },
+            },
+            4,
+            3,
+        );
+
+        let summary = state.summary();
+        assert_eq!(summary.wintab_issues, 1);
+        assert_eq!(summary.samples_not_retained, 5);
+        assert_eq!(summary.incomplete_batches, 1);
+        assert_eq!(summary.storage_limit, Some(StorageLimit::Samples));
+        assert_eq!(summary.wintab_status, WintabStatus::Partial);
+        assert_eq!(
+            summary.latest_wintab_issue,
+            Some(WintabIssue::RetainedSampleCapacityExceeded {
+                reported_packets: 5,
+                remaining: 3,
+            })
+        );
+        assert!(!state.can_capture());
+    }
+
+    #[test]
+    fn wintab_overlap_issue_preserves_opaque_context_and_status_flags() {
+        let mut state = ProbeState::default();
+        state.set_capture_mode(super::CaptureMode::Wintab);
+        let issue = WintabIssue::ContextOverlapChanged {
+            related_context_raw_session_scoped: 0x7788,
+            context_status_raw: 0x0002,
+        };
+        state.record(ProbeRecord::WintabIssue {
+            source: CaptureSource::WintabPacket,
+            message_sequence: 14,
+            message_id_raw: 0x7ff4,
+            message_hwnd_raw_session_scoped: Some(0x2222),
+            issue,
+        });
+
+        let summary = state.summary();
+        assert_eq!(summary.wintab_issues, 1);
+        assert_eq!(summary.incomplete_batches, 1);
+        assert_eq!(summary.wintab_status, WintabStatus::Partial);
+        assert_eq!(summary.latest_wintab_issue, Some(issue));
+    }
+
+    #[test]
+    fn reduced_wintab_queue_capacity_is_not_reported_as_sample_loss() {
+        let mut state = ProbeState::default();
+        state.set_capture_mode(super::CaptureMode::Wintab);
+        let issue = WintabIssue::QueueCapacityReduced {
+            requested: 4096,
+            actual: 128,
+        };
+        state.set_wintab_configuration(
+            WintabStatus::Partial,
+            Some(WintabPacketTimeMode::AbsoluteSystemTime),
+            Some(0x5f7),
+            Some(0),
+            Some(128),
+        );
+        state.record(ProbeRecord::WintabIssue {
+            source: CaptureSource::WintabPacket,
+            message_sequence: 0,
+            message_id_raw: 0,
+            message_hwnd_raw_session_scoped: None,
+            issue,
+        });
+
+        let summary = state.summary();
+        assert_eq!(summary.wintab_status, WintabStatus::Partial);
+        assert_eq!(summary.wintab_queue_capacity_raw, Some(128));
+        assert_eq!(summary.samples_not_retained, 0);
+        assert_eq!(summary.latest_wintab_issue, Some(issue));
+    }
+
+    #[test]
     fn native_history_larger_than_remaining_capacity_marks_incomplete() {
         let mut state = ProbeState::default();
         state.record_with_limits(
@@ -1513,5 +2557,182 @@ mod tests {
         let sample = own_sample(native, 7, 0, 0).unwrap();
         assert_eq!(sample.source_device_handle_raw_session_scoped, 0x1234);
         assert_eq!(sample.target_hwnd_raw_session_scoped, 0x5678);
+    }
+
+    #[test]
+    fn public_event_association_requires_same_dispatch_window_and_pointer() {
+        let mut state = ProbeState::default();
+        state.set_public_pointer_type_api(Some(fake_get_pointer_type));
+        let metadata = HookMessageMetadata {
+            message_id_raw: WM_POINTERUPDATE,
+            message_hwnd_raw_session_scoped: 0x2222,
+            wparam_raw: 7,
+            lparam_raw: 0,
+            pointer_id: 7,
+        };
+        state.begin_native_dispatch(41, Some(metadata));
+
+        let matching = state.public_touch_native_metadata(Some(0x2222), 7);
+        assert_eq!(
+            matching.message_association,
+            Some(PublicMessageAssociation {
+                message_sequence: 41,
+                message_id_raw: WM_POINTERUPDATE,
+                message_hwnd_raw_session_scoped: 0x2222,
+                pointer_id_raw: 7,
+            })
+        );
+        assert_eq!(matching.native_pointer_type_raw, Some(PT_PEN));
+        assert_eq!(
+            matching.pen_classification,
+            PublicPenClassification::ConfirmedPen
+        );
+
+        let additional_frame_event = state.public_touch_native_metadata(Some(0x2222), 7);
+        assert_eq!(additional_frame_event.message_association, None);
+        assert_eq!(
+            additional_frame_event.pen_classification,
+            PublicPenClassification::Unclassified(
+                PublicUnclassifiedReason::AdditionalFrameEventUnjoined
+            )
+        );
+
+        let wrong_window = state.public_touch_native_metadata(Some(0x3333), 7);
+        assert_eq!(wrong_window.message_association, None);
+        assert_eq!(
+            wrong_window.pen_classification,
+            PublicPenClassification::Unclassified(PublicUnclassifiedReason::NoMatchedNativeMessage)
+        );
+        let wrong_pointer = state.public_touch_native_metadata(Some(0x2222), 8);
+        assert_eq!(wrong_pointer.message_association, None);
+    }
+
+    #[test]
+    fn public_touch_is_not_classified_as_pen_without_native_pt_pen() {
+        let mut state = ProbeState::default();
+        state.set_public_pointer_type_api(Some(fake_get_pointer_type));
+        let metadata = HookMessageMetadata {
+            message_id_raw: WM_POINTERUPDATE,
+            message_hwnd_raw_session_scoped: 0x2222,
+            wparam_raw: 8,
+            lparam_raw: 0,
+            pointer_id: 8,
+        };
+        state.begin_native_dispatch(50, Some(metadata));
+
+        let native = state.public_touch_native_metadata(Some(0x2222), 8);
+        assert!(native.message_association.is_some());
+        assert_eq!(native.native_pointer_type_raw, Some(PT_TOUCH));
+        assert_eq!(
+            native.pen_classification,
+            PublicPenClassification::ConfirmedNonPen {
+                pointer_type_raw: PT_TOUCH,
+            }
+        );
+    }
+
+    #[test]
+    fn reentrant_public_event_association_stays_null_and_unclassified() {
+        let mut state = ProbeState::default();
+        state.set_public_pointer_type_api(Some(fake_get_pointer_type));
+        let metadata = HookMessageMetadata {
+            message_id_raw: WM_POINTERUPDATE,
+            message_hwnd_raw_session_scoped: 0x2222,
+            wparam_raw: 7,
+            lparam_raw: 0,
+            pointer_id: 7,
+        };
+        state.begin_native_dispatch(41, Some(metadata));
+        state.enter_winit_callback();
+        state.begin_native_dispatch(42, Some(metadata));
+
+        let ambiguous = state.public_touch_native_metadata(Some(0x2222), 7);
+        assert_eq!(ambiguous.message_association, None);
+        assert_eq!(
+            ambiguous.pen_classification,
+            PublicPenClassification::Unclassified(
+                PublicUnclassifiedReason::AmbiguousOrReentrantDispatch
+            )
+        );
+        state.leave_winit_callback();
+
+        let after_callback = state.public_touch_native_metadata(Some(0x2222), 7);
+        assert_eq!(after_callback.message_association, None);
+    }
+
+    #[test]
+    fn stale_dispatch_metadata_is_expired_after_public_callback() {
+        let mut state = ProbeState::default();
+        state.set_public_pointer_type_api(Some(fake_get_pointer_type));
+        let metadata = HookMessageMetadata {
+            message_id_raw: WM_POINTERUPDATE,
+            message_hwnd_raw_session_scoped: 0x2222,
+            wparam_raw: 7,
+            lparam_raw: 0,
+            pointer_id: 7,
+        };
+        state.begin_native_dispatch(60, Some(metadata));
+
+        state.enter_winit_callback();
+        let current_dispatch = state.public_touch_native_metadata(Some(0x2222), 7);
+        assert!(current_dispatch.message_association.is_some());
+        state.leave_winit_callback();
+
+        // A later or buffered callback cannot reuse the last hook message even
+        // when its HWND and touch ID happen to match exactly.
+        state.enter_winit_callback();
+        let stale = state.public_touch_native_metadata(Some(0x2222), 7);
+        assert_eq!(stale.message_association, None);
+        assert_eq!(
+            stale.pen_classification,
+            PublicPenClassification::Unclassified(PublicUnclassifiedReason::NoMatchedNativeMessage)
+        );
+        state.leave_winit_callback();
+    }
+
+    #[test]
+    fn public_winit_touch_record_keeps_force_as_source_data_and_native_time_tilt_null() {
+        let mut state = ProbeState::default();
+        state.record(ProbeRecord::PublicWinitEvent(PublicWinitEventRecord {
+            source: CaptureSource::PublicWinitWindowEvent,
+            capability: PublicEventCapability::TouchPhasePositionForce,
+            public_event_sequence: 1,
+            app_observed_elapsed_ns: 2,
+            window_hwnd_raw_session_scoped: Some(0x2222),
+            message_association: None,
+            data: PublicWinitEventData::Touch {
+                winit_device_id: winit::event::DeviceId::dummy(),
+                public_touch_id: 7,
+                phase: winit::event::TouchPhase::Moved,
+                x_physical_px: 1.0,
+                y_physical_px: 2.0,
+                public_winit_force: Some(winit::event::Force::Normalized(0.25)),
+                native_pointer_type_raw: None,
+                pointer_type_error_raw: None,
+                pen_classification: PublicPenClassification::Unclassified(
+                    PublicUnclassifiedReason::NoMatchedNativeMessage,
+                ),
+                native_timestamp_raw: None,
+                tilt: None,
+            },
+        }));
+
+        assert_eq!(state.summary().public_events, 1);
+        assert_eq!(state.summary().public_touch_events, 1);
+        match &state.records[0] {
+            ProbeRecord::PublicWinitEvent(record) => {
+                assert_eq!(record.message_association, None);
+                assert!(matches!(
+                    record.data,
+                    PublicWinitEventData::Touch {
+                        public_winit_force: Some(winit::event::Force::Normalized(0.25)),
+                        native_timestamp_raw: None,
+                        tilt: None,
+                        ..
+                    }
+                ));
+            }
+            _ => panic!("public event source tag changed"),
+        }
     }
 }
