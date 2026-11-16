@@ -12,8 +12,8 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Display, Formatter},
-    fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, Read, Write},
+    fs::{self, File, OpenOptions, TryLockError},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -238,6 +238,7 @@ pub(crate) enum JournalErrorKind {
     InvalidData,
     LimitReached,
     AllocationFailed,
+    WriterLeaseBusy,
     Poisoned,
 }
 
@@ -282,6 +283,13 @@ impl JournalError {
             message:
                 "journal writer is poisoned; discard derived in-memory state and reopen the file"
                     .to_owned(),
+        }
+    }
+
+    fn writer_lease_busy() -> Self {
+        Self {
+            kind: JournalErrorKind::WriterLeaseBusy,
+            message: "another writer holds the journal's exclusive file lease".to_owned(),
         }
     }
 }
@@ -872,6 +880,14 @@ impl JournalReplayState {
     }
 }
 
+fn acquire_writer_lease(file: &File) -> Result<(), JournalError> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(JournalError::writer_lease_busy()),
+        Err(TryLockError::Error(error)) => Err(JournalError::io(error)),
+    }
+}
+
 impl JournalWriter {
     pub(crate) fn create(path: PathBuf, header: JournalHeader) -> Result<Self, JournalError> {
         header.validate()?;
@@ -883,9 +899,11 @@ impl JournalWriter {
         }
         let file = OpenOptions::new()
             .create_new(true)
-            .append(true)
+            .read(true)
+            .write(true)
             .open(&path)
             .map_err(JournalError::io)?;
+        acquire_writer_lease(&file)?;
         let header_line = encode_row(&encode_header_fields(&header, JOURNAL_SCHEMA_VERSION))?;
         if header_line.len() as u64 > MAX_JOURNAL_BYTES {
             return Err(JournalError::limit(
@@ -921,10 +939,25 @@ impl JournalWriter {
     }
 
     /// Opens an existing valid journal for append. A torn final line is
-    /// explicitly truncated to the last validated record boundary; malformed
-    /// complete records and interior corruption are rejected by the parser.
+    /// explicitly truncated to the last validated record boundary. One
+    /// exclusive OS file lease covers parsing, recovery, and future appends;
+    /// malformed complete records and interior corruption are rejected.
     pub(crate) fn open_append(path: PathBuf) -> Result<Self, JournalError> {
-        let parsed = read_journal(&path)?;
+        Self::open_append_with_validation_hook(path, || {})
+    }
+
+    fn open_append_with_validation_hook(
+        path: PathBuf,
+        after_validation: impl FnOnce(),
+    ) -> Result<Self, JournalError> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(JournalError::io)?;
+        acquire_writer_lease(&file)?;
+        file.seek(SeekFrom::Start(0)).map_err(JournalError::io)?;
+        let parsed = parse_journal(&mut file)?;
         if parsed.schema_version != JOURNAL_SCHEMA_VERSION {
             return Err(JournalError::invalid(
                 "legacy journal is read-only; migrate into a new schema 2 journal before append",
@@ -937,18 +970,12 @@ impl JournalWriter {
             .last()
             .map(|checkpoint| checkpoint.fingerprint)
             .ok_or_else(|| JournalError::invalid("journal has no validated header prefix"))?;
+        after_validation();
         if recovered_truncated_final_record {
-            let file = OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .map_err(JournalError::io)?;
             file.set_len(valid_prefix_bytes).map_err(JournalError::io)?;
             file.sync_all().map_err(JournalError::io)?;
         }
-        let file = OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .map_err(JournalError::io)?;
+        file.seek(SeekFrom::End(0)).map_err(JournalError::io)?;
         Ok(Self {
             path,
             file,
@@ -1471,6 +1498,7 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
                     .push(StoredPhysicalSample { sequence, sample });
             }
             "SMD" => {
+                require_fields(&fields, 10, "SMD")?;
                 if total_state_entries >= MAX_JOURNAL_RECORDS {
                     return Err(JournalError::limit("snapshot state entry cap reached"));
                 }
@@ -1729,6 +1757,7 @@ fn parse_header_fields(fields: &[&str]) -> Result<(u32, JournalHeader), JournalE
             "first journal record is not a LASSOINK-JOURNAL header",
         ));
     }
+    require_at_least_fields(fields, 2, "LASSOINK-JOURNAL")?;
     let version = parse_u32(fields[1], "journal schema version")?;
     if !matches!(
         version,
@@ -2520,6 +2549,17 @@ fn require_fields(fields: &[&str], expected: usize, tag: &str) -> Result<(), Jou
     }
 }
 
+fn require_at_least_fields(fields: &[&str], minimum: usize, tag: &str) -> Result<(), JournalError> {
+    if fields.len() < minimum {
+        Err(JournalError::invalid(format!(
+            "{tag} record has {} fields; expected at least {minimum}",
+            fields.len()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn read_bounded_line<R: BufRead>(
     reader: &mut R,
     output: &mut Vec<u8>,
@@ -2671,6 +2711,7 @@ mod tests {
         writer.append_sample(first).unwrap();
         writer.append_sample(second).unwrap();
         writer.flush().unwrap();
+        drop(writer);
 
         let parsed = read_journal(&path).unwrap();
         assert_eq!(parsed.schema_version, JOURNAL_SCHEMA_VERSION);
@@ -2885,6 +2926,7 @@ mod tests {
         writer.tombstone(310, target).unwrap();
         assert_eq!(delete_revision, 2);
         writer.flush().unwrap();
+        drop(writer);
 
         let parsed = read_journal(&path).unwrap();
         assert_eq!(parsed.records.len(), 6);
@@ -2939,6 +2981,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rev, 1);
+        drop(writer);
         let parsed = read_journal(&path).unwrap();
         let visible = parsed.state.projected_samples().unwrap();
         assert_eq!(parsed.state.physical_samples.len(), 2);
@@ -3011,6 +3054,33 @@ mod tests {
         rewrite_record_field(&path, "P", 0, "BROKEN");
         assert!(read_journal(&path).is_err());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn complete_short_header_and_event_rows_return_invalid_data() {
+        let short_header_path = temp_path("short-header");
+        fs::write(&short_header_path, b"LASSOINK-JOURNAL\n").unwrap();
+        let error = read_journal(&short_header_path).unwrap_err();
+        assert_eq!(error.kind, JournalErrorKind::InvalidData);
+        let error = parse_journal(std::io::Cursor::new(b"LASSOINK-JOURNAL\n")).unwrap_err();
+        assert_eq!(error.kind, JournalErrorKind::InvalidData);
+        fs::remove_file(short_header_path).unwrap();
+
+        let header_line = encode_row(&encode_header_fields(
+            &header("short-event-header"),
+            JOURNAL_SCHEMA_VERSION,
+        ))
+        .unwrap();
+        for malformed_row in ["P", "META", "REV", "TOMB", "MOVE", "CORR"] {
+            let mut input = header_line.clone();
+            input.extend_from_slice(format!("{malformed_row}\n").as_bytes());
+            let error = parse_journal(std::io::Cursor::new(input)).unwrap_err();
+            assert_eq!(
+                error.kind,
+                JournalErrorKind::InvalidData,
+                "row tag {malformed_row} must reject its short complete row"
+            );
+        }
     }
 
     #[test]
@@ -3211,6 +3281,120 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2, 3, 4]
         );
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn exclusive_writer_lease_refuses_second_writer_without_mutation() {
+        let path = temp_path("writer-lease");
+        let mut owner =
+            JournalWriter::create(path.clone(), header("journal-writer-lease")).unwrap();
+        owner
+            .append_sample(sample(
+                "direct-wm-pointer",
+                "stroke-a",
+                1,
+                10,
+                Some(5),
+                true,
+                1,
+            ))
+            .unwrap();
+        drop(owner);
+        let bytes_before_competitor = fs::read(&path).unwrap();
+
+        let owner = JournalWriter::open_append(path.clone()).unwrap();
+        let second_writer_error = JournalWriter::open_append(path.clone()).unwrap_err();
+        assert_eq!(second_writer_error.kind, JournalErrorKind::WriterLeaseBusy);
+        drop(owner);
+        assert_eq!(fs::read(&path).unwrap(), bytes_before_competitor);
+
+        let mut owner = JournalWriter::open_append(path.clone()).unwrap();
+        assert_eq!(
+            owner
+                .append_sample(sample(
+                    "direct-wm-pointer",
+                    "stroke-a",
+                    2,
+                    20,
+                    Some(6),
+                    true,
+                    2,
+                ))
+                .unwrap(),
+            2
+        );
+        drop(owner);
+
+        let reopened = JournalWriter::open_append(path.clone()).unwrap();
+        assert_eq!(reopened.state.last_sequence, 2);
+        drop(reopened);
+        let parsed = read_journal(&path).unwrap();
+        assert_eq!(parsed.state.last_sequence, 2);
+        assert_eq!(parsed.state.physical_samples.len(), 2);
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn recovery_holds_lease_across_parse_truncate_and_append_on_same_handle() {
+        let path = temp_path("writer-lease-recovery");
+        let mut initial =
+            JournalWriter::create(path.clone(), header("journal-writer-lease-recovery")).unwrap();
+        initial
+            .append_sample(sample(
+                "direct-wm-pointer",
+                "stroke-a",
+                1,
+                10,
+                Some(5),
+                true,
+                1,
+            ))
+            .unwrap();
+        drop(initial);
+
+        let mut torn_tail = OpenOptions::new().append(true).open(&path).unwrap();
+        torn_tail.write_all(b"P\t2\tinterrupted-row").unwrap();
+        drop(torn_tail);
+        let valid_prefix_bytes = read_journal(&path).unwrap().recovery.valid_prefix_bytes;
+        let path_during_recovery = path.clone();
+
+        let mut recovery_owner =
+            JournalWriter::open_append_with_validation_hook(path.clone(), || {
+                // This callback runs after validation and before recovery
+                // truncation while the one writer lease is still held.
+                let competing_error =
+                    JournalWriter::open_append(path_during_recovery.clone()).unwrap_err();
+                assert_eq!(competing_error.kind, JournalErrorKind::WriterLeaseBusy);
+            })
+            .unwrap();
+        assert!(recovery_owner.recovered_truncated_final_record());
+        assert_eq!(recovery_owner.state.last_sequence, 1);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            valid_prefix_bytes,
+            "recovery truncates only the torn tail after holding the lease"
+        );
+        assert_eq!(
+            recovery_owner
+                .append_sample(sample(
+                    "direct-wm-pointer",
+                    "stroke-a",
+                    2,
+                    20,
+                    Some(6),
+                    true,
+                    2,
+                ))
+                .unwrap(),
+            2
+        );
+        drop(recovery_owner);
+
+        let parsed = read_journal(&path).unwrap();
+        assert!(!parsed.recovery.truncated_final_record);
+        assert_eq!(parsed.state.last_sequence, 2);
+        assert_eq!(parsed.state.physical_samples.len(), 2);
         cleanup_journal(&path);
     }
 
@@ -3478,6 +3662,53 @@ mod tests {
         assert_eq!(stale.state.physical_samples.len(), 2);
         cleanup_journal(&stale_path);
 
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn short_snapshot_state_rows_reject_and_malformed_snapshot_falls_back() {
+        let snapshot_header =
+            b"LASSOINK-SNAPSHOT\t1\tjournal-short-smd\t0\t0\t0\t0000000000000000\t0000000000000000\n";
+        for malformed_tag in ["SP", "SMD", "ST", "SM", "SC"] {
+            let mut bytes = snapshot_header.to_vec();
+            bytes.extend_from_slice(format!("{malformed_tag}\n").as_bytes());
+            assert!(
+                parse_snapshot(std::io::Cursor::new(bytes)).is_err(),
+                "short snapshot row {malformed_tag} must be rejected"
+            );
+        }
+
+        let path = temp_path("snapshot-short-smd-journal");
+        let snapshot_path = default_snapshot_path(&path);
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-short-smd-source")).unwrap();
+        writer
+            .append_sample(sample(
+                "direct-wm-pointer",
+                "stroke-a",
+                1,
+                10,
+                Some(5),
+                true,
+                1,
+            ))
+            .unwrap();
+        writer.write_snapshot(&snapshot_path).unwrap();
+        drop(writer);
+        let full = read_journal(&path).unwrap();
+
+        let mut malformed_snapshot =
+            b"LASSOINK-SNAPSHOT\t1\tjournal-short-smd-source\t0\t0\t0\t0000000000000000\t0000000000000000\n"
+                .to_vec();
+        malformed_snapshot.extend_from_slice(b"SMD\n");
+        fs::write(&snapshot_path, malformed_snapshot).unwrap();
+
+        let restored = load_with_snapshot(&path, &snapshot_path).unwrap();
+        assert!(matches!(
+            restored.disposition,
+            SnapshotDisposition::Rejected(_)
+        ));
+        assert_eq!(restored.state, full.state);
         cleanup_journal(&path);
     }
 }
