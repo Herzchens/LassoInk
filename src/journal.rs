@@ -2454,6 +2454,9 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
             }
             "US" | "RS" => {
                 require_fields(&fields, 2, "undo/redo stack")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
+                    return Err(JournalError::limit("snapshot state entry cap reached"));
+                }
                 let action_id = parse_u64(fields[1], "snapshot stack action ID")?;
                 let stack = if fields[0] == "US" {
                     &mut snapshot.state.undo_stack
@@ -4599,6 +4602,107 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_round_trips_mixed_edit_actions_and_undo_redo_stacks_with_tail() {
+        let path = temp_path("snapshot-edit-state");
+        let snapshot_path = default_snapshot_path(&path);
+        let journal_header = header("journal-snapshot-edit-state");
+        let mut writer = JournalWriter::create(path.clone(), journal_header.clone()).unwrap();
+
+        let old_sample = sample("direct-wm-pointer", "collision", 1, 100, Some(10), true, 10);
+        let old_target = target_of(&old_sample, &journal_header.journal_id);
+        writer.append_sample(old_sample).unwrap();
+        writer
+            .begin_session_epoch(
+                "session-2".to_owned(),
+                1_800_000_002_000_000_000,
+                Some("cfg-b".to_owned()),
+                "snapshot-test-resume".to_owned(),
+            )
+            .unwrap();
+        let mut new_sample = sample("direct-wm-pointer", "collision", 1, 1, Some(1), true, 30);
+        new_sample.session_id = "session-2".to_owned();
+        new_sample.config_id = Some("cfg-b".to_owned());
+        let new_target = target_of(&new_sample, &journal_header.journal_id);
+        writer.append_sample(new_sample).unwrap();
+        assert_ne!(old_target, new_target);
+
+        let hide_old = writer
+            .apply_edit_action(
+                2,
+                EditCommand::Tombstone {
+                    targets: vec![old_target.clone()],
+                },
+            )
+            .unwrap();
+        let hide_new = writer
+            .apply_edit_action(
+                3,
+                EditCommand::Tombstone {
+                    targets: vec![new_target],
+                },
+            )
+            .unwrap();
+        let restore_old = writer
+            .apply_edit_action(
+                4,
+                EditCommand::Restore {
+                    targets: vec![old_target.clone()],
+                },
+            )
+            .unwrap();
+        writer.undo_last_edit(5).unwrap();
+        writer.undo_last_edit(6).unwrap();
+        assert_eq!(writer.state.undo_stack, [hide_old]);
+        assert_eq!(writer.state.redo_stack, [restore_old, hide_new]);
+        assert_eq!(
+            writer
+                .state
+                .edit_actions
+                .iter()
+                .map(|action| action.active)
+                .collect::<Vec<_>>(),
+            [true, false, false]
+        );
+        writer.write_snapshot(&snapshot_path).unwrap();
+
+        assert_eq!(writer.redo_last_edit(7).unwrap(), hide_new);
+        let restore_after_snapshot = writer
+            .apply_edit_action(
+                8,
+                EditCommand::Restore {
+                    targets: vec![old_target],
+                },
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let full = read_journal(&path).unwrap();
+        let restored = load_with_snapshot(&path, &snapshot_path).unwrap();
+        assert_eq!(restored.disposition, SnapshotDisposition::Used);
+        assert_eq!(restored.replayed_tail_records, 2);
+        assert_eq!(restored.state, full.state);
+        assert_eq!(full.state.session_epochs.len(), 2);
+        assert_eq!(full.state.edit_actions.len(), 4);
+        assert_eq!(full.state.edit_controls.len(), 3);
+        assert_eq!(
+            full.state.undo_stack,
+            [hide_old, hide_new, restore_after_snapshot]
+        );
+        assert!(full.state.redo_stack.is_empty());
+        assert_eq!(
+            full.state
+                .edit_actions
+                .iter()
+                .map(|action| action.active)
+                .collect::<Vec<_>>(),
+            [true, true, false, true]
+        );
+        assert_eq!(full.state.projected_samples().unwrap().len(), 1);
+        cleanup_journal(&path);
+    }
+
+    #[test]
     fn interrupted_multi_stroke_action_is_not_partially_visible() {
         let path = temp_path("interrupted-edit");
         let journal_header = header("journal-interrupted-edit");
@@ -5503,6 +5607,55 @@ mod tests {
             SnapshotDisposition::Rejected(_)
         ));
         assert_eq!(restored.state, full.state);
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn oversized_snapshot_undo_redo_stack_rows_reject_and_load_falls_back() {
+        let path = temp_path("snapshot-stack-cap-journal");
+        let snapshot_path = default_snapshot_path(&path);
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-snapshot-stack-cap")).unwrap();
+        writer
+            .append_sample(sample(
+                "direct-wm-pointer",
+                "stroke-a",
+                1,
+                10,
+                Some(5),
+                true,
+                1,
+            ))
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        let full = read_journal(&path).unwrap();
+
+        let snapshot_header =
+            b"LASSOINK-SNAPSHOT\t2\tjournal-snapshot-stack-cap\t0\t0\t0\t0000000000000000\t0000000000000000\n";
+        for stack_tag in ["US", "RS"] {
+            let mut malformed_snapshot = Vec::new();
+            malformed_snapshot
+                .try_reserve(
+                    snapshot_header
+                        .len()
+                        .saturating_add(MAX_SNAPSHOT_STATE_ENTRIES.saturating_mul(6)),
+                )
+                .unwrap();
+            malformed_snapshot.extend_from_slice(snapshot_header);
+            for _ in 0..=MAX_SNAPSHOT_STATE_ENTRIES {
+                malformed_snapshot.extend_from_slice(stack_tag.as_bytes());
+                malformed_snapshot.extend_from_slice(b"\t1\n");
+            }
+            fs::write(&snapshot_path, malformed_snapshot).unwrap();
+
+            let restored = load_with_snapshot(&path, &snapshot_path).unwrap();
+            assert!(matches!(
+                restored.disposition,
+                SnapshotDisposition::Rejected(_)
+            ));
+            assert_eq!(restored.state, full.state);
+        }
         cleanup_journal(&path);
     }
 }
