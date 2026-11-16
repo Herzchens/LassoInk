@@ -3544,10 +3544,11 @@ mod tests {
                 ..
             }
         )));
-        assert!(contradictory_events.iter().all(|event| !matches!(
-            event,
-            DirectCaptureEvent::StrokeCommitRequested { .. }
-        )));
+        assert!(
+            contradictory_events
+                .iter()
+                .all(|event| !matches!(event, DirectCaptureEvent::StrokeCommitRequested { .. }))
+        );
         assert_eq!(tracker.active_stroke_count(), 0);
 
         let fresh_down = direct_batch(
@@ -3796,10 +3797,7 @@ mod tests {
             i32::MIN
         );
 
-        let up = direct_batch(
-            PointerMessageKind::Up,
-            tool_sample(0, 91, i32::MAX, 100),
-        );
+        let up = direct_batch(PointerMessageKind::Up, tool_sample(0, 91, i32::MAX, 100));
         let (up_raw, up_intent) = tracker
             .direct_batch_to_tool_events(
                 CanvasTool::Select,
@@ -3915,7 +3913,10 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![101, 102]
             );
-            assert!(up_intent.is_none(), "canceled history cannot edit the scene");
+            assert!(
+                up_intent.is_none(),
+                "canceled history cannot edit the scene"
+            );
             assert!(tracker.active.is_empty());
             assert_eq!(scene.stroke_count(), 1);
         }

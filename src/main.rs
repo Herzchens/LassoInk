@@ -66,8 +66,8 @@ pub(crate) fn require_native_ui_test_opt_in() {
         std::env::var(key).is_ok_and(|actual| actual == expected)
     }
 
-    let hosted_event = env_is("GITHUB_EVENT_NAME", "push")
-        || env_is("GITHUB_EVENT_NAME", "pull_request");
+    let hosted_event =
+        env_is("GITHUB_EVENT_NAME", "push") || env_is("GITHUB_EVENT_NAME", "pull_request");
     assert!(
         cfg!(target_os = "windows")
             && env_is("LASSOINK_RUN_NATIVE_UI_TESTS", "1")

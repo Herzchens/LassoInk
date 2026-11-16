@@ -689,11 +689,9 @@ mod tests {
                         {
                             return records;
                         }
-                        ProjectWriterAck::CaptureFailed {
-                            batch_id,
-                            error,
-                            ..
-                        } if batch_id == expected_batch_id => {
+                        ProjectWriterAck::CaptureFailed { batch_id, error, .. }
+                            if batch_id == expected_batch_id =>
+                        {
                             panic!("capture batch {batch_id} failed: {error}");
                         }
                         _ => {}
