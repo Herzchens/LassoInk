@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   verify:
-    name: Verify M1 stage 3 on Windows x64
+    name: Verify M3 source and default tests on Windows x64
     runs-on: windows-2025
     steps:
       - name: Check out exact PR head or pushed commit
@@ -48,3 +48,36 @@ jobs:
       - name: Build
         shell: pwsh
         run: cargo +1.100.0 build --locked --workspace
+
+  native-ui:
+    name: Guarded Win32 Winit and GDI tests
+    needs: verify
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      LASSOINK_RUN_NATIVE_UI_TESTS: "1"
+    steps:
+      - name: Check out exact PR head or pushed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out head SHA
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:EXPECTED_HEAD_SHA) {
+            throw "Expected $env:EXPECTED_HEAD_SHA; got $actual"
+          }
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.100.0 --profile minimal --component clippy --component rustfmt --target x86_64-pc-windows-msvc
+
+      - name: Run guarded native UI tests serially
+        shell: pwsh
+        run: cargo +1.100.0 test --locked --workspace -- --include-ignored --test-threads=1

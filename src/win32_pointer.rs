@@ -455,6 +455,11 @@ pub(crate) enum CaptureIssue {
     SessionOutputFailed {
         stage: SessionOutputStage,
     },
+    ProjectWriterBackpressure {
+        queued_samples: u64,
+        pending_batches: u64,
+    },
+    ProjectIncomplete,
     NullMessagePointer,
     InvalidPointerId,
     EmptyHistory,
@@ -789,12 +794,15 @@ pub(crate) enum StorageLimit {
     NativeHistory,
     Allocation,
     SessionOutput,
+    ProjectWriter,
+    ProjectIncomplete,
     Multiple,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct ProbeState {
     records: Vec<ProbeRecord>,
+    pending_samples: u64,
     summary: ProbeSummary,
     public_pointer_type_api: Option<GetPointerTypeFn>,
     active_public_dispatch: Option<ActivePublicDispatch>,
@@ -1037,6 +1045,7 @@ impl ProbeState {
 
     pub(crate) fn clear_pending_records_after_write(&mut self) {
         self.records.clear();
+        self.pending_samples = 0;
     }
 
     pub(crate) fn mark_session_output_failed(&mut self, stage: SessionOutputStage) {
@@ -1051,12 +1060,39 @@ impl ProbeState {
         });
     }
 
+    pub(crate) fn mark_project_writer_backpressure(
+        &mut self,
+        queued_samples: u64,
+        pending_batches: u64,
+    ) {
+        let issue = CaptureIssue::ProjectWriterBackpressure {
+            queued_samples,
+            pending_batches,
+        };
+        self.summary.issues = self.summary.issues.saturating_add(1);
+        self.summary.incomplete_batches = self.summary.incomplete_batches.saturating_add(1);
+        self.summary.latest_incomplete_issue = Some(issue);
+        self.summary.storage_limit = Some(if self.summary.storage_limit.is_some() {
+            StorageLimit::Multiple
+        } else {
+            StorageLimit::ProjectWriter
+        });
+    }
+
+    pub(crate) fn mark_project_incomplete(&mut self) {
+        let issue = CaptureIssue::ProjectIncomplete;
+        self.summary.issues = self.summary.issues.saturating_add(1);
+        self.summary.incomplete_batches = self.summary.incomplete_batches.saturating_add(1);
+        self.summary.latest_incomplete_issue = Some(issue);
+        self.summary.storage_limit = Some(if self.summary.storage_limit.is_some() {
+            StorageLimit::Multiple
+        } else {
+            StorageLimit::ProjectIncomplete
+        });
+    }
+
     pub(crate) fn remaining_sample_capacity(&self) -> u64 {
-        MAX_RETAINED_SAMPLES.saturating_sub(
-            self.summary
-                .samples
-                .saturating_add(self.summary.wintab_packets),
-        )
+        MAX_RETAINED_SAMPLES.saturating_sub(self.pending_samples)
     }
 
     pub(crate) fn record(&mut self, record: ProbeRecord) {
@@ -1073,11 +1109,11 @@ impl ProbeState {
             ProbeRecord::WintabPackets(batch) => batch.packets.len() as u64,
             _ => 0,
         };
-        let record_limit_reached = self.summary.records_retained >= max_records as u64;
-        let retained_sample_count = self
-            .summary
-            .samples
-            .saturating_add(self.summary.wintab_packets);
+        // These caps protect the in-memory pending buffer. Total session
+        // counters remain cumulative; successfully flushed batches release
+        // this pending capacity for later input.
+        let record_limit_reached = self.records.len() >= max_records;
+        let retained_sample_count = self.pending_samples;
         let sample_limit_exceeded =
             incoming_samples > max_samples.saturating_sub(retained_sample_count);
         let message_issue = match &record {
@@ -1105,7 +1141,7 @@ impl ProbeState {
             self.summary.records_not_retained = self.summary.records_not_retained.saturating_add(1);
             if incoming_samples > 0 {
                 let remaining_records =
-                    (max_records as u64).saturating_sub(self.summary.records_retained);
+                    (max_records as u64).saturating_sub(self.records.len() as u64);
                 let remaining_samples = max_samples.saturating_sub(retained_sample_count);
                 if let ProbeRecord::WintabPackets(_) = &record {
                     let issue = WintabIssue::RetainedDataLimitExceeded {
@@ -1285,6 +1321,7 @@ impl ProbeState {
         }
         self.records.push(record);
         self.summary.records_retained = self.summary.records_retained.saturating_add(1);
+        self.pending_samples = self.pending_samples.saturating_add(incoming_samples);
 
         let wintab_record_limit = wintab_retention_limit.is_some_and(|issue| {
             matches!(
@@ -1305,19 +1342,14 @@ impl ProbeState {
             _ => false,
         });
         self.mark_storage_limit(
-            self.summary.records_retained >= max_records as u64 || wintab_record_limit,
-            self.summary
-                .samples
-                .saturating_add(self.summary.wintab_packets)
-                >= max_samples
-                || matches!(
-                    message_issue,
-                    Some(
-                        CaptureIssue::RetainedSampleCapacityExceeded { .. }
-                            | CaptureIssue::RetentionCapacitiesExceeded { .. }
-                    )
+            wintab_record_limit,
+            matches!(
+                message_issue,
+                Some(
+                    CaptureIssue::RetainedSampleCapacityExceeded { .. }
+                        | CaptureIssue::RetentionCapacitiesExceeded { .. }
                 )
-                || wintab_sample_limit,
+            ) || wintab_sample_limit,
             native_history_limit,
             false,
         );
@@ -2656,13 +2688,19 @@ mod tests {
         state.record_with_limits(api_error_record(1), 2, 8);
         state.record_with_limits(api_error_record(2), 2, 8);
 
-        let full_summary = state.summary();
         assert_eq!(state.records.len(), 2);
-        assert_eq!(full_summary.records_retained, 2);
-        assert_eq!(full_summary.storage_limit, Some(StorageLimit::Records));
-        assert!(!state.can_capture());
+        assert_eq!(state.summary().records_retained, 2);
+        assert_eq!(state.summary().storage_limit, None);
+        assert!(state.can_capture());
 
         state.record_with_limits(api_error_record(3), 2, 8);
+        assert_eq!(state.records.len(), 2);
+        assert_eq!(state.summary().storage_limit, Some(StorageLimit::Records));
+        assert_eq!(state.summary().records_not_retained, 1);
+        assert!(!state.can_capture());
+        let full_summary = state.summary();
+
+        state.record_with_limits(api_error_record(4), 2, 8);
         assert_eq!(state.records.len(), 2);
         assert_eq!(state.summary(), full_summary);
     }
@@ -2671,15 +2709,37 @@ mod tests {
     fn public_event_records_obey_the_shared_record_cap() {
         let mut state = ProbeState::default();
         state.record_with_limits(public_touch_record(1), 1, 8);
+        assert_eq!(state.summary().storage_limit, None);
         state.record_with_limits(public_touch_record(2), 1, 8);
 
         let summary = state.summary();
         assert_eq!(state.records.len(), 1);
         assert_eq!(summary.public_events, 1);
         assert_eq!(summary.public_touch_events, 1);
-        assert_eq!(summary.records_not_retained, 0);
+        assert_eq!(summary.records_not_retained, 1);
         assert_eq!(summary.storage_limit, Some(StorageLimit::Records));
         assert!(!state.can_capture());
+    }
+
+    #[test]
+    fn flushing_pending_records_releases_bounded_buffer_for_later_input() {
+        let mut state = ProbeState::default();
+        state.record_with_limits(direct_batch(3, 1), 1, 3);
+        assert_eq!(state.pending_samples, 3);
+        assert_eq!(state.records.len(), 1);
+        assert!(state.can_capture());
+
+        state.clear_pending_records_after_write();
+        assert_eq!(state.pending_samples, 0);
+        assert!(state.records.is_empty());
+        assert_eq!(state.remaining_sample_capacity(), 131_072);
+        assert!(state.can_capture());
+
+        state.record_with_limits(direct_batch(3, 2), 1, 3);
+        assert_eq!(state.pending_samples, 3);
+        assert_eq!(state.summary().samples, 6);
+        assert_eq!(state.summary().records_retained, 2);
+        assert!(state.can_capture());
     }
 
     #[test]
@@ -2695,6 +2755,24 @@ mod tests {
             state.summary().latest_startup_issue,
             Some(CaptureIssue::SessionOutputFailed {
                 stage: SessionOutputStage::Write,
+            })
+        );
+    }
+
+    #[test]
+    fn project_writer_backpressure_stops_new_capture_with_a_distinct_issue() {
+        let mut state = ProbeState::default();
+        state.mark_project_writer_backpressure(131_072, 8);
+        assert!(!state.can_capture());
+        assert_eq!(
+            state.summary().storage_limit,
+            Some(StorageLimit::ProjectWriter)
+        );
+        assert_eq!(
+            state.summary().latest_incomplete_issue,
+            Some(CaptureIssue::ProjectWriterBackpressure {
+                queued_samples: 131_072,
+                pending_batches: 8,
             })
         );
     }

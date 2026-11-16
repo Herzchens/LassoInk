@@ -28,6 +28,7 @@ const MAX_JOURNAL_TEXT_BYTES: usize = 4096;
 const MAX_RAW_PAYLOAD_BYTES: usize = 8192;
 const MAX_METADATA_TEXT_BYTES: usize = 4096;
 pub(crate) const MAX_EDIT_TARGETS: usize = 256;
+const STROKE_VIEW_FRAME_WIDTH: usize = 7;
 const FNV_OFFSET_BASIS: u64 = 14_695_981_039_346_656_037;
 const FNV_PRIME: u64 = 1_099_511_628_211;
 
@@ -53,6 +54,53 @@ pub(crate) struct StrokeRef {
     pub device_id: Option<String>,
     pub pointer_id: Option<u64>,
     pub stroke_id: String,
+}
+
+/// Exact per-stroke coordinate frame observed at native pen-down. Screen
+/// positions remain raw in `PhysicalSample`; this frame documents the client
+/// origin and canvas view used to derive replay geometry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StrokeViewFrame {
+    pub screen_origin_x_px: i64,
+    pub screen_origin_y_px: i64,
+    /// IEEE-754 bits for the Winit DPI scale factor observed at pen-down.
+    /// Raw pointer and GDI coordinates are already physical screen pixels, so
+    /// this value is provenance and is not multiplied into those coordinates.
+    pub dpi_scale_factor_bits: u64,
+    pub canvas_zoom_bits: u64,
+    pub canvas_pan_x_bits: u64,
+    pub canvas_pan_y_bits: u64,
+    pub toolbar_height_px: u32,
+}
+
+impl Default for StrokeViewFrame {
+    fn default() -> Self {
+        Self {
+            screen_origin_x_px: 0,
+            screen_origin_y_px: 0,
+            dpi_scale_factor_bits: 1.0_f64.to_bits(),
+            canvas_zoom_bits: 1.0_f64.to_bits(),
+            canvas_pan_x_bits: 0.0_f64.to_bits(),
+            canvas_pan_y_bits: 0.0_f64.to_bits(),
+            toolbar_height_px: 40,
+        }
+    }
+}
+
+impl StrokeViewFrame {
+    pub(crate) fn is_valid(self) -> bool {
+        let dpi_scale = f64::from_bits(self.dpi_scale_factor_bits);
+        let zoom = f64::from_bits(self.canvas_zoom_bits);
+        let pan_x = f64::from_bits(self.canvas_pan_x_bits);
+        let pan_y = f64::from_bits(self.canvas_pan_y_bits);
+        dpi_scale.is_finite()
+            && dpi_scale > 0.0
+            && zoom.is_finite()
+            && (0.2..=8.0).contains(&zoom)
+            && pan_x.is_finite()
+            && pan_y.is_finite()
+            && self.toolbar_height_px <= 4096
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -152,6 +200,16 @@ pub(crate) enum JournalEvent {
         epoch: SessionEpoch,
         app_arrival_elapsed_ns: u128,
     },
+    StrokeStarted {
+        target: StrokeRef,
+        view_frame: StrokeViewFrame,
+        app_arrival_elapsed_ns: u128,
+    },
+    StrokeInterrupted {
+        target: StrokeRef,
+        reason: StrokeInterruptionReason,
+        app_arrival_elapsed_ns: u128,
+    },
     /// One durable row is one complete logical action. Multi-stroke actions
     /// are bounded lists in this row, so a crash cannot expose a partial edit.
     EditAction {
@@ -221,6 +279,9 @@ pub(crate) struct SessionEpoch {
     pub started_at_unix_ns: Option<u128>,
     pub config_id: Option<String>,
     pub provenance: String,
+    /// New capture sessions require explicit stroke start/commit rows.
+    /// Legacy migrated sessions remain visible without synthesized markers.
+    pub requires_stroke_commit: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -236,6 +297,10 @@ pub(crate) enum EditCommand {
     },
     Restore {
         targets: Vec<StrokeRef>,
+    },
+    StrokeVisibility {
+        targets: Vec<StrokeRef>,
+        visible: bool,
     },
     Move {
         target: StrokeRef,
@@ -280,6 +345,45 @@ pub(crate) struct StoredMigrationProvenance {
     pub source_journal_id: String,
     pub source_prefix_fingerprint: u64,
     pub source_record_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrokeInterruptionReason {
+    PointerDownBeforePenUp,
+    PointerCaptureChanged,
+    PointerLeave,
+    PointerReentryBoundary,
+    DeviceOutOfRange,
+    DeviceChanged,
+    DeviceReentryBoundary,
+    ContactLostWithoutPenUp,
+    CanvasViewTransformChanged,
+    CanvasToolChanged,
+    CanceledNativeUp,
+    UnattributedNativeUp,
+    AmbiguousNativeUp,
+    MixedDeviceBatch,
+    WindowFocusLost,
+    WriterBackpressure,
+    ProcessEndedWithoutPenUp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredStrokeStart {
+    pub sequence: u64,
+    pub app_epoch_id: String,
+    pub app_arrival_elapsed_ns: u128,
+    pub target: StrokeRef,
+    pub view_frame: StrokeViewFrame,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredStrokeInterruption {
+    pub sequence: u64,
+    pub app_epoch_id: String,
+    pub app_arrival_elapsed_ns: u128,
+    pub target: StrokeRef,
+    pub reason: StrokeInterruptionReason,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -328,6 +432,9 @@ pub(crate) struct JournalReplayState {
     pub logical_revision: u64,
     pub physical_samples: Vec<StoredPhysicalSample>,
     pub session_epochs: Vec<StoredSessionEpoch>,
+    pub stroke_starts: Vec<StoredStrokeStart>,
+    pub stroke_interruptions: Vec<StoredStrokeInterruption>,
+    pub active_strokes: HashMap<StrokeRef, StoredStrokeStart>,
     pub edit_actions: Vec<StoredEditAction>,
     pub edit_controls: Vec<StoredEditControl>,
     pub migration_provenance: Vec<StoredMigrationProvenance>,
@@ -339,6 +446,7 @@ pub(crate) struct JournalReplayState {
     pub moves: Vec<StoredMove>,
     pub corrections: Vec<StoredCorrection>,
     session_ids: HashSet<String>,
+    stroke_start_set: HashSet<StrokeRef>,
     undo_stack: Vec<u64>,
     redo_stack: Vec<u64>,
     stroke_domains: HashMap<StrokeRef, HashSet<(String, String)>>,
@@ -700,6 +808,7 @@ impl JournalReplayState {
             config_id: header.config_id.clone(),
             provenance: "initial journal header session; original app origin is implicit"
                 .to_owned(),
+            requires_stroke_commit: false,
         };
         initial_epoch.validate()?;
         let mut state = Self {
@@ -725,6 +834,13 @@ impl JournalReplayState {
 
     fn contains_stroke(&self, target: &StrokeRef) -> bool {
         self.stroke_domains.contains_key(target)
+    }
+
+    fn session_requires_stroke_commit(&self, session_id: &str) -> bool {
+        self.session_epochs
+            .iter()
+            .find(|epoch| epoch.epoch.session_id == session_id)
+            .is_some_and(|epoch| epoch.epoch.requires_stroke_commit)
     }
 
     fn index_sample(&mut self, sample: &PhysicalSample) -> Result<(), JournalError> {
@@ -837,6 +953,24 @@ impl JournalReplayState {
         Ok(())
     }
 
+    fn validate_restore_target(&self, target: &StrokeRef) -> Result<(), JournalError> {
+        self.validate_edit_target(target)?;
+        if self.session_requires_stroke_commit(&target.session_id)
+            && !self.edit_actions.iter().any(|action| {
+                matches!(
+                    &action.command,
+                    EditCommand::StrokeVisibility { targets, visible: true }
+                        if targets.iter().any(|committed| committed == target)
+                )
+            })
+        {
+            return Err(JournalError::invalid(
+                "Restore cannot expose a new-session stroke without a durable native-up commit",
+            ));
+        }
+        Ok(())
+    }
+
     fn apply_move_total(&mut self, target: &StrokeRef, delta_x_raw: i64, delta_y_raw: i64) {
         let transform = self
             .move_totals
@@ -903,6 +1037,22 @@ impl JournalReplayState {
                 if self.physical_samples.len() >= MAX_JOURNAL_RECORDS {
                     return Err(JournalError::limit("physical sample record cap reached"));
                 }
+                if sample.stroke_id.is_some()
+                    && self
+                        .session_epochs
+                        .iter()
+                        .find(|epoch| epoch.epoch.session_id == sample.session_id)
+                        .is_some_and(|epoch| epoch.epoch.requires_stroke_commit)
+                {
+                    let stroke = sample
+                        .stroke_ref(&self.journal_id)
+                        .expect("a present stroke ID creates a stroke target");
+                    if !self.active_strokes.contains_key(&stroke) {
+                        return Err(JournalError::invalid(
+                            "new-session stroke sample has no explicit StrokeStarted event",
+                        ));
+                    }
+                }
                 self.physical_samples
                     .try_reserve(1)
                     .map_err(JournalError::allocation)?;
@@ -925,6 +1075,49 @@ impl JournalReplayState {
                     .map_err(JournalError::allocation)?;
             }
             JournalEvent::SessionEpochStarted { .. } => {}
+            JournalEvent::StrokeStarted {
+                target, view_frame, ..
+            } => {
+                validate_stroke_ref(target)?;
+                if !view_frame.is_valid() {
+                    return Err(JournalError::invalid(
+                        "stroke start has an invalid captured view frame",
+                    ));
+                }
+                if target.journal_id != self.journal_id
+                    || target.session_id != record.app_epoch_id
+                    || !self.session_ids.contains(&target.session_id)
+                {
+                    return Err(JournalError::invalid(
+                        "StrokeStarted target must identify this project and current session",
+                    ));
+                }
+                if self.stroke_start_set.contains(target) {
+                    return Err(JournalError::invalid(
+                        "stroke identity already has a start record",
+                    ));
+                }
+                self.stroke_start_set
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                self.stroke_starts
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                self.active_strokes
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+            }
+            JournalEvent::StrokeInterrupted { target, .. } => {
+                validate_stroke_ref(target)?;
+                if !self.active_strokes.contains_key(target) {
+                    return Err(JournalError::invalid(
+                        "StrokeInterrupted target is not an active started stroke",
+                    ));
+                }
+                self.stroke_interruptions
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+            }
             JournalEvent::MigrationProvenance {
                 source_schema_version,
                 source_journal_id,
@@ -1118,6 +1311,36 @@ impl JournalReplayState {
                 self.session_epochs
                     .push(StoredSessionEpoch { sequence, epoch });
             }
+            JournalEvent::StrokeStarted {
+                target,
+                view_frame,
+                app_arrival_elapsed_ns,
+            } => {
+                let stored = StoredStrokeStart {
+                    sequence,
+                    app_epoch_id: app_epoch_id.clone(),
+                    app_arrival_elapsed_ns,
+                    target: target.clone(),
+                    view_frame,
+                };
+                self.stroke_start_set.insert(target.clone());
+                self.active_strokes.insert(target.clone(), stored.clone());
+                self.stroke_starts.push(stored);
+            }
+            JournalEvent::StrokeInterrupted {
+                target,
+                reason,
+                app_arrival_elapsed_ns,
+            } => {
+                self.active_strokes.remove(&target);
+                self.stroke_interruptions.push(StoredStrokeInterruption {
+                    sequence,
+                    app_epoch_id: app_epoch_id.clone(),
+                    app_arrival_elapsed_ns,
+                    target,
+                    reason,
+                });
+            }
             JournalEvent::MigrationProvenance {
                 source_schema_version,
                 source_journal_id,
@@ -1139,6 +1362,15 @@ impl JournalReplayState {
                 app_arrival_elapsed_ns,
                 command,
             } => {
+                if let EditCommand::StrokeVisibility {
+                    targets,
+                    visible: true,
+                } = &command
+                {
+                    for target in targets {
+                        self.active_strokes.remove(target);
+                    }
+                }
                 self.edit_actions.push(StoredEditAction {
                     sequence,
                     action_id,
@@ -1275,6 +1507,11 @@ impl JournalReplayState {
                         visibility.insert(target.clone(), true);
                     }
                 }
+                EditCommand::StrokeVisibility { targets, visible } => {
+                    for target in targets {
+                        visibility.insert(target.clone(), *visible);
+                    }
+                }
                 EditCommand::Move {
                     target,
                     delta_x_raw,
@@ -1297,15 +1534,38 @@ impl JournalReplayState {
                             .checked_add(*delta_y_raw)
                             .ok_or_else(|| JournalError::invalid("edit move y delta overflow"))?;
                     } else {
+                        let legacy = self.move_totals.get(target);
+                        if legacy.is_some_and(|legacy| {
+                            legacy.coordinate_space != *coordinate_space || legacy.units != *units
+                        }) {
+                            return Err(JournalError::invalid(
+                                "legacy and schema 3 moves use inconsistent raw position domains",
+                            ));
+                        }
                         edit_moves.insert(
                             target.clone(),
                             ProjectedTransform {
                                 coordinate_space: coordinate_space.clone(),
                                 units: units.clone(),
-                                delta_x_raw: *delta_x_raw,
-                                delta_y_raw: *delta_y_raw,
+                                // Keep the accumulation order shared with
+                                // validate_edit_command: legacy transform
+                                // first, then active schema 3 actions in
+                                // journal order. Separately summing actions
+                                // could overflow even when the final combined
+                                // raw coordinate is representable.
+                                delta_x_raw: legacy.map_or(0, |legacy| legacy.delta_x_raw),
+                                delta_y_raw: legacy.map_or(0, |legacy| legacy.delta_y_raw),
                             },
                         );
+                        let total = edit_moves.get_mut(target).expect("move total was inserted");
+                        total.delta_x_raw = total
+                            .delta_x_raw
+                            .checked_add(*delta_x_raw)
+                            .ok_or_else(|| JournalError::invalid("edit move x delta overflow"))?;
+                        total.delta_y_raw = total
+                            .delta_y_raw
+                            .checked_add(*delta_y_raw)
+                            .ok_or_else(|| JournalError::invalid("edit move y delta overflow"))?;
                     }
                 }
                 EditCommand::Correction { .. } => {}
@@ -1319,41 +1579,36 @@ impl JournalReplayState {
         for stored in &self.physical_samples {
             let stroke = stored.sample.stroke_ref(&self.journal_id);
             if let Some(stroke) = &stroke {
-                let visible = visibility
-                    .get(stroke)
-                    .copied()
-                    .unwrap_or_else(|| !self.tombstone_set.contains(stroke));
+                let default_visible = !self.session_requires_stroke_commit(&stroke.session_id)
+                    && !self.tombstone_set.contains(stroke);
+                let visible = visibility.get(stroke).copied().unwrap_or(default_visible);
                 if !visible {
                     continue;
                 }
             }
             let mut effective_position = stored.sample.position.clone();
             if let Some(stroke) = &stroke {
-                for transform in [self.move_totals.get(stroke), edit_moves.get(stroke)]
-                    .into_iter()
-                    .flatten()
+                let transform = edit_moves
+                    .get(stroke)
+                    .or_else(|| self.move_totals.get(stroke));
+                if let Some(transform) = transform
+                    && let Some(position) = effective_position.as_mut()
                 {
-                    if let Some(position) = effective_position.as_mut() {
-                        if position.coordinate_space != transform.coordinate_space
-                            || position.units != transform.units
-                        {
-                            return Err(JournalError::invalid(
-                                "stored move cannot be projected onto this position domain",
-                            ));
-                        }
-                        position.x_raw = position
-                            .x_raw
-                            .checked_add(transform.delta_x_raw)
-                            .ok_or_else(|| {
-                                JournalError::invalid("projected x coordinate overflow")
-                            })?;
-                        position.y_raw = position
-                            .y_raw
-                            .checked_add(transform.delta_y_raw)
-                            .ok_or_else(|| {
-                                JournalError::invalid("projected y coordinate overflow")
-                            })?;
+                    if position.coordinate_space != transform.coordinate_space
+                        || position.units != transform.units
+                    {
+                        return Err(JournalError::invalid(
+                            "stored move cannot be projected onto this position domain",
+                        ));
                     }
+                    position.x_raw = position
+                        .x_raw
+                        .checked_add(transform.delta_x_raw)
+                        .ok_or_else(|| JournalError::invalid("projected x coordinate overflow"))?;
+                    position.y_raw = position
+                        .y_raw
+                        .checked_add(transform.delta_y_raw)
+                        .ok_or_else(|| JournalError::invalid("projected y coordinate overflow"))?;
                 }
             }
             projected.push(ProjectedSample {
@@ -1364,6 +1619,12 @@ impl JournalReplayState {
             });
         }
         Ok(projected)
+    }
+
+    pub(crate) fn incomplete_stroke_count(&self) -> usize {
+        self.active_strokes
+            .len()
+            .saturating_add(self.stroke_interruptions.len())
     }
 }
 
@@ -1424,6 +1685,18 @@ impl JournalWriter {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn header(&self) -> &JournalHeader {
+        &self.header
+    }
+
+    pub(crate) fn replay_state(&self) -> &JournalReplayState {
+        &self.state
+    }
+
+    pub(crate) fn active_session_id(&self) -> &str {
+        &self.state.current_session_id
     }
 
     /// Opens an existing valid journal for append. A torn final line is
@@ -1493,12 +1766,20 @@ impl JournalWriter {
     }
 
     pub(crate) fn append_sample(&mut self, sample: PhysicalSample) -> Result<u64, JournalError> {
+        self.append_sample_record(sample)
+            .map(|record| record.sequence)
+    }
+
+    pub(crate) fn append_sample_record(
+        &mut self,
+        sample: PhysicalSample,
+    ) -> Result<JournalRecord, JournalError> {
         if sample.session_id != self.state.current_session_id {
             return Err(JournalError::invalid(
                 "sample session ID must match the active app-arrival epoch",
             ));
         }
-        self.append_event(JournalEvent::PhysicalSample(Box::new(sample)))
+        self.append_event_record(JournalEvent::PhysicalSample(Box::new(sample)))
     }
 
     pub(crate) fn begin_session_epoch(
@@ -1508,15 +1789,107 @@ impl JournalWriter {
         config_id: Option<String>,
         provenance: String,
     ) -> Result<u64, JournalError> {
-        self.append_event(JournalEvent::SessionEpochStarted {
+        let sequence = self.append_event(JournalEvent::SessionEpochStarted {
             epoch: SessionEpoch {
                 session_id,
                 started_at_unix_ns: Some(started_at_unix_ns),
                 config_id,
                 provenance,
+                requires_stroke_commit: true,
             },
             app_arrival_elapsed_ns: 0,
+        })?;
+        // If a prior process ended with a pen down, record an explicit
+        // interruption in the new arrival epoch. Never synthesize pen-up or
+        // commit an in-progress stroke during resume.
+        self.interrupt_active_strokes(StrokeInterruptionReason::ProcessEndedWithoutPenUp, 0)?;
+        Ok(sequence)
+    }
+
+    pub(crate) fn start_stroke(
+        &mut self,
+        target: StrokeRef,
+        view_frame: StrokeViewFrame,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<u64, JournalError> {
+        self.start_stroke_record(target, view_frame, app_arrival_elapsed_ns)
+            .map(|record| record.sequence)
+    }
+
+    pub(crate) fn start_stroke_record(
+        &mut self,
+        target: StrokeRef,
+        view_frame: StrokeViewFrame,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<JournalRecord, JournalError> {
+        self.append_event_record(JournalEvent::StrokeStarted {
+            target,
+            view_frame,
+            app_arrival_elapsed_ns,
         })
+    }
+
+    pub(crate) fn interrupt_stroke(
+        &mut self,
+        target: StrokeRef,
+        reason: StrokeInterruptionReason,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<u64, JournalError> {
+        self.interrupt_stroke_record(target, reason, app_arrival_elapsed_ns)
+            .map(|record| record.sequence)
+    }
+
+    pub(crate) fn interrupt_stroke_record(
+        &mut self,
+        target: StrokeRef,
+        reason: StrokeInterruptionReason,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<JournalRecord, JournalError> {
+        self.append_event_record(JournalEvent::StrokeInterrupted {
+            target,
+            reason,
+            app_arrival_elapsed_ns,
+        })
+    }
+
+    pub(crate) fn commit_stroke(
+        &mut self,
+        target: StrokeRef,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<u64, JournalError> {
+        self.commit_stroke_record(target, app_arrival_elapsed_ns)
+            .map(|record| record.sequence)
+    }
+
+    pub(crate) fn commit_stroke_record(
+        &mut self,
+        target: StrokeRef,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<JournalRecord, JournalError> {
+        self.apply_edit_action_record(
+            app_arrival_elapsed_ns,
+            EditCommand::StrokeVisibility {
+                targets: vec![target],
+                visible: true,
+            },
+        )
+    }
+
+    pub(crate) fn interrupt_active_strokes(
+        &mut self,
+        reason: StrokeInterruptionReason,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<usize, JournalError> {
+        let mut targets = Vec::new();
+        targets
+            .try_reserve_exact(self.state.active_strokes.len())
+            .map_err(JournalError::allocation)?;
+        targets.extend(self.state.active_strokes.keys().cloned());
+        let count = targets.len();
+        for target in targets {
+            self.interrupt_stroke(target, reason, app_arrival_elapsed_ns)?;
+        }
+        Ok(count)
     }
 
     pub(crate) fn append_metadata(
@@ -1531,6 +1904,18 @@ impl JournalWriter {
         app_arrival_elapsed_ns: u128,
         command: EditCommand,
     ) -> Result<u64, JournalError> {
+        self.apply_edit_action_record(app_arrival_elapsed_ns, command)
+            .map(|record| match record.event {
+                JournalEvent::EditAction { action_id, .. } => action_id,
+                _ => unreachable!("edit action append returns an edit action row"),
+            })
+    }
+
+    pub(crate) fn apply_edit_action_record(
+        &mut self,
+        app_arrival_elapsed_ns: u128,
+        command: EditCommand,
+    ) -> Result<JournalRecord, JournalError> {
         let action_id = self
             .state
             .last_sequence
@@ -1541,19 +1926,29 @@ impl JournalWriter {
             .logical_revision
             .checked_add(1)
             .ok_or_else(|| JournalError::limit("logical revision counter overflow"))?;
-        self.append_event(JournalEvent::EditAction {
+        self.append_event_record(JournalEvent::EditAction {
             action_id,
             revision_id,
             app_arrival_elapsed_ns,
             command,
-        })?;
-        Ok(action_id)
+        })
     }
 
     pub(crate) fn undo_last_edit(
         &mut self,
         app_arrival_elapsed_ns: u128,
     ) -> Result<u64, JournalError> {
+        self.undo_last_edit_record(app_arrival_elapsed_ns)
+            .map(|record| match record.event {
+                JournalEvent::Undo { action_id, .. } => action_id,
+                _ => unreachable!("undo append returns an undo row"),
+            })
+    }
+
+    pub(crate) fn undo_last_edit_record(
+        &mut self,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<JournalRecord, JournalError> {
         let action_id = *self
             .state
             .undo_stack
@@ -1564,18 +1959,28 @@ impl JournalWriter {
             .logical_revision
             .checked_add(1)
             .ok_or_else(|| JournalError::limit("logical revision counter overflow"))?;
-        self.append_event(JournalEvent::Undo {
+        self.append_event_record(JournalEvent::Undo {
             action_id,
             revision_id,
             app_arrival_elapsed_ns,
-        })?;
-        Ok(action_id)
+        })
     }
 
     pub(crate) fn redo_last_edit(
         &mut self,
         app_arrival_elapsed_ns: u128,
     ) -> Result<u64, JournalError> {
+        self.redo_last_edit_record(app_arrival_elapsed_ns)
+            .map(|record| match record.event {
+                JournalEvent::Redo { action_id, .. } => action_id,
+                _ => unreachable!("redo append returns a redo row"),
+            })
+    }
+
+    pub(crate) fn redo_last_edit_record(
+        &mut self,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<JournalRecord, JournalError> {
         let action_id = *self
             .state
             .redo_stack
@@ -1586,12 +1991,11 @@ impl JournalWriter {
             .logical_revision
             .checked_add(1)
             .ok_or_else(|| JournalError::limit("logical revision counter overflow"))?;
-        self.append_event(JournalEvent::Redo {
+        self.append_event_record(JournalEvent::Redo {
             action_id,
             revision_id,
             app_arrival_elapsed_ns,
-        })?;
-        Ok(action_id)
+        })
     }
 
     pub(crate) fn begin_revision(
@@ -1683,6 +2087,14 @@ impl JournalWriter {
     }
 
     fn append_event(&mut self, event: JournalEvent) -> Result<u64, JournalError> {
+        self.append_event_record(event)
+            .map(|record| record.sequence)
+    }
+
+    pub(crate) fn append_event_record(
+        &mut self,
+        event: JournalEvent,
+    ) -> Result<JournalRecord, JournalError> {
         if self.poisoned {
             return Err(JournalError::poisoned());
         }
@@ -1729,10 +2141,10 @@ impl JournalWriter {
             return Err(JournalError::io(error));
         }
 
-        self.state.apply_prepared(record);
+        self.state.apply_prepared(record.clone());
         self.bytes_written = self.bytes_written.saturating_add(line.len() as u64);
         self.prefix_fingerprint = fnv_update(self.prefix_fingerprint, &line);
-        Ok(sequence)
+        Ok(record)
     }
 
     pub(crate) fn flush(&mut self) -> Result<(), JournalError> {
@@ -2075,7 +2487,7 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
         let fields = text.split('\t').collect::<Vec<_>>();
         if is_header {
             require_fields(&fields, 8, "LASSOINK-SNAPSHOT")?;
-            if fields[0] != "LASSOINK-SNAPSHOT" || fields[1] != "2" {
+            if fields[0] != "LASSOINK-SNAPSHOT" || fields[1] != "3" {
                 return Err(JournalError::invalid("unsupported snapshot header"));
             }
             let prefix_fingerprint = parse_hex_u64(fields[6], "snapshot prefix fingerprint")?;
@@ -2101,7 +2513,7 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
         let snapshot = parsed.as_mut().expect("snapshot header has been parsed");
         match fields.first().copied().unwrap_or_default() {
             "EPO" => {
-                require_fields(&fields, 6, "EPO")?;
+                require_fields(&fields, 7, "EPO")?;
                 if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
                     return Err(JournalError::limit("snapshot state entry cap reached"));
                 }
@@ -2114,6 +2526,10 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
                     )?,
                     config_id: decode_option_text(fields[4])?,
                     provenance: decode_field(fields[5])?,
+                    requires_stroke_commit: parse_bool(
+                        fields[6],
+                        "snapshot epoch stroke-commit policy",
+                    )?,
                 };
                 epoch.validate()?;
                 if sequence > snapshot.prefix_sequence
@@ -2144,6 +2560,120 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
                     .state
                     .session_epochs
                     .push(StoredSessionEpoch { sequence, epoch });
+            }
+            "SBG" => {
+                require_fields(&fields, 4 + STROKE_VIEW_FRAME_WIDTH + 6, "SBG")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
+                    return Err(JournalError::limit("snapshot state entry cap reached"));
+                }
+                let sequence = parse_u64(fields[1], "snapshot stroke start sequence")?;
+                let app_epoch_id = decode_field(fields[2])?;
+                let app_arrival_elapsed_ns =
+                    parse_u128(fields[3], "snapshot stroke start app arrival")?;
+                let view_frame = parse_stroke_view_frame_fields(&fields, 4)?;
+                if sequence > snapshot.prefix_sequence
+                    || !snapshot.state.session_ids.contains(&app_epoch_id)
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot stroke start is past its prefix or has unknown epoch",
+                    ));
+                }
+                let target = parse_stroke_ref_fields(
+                    &fields,
+                    4 + STROKE_VIEW_FRAME_WIDTH,
+                    JOURNAL_SCHEMA_VERSION,
+                    &snapshot.journal_id,
+                    &snapshot.state.current_session_id,
+                )?;
+                if target.session_id != app_epoch_id
+                    || !snapshot.state.stroke_start_set.insert(target.clone())
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot stroke start identity is inconsistent or repeated",
+                    ));
+                }
+                snapshot.state.stroke_starts.push(StoredStrokeStart {
+                    sequence,
+                    app_epoch_id,
+                    app_arrival_elapsed_ns,
+                    target,
+                    view_frame,
+                });
+            }
+            "SIT" => {
+                require_fields(&fields, 11, "SIT")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
+                    return Err(JournalError::limit("snapshot state entry cap reached"));
+                }
+                let sequence = parse_u64(fields[1], "snapshot stroke interruption sequence")?;
+                let app_epoch_id = decode_field(fields[2])?;
+                let app_arrival_elapsed_ns =
+                    parse_u128(fields[3], "snapshot stroke interruption app arrival")?;
+                let reason = parse_stroke_interruption_reason(fields[4])?;
+                if sequence > snapshot.prefix_sequence
+                    || !snapshot.state.session_ids.contains(&app_epoch_id)
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot stroke interruption is past its prefix or has unknown epoch",
+                    ));
+                }
+                let target = parse_stroke_ref_fields(
+                    &fields,
+                    5,
+                    JOURNAL_SCHEMA_VERSION,
+                    &snapshot.journal_id,
+                    &snapshot.state.current_session_id,
+                )?;
+                if !snapshot.state.stroke_start_set.contains(&target) {
+                    return Err(JournalError::invalid(
+                        "snapshot interruption references an unknown stroke start",
+                    ));
+                }
+                snapshot
+                    .state
+                    .stroke_interruptions
+                    .push(StoredStrokeInterruption {
+                        sequence,
+                        app_epoch_id,
+                        app_arrival_elapsed_ns,
+                        target,
+                        reason,
+                    });
+            }
+            "SAC" => {
+                require_fields(&fields, 7, "SAC")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
+                    return Err(JournalError::limit("snapshot state entry cap reached"));
+                }
+                let target = parse_stroke_ref_fields(
+                    &fields,
+                    1,
+                    JOURNAL_SCHEMA_VERSION,
+                    &snapshot.journal_id,
+                    &snapshot.state.current_session_id,
+                )?;
+                let start = snapshot
+                    .state
+                    .stroke_starts
+                    .iter()
+                    .find(|start| start.target == target)
+                    .cloned()
+                    .ok_or_else(|| JournalError::invalid("active snapshot stroke has no start"))?;
+                if snapshot
+                    .state
+                    .stroke_interruptions
+                    .iter()
+                    .any(|interruption| interruption.target == target)
+                    || snapshot
+                        .state
+                        .active_strokes
+                        .insert(target, start)
+                        .is_some()
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot active stroke is interrupted or duplicated",
+                    ));
+                }
             }
             "SP" => {
                 if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
@@ -2571,7 +3101,48 @@ fn encode_snapshot(materialized: &MaterializedState) -> Result<Vec<u8>, JournalE
             opt_u128(stored.epoch.started_at_unix_ns),
             encode_option_text(stored.epoch.config_id.as_deref()),
             encode_field(&stored.epoch.provenance),
+            stored.epoch.requires_stroke_commit.to_string(),
         ];
+        append_encoded_row(&mut body, &fields)?;
+    }
+    for start in &materialized.state.stroke_starts {
+        let mut fields = vec![
+            "SBG".to_owned(),
+            start.sequence.to_string(),
+            encode_field(&start.app_epoch_id),
+            start.app_arrival_elapsed_ns.to_string(),
+        ];
+        fields.extend(encode_stroke_view_frame_fields(start.view_frame));
+        fields.extend(encode_stroke_ref_fields(
+            &start.target,
+            JOURNAL_SCHEMA_VERSION,
+        ));
+        append_encoded_row(&mut body, &fields)?;
+    }
+    for interruption in &materialized.state.stroke_interruptions {
+        let mut fields = vec![
+            "SIT".to_owned(),
+            interruption.sequence.to_string(),
+            encode_field(&interruption.app_epoch_id),
+            interruption.app_arrival_elapsed_ns.to_string(),
+            encode_stroke_interruption_reason(interruption.reason).to_owned(),
+        ];
+        fields.extend(encode_stroke_ref_fields(
+            &interruption.target,
+            JOURNAL_SCHEMA_VERSION,
+        ));
+        append_encoded_row(&mut body, &fields)?;
+    }
+    let mut active_targets = materialized
+        .state
+        .active_strokes
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    active_targets.sort();
+    for target in active_targets {
+        let mut fields = vec!["SAC".to_owned()];
+        fields.extend(encode_stroke_ref_fields(&target, JOURNAL_SCHEMA_VERSION));
         append_encoded_row(&mut body, &fields)?;
     }
     for stored in &materialized.state.physical_samples {
@@ -2690,7 +3261,7 @@ fn encode_snapshot(materialized: &MaterializedState) -> Result<Vec<u8>, JournalE
     let state_fingerprint = fnv_update(FNV_OFFSET_BASIS, &body);
     let header = vec![
         "LASSOINK-SNAPSHOT".to_owned(),
-        "2".to_owned(),
+        "3".to_owned(),
         encode_field(&materialized.journal_id),
         materialized.prefix_bytes.to_string(),
         materialized.prefix_sequence.to_string(),
@@ -2795,6 +3366,8 @@ fn validate_record_before_encoding(
         }
         JournalEvent::Metadata(metadata) => metadata.validate(),
         JournalEvent::SessionEpochStarted { epoch, .. } => epoch.validate(),
+        JournalEvent::StrokeStarted { target, .. }
+        | JournalEvent::StrokeInterrupted { target, .. } => validate_stroke_ref(target),
         JournalEvent::EditAction { command, .. } => validate_edit_command_fields(command),
         JournalEvent::Undo { .. } | JournalEvent::Redo { .. } => Ok(()),
         JournalEvent::MigrationProvenance {
@@ -2835,9 +3408,9 @@ fn validate_record_before_encoding(
 
 fn validate_edit_command_fields(command: &EditCommand) -> Result<(), JournalError> {
     match command {
-        EditCommand::Tombstone { targets } | EditCommand::Restore { targets } => {
-            validate_edit_target_list(targets)
-        }
+        EditCommand::Tombstone { targets }
+        | EditCommand::Restore { targets }
+        | EditCommand::StrokeVisibility { targets, .. } => validate_edit_target_list(targets),
         EditCommand::Move {
             target,
             coordinate_space,
@@ -2875,7 +3448,25 @@ fn validate_snapshot_edit_targets(
     match command {
         EditCommand::Tombstone { targets } | EditCommand::Restore { targets } => {
             for target in targets {
+                if matches!(command, EditCommand::Restore { .. }) {
+                    state.validate_restore_target(target)?;
+                } else {
+                    state.validate_edit_target(target)?;
+                }
+            }
+            Ok(())
+        }
+        EditCommand::StrokeVisibility { targets, visible } => {
+            for target in targets {
                 state.validate_edit_target(target)?;
+                if *visible
+                    && (!state.stroke_start_set.contains(target)
+                        || !state.stroke_domains.contains_key(target))
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot stroke visibility commit has no started stroke with samples",
+                    ));
+                }
             }
             Ok(())
         }
@@ -2921,7 +3512,26 @@ fn validate_edit_command(
         EditCommand::Tombstone { targets } | EditCommand::Restore { targets } => {
             validate_edit_target_list(targets)?;
             for target in targets {
+                if matches!(command, EditCommand::Restore { .. }) {
+                    state.validate_restore_target(target)?;
+                } else {
+                    state.validate_edit_target(target)?;
+                }
+            }
+            Ok(())
+        }
+        EditCommand::StrokeVisibility { targets, visible } => {
+            validate_edit_target_list(targets)?;
+            for target in targets {
                 state.validate_edit_target(target)?;
+                if *visible
+                    && (!state.active_strokes.contains_key(target)
+                        || !state.stroke_domains.contains_key(target))
+                {
+                    return Err(JournalError::invalid(
+                        "visible StrokeVisibility commit requires an active started stroke with samples",
+                    ));
+                }
             }
             Ok(())
         }
@@ -2972,12 +3582,26 @@ fn validate_edit_command(
                     })?;
                 }
             }
-            total_x
+            let final_delta_x = total_x
                 .checked_add(*delta_x_raw)
                 .ok_or_else(|| JournalError::invalid("combined edit move x delta overflow"))?;
-            total_y
+            let final_delta_y = total_y
                 .checked_add(*delta_y_raw)
                 .ok_or_else(|| JournalError::invalid("combined edit move y delta overflow"))?;
+            for stored in &state.physical_samples {
+                if stored.sample.stroke_ref(&state.journal_id).as_ref() == Some(target)
+                    && let Some(position) = &stored.sample.position
+                {
+                    position
+                        .x_raw
+                        .checked_add(final_delta_x)
+                        .ok_or_else(|| JournalError::invalid("projected x coordinate overflow"))?;
+                    position
+                        .y_raw
+                        .checked_add(final_delta_y)
+                        .ok_or_else(|| JournalError::invalid("projected y coordinate overflow"))?;
+                }
+            }
             Ok(())
         }
         EditCommand::Correction {
@@ -3034,7 +3658,36 @@ fn encode_record_fields(record: &JournalRecord, version: u32) -> Result<Vec<Stri
             opt_u128(epoch.started_at_unix_ns),
             encode_option_text(epoch.config_id.as_deref()),
             encode_field(&epoch.provenance),
+            epoch.requires_stroke_commit.to_string(),
         ],
+        JournalEvent::StrokeStarted {
+            target,
+            view_frame,
+            app_arrival_elapsed_ns,
+        } => {
+            let mut fields = vec![
+                "SBEG".to_owned(),
+                record.sequence.to_string(),
+                app_arrival_elapsed_ns.to_string(),
+            ];
+            fields.extend(encode_stroke_view_frame_fields(*view_frame));
+            fields.extend(encode_stroke_ref_fields(target, version));
+            fields
+        }
+        JournalEvent::StrokeInterrupted {
+            target,
+            reason,
+            app_arrival_elapsed_ns,
+        } => {
+            let mut fields = vec![
+                "SINT".to_owned(),
+                record.sequence.to_string(),
+                app_arrival_elapsed_ns.to_string(),
+                encode_stroke_interruption_reason(*reason).to_owned(),
+            ];
+            fields.extend(encode_stroke_ref_fields(target, version));
+            fields
+        }
         JournalEvent::EditAction {
             action_id,
             revision_id,
@@ -3182,6 +3835,16 @@ fn encode_edit_action_fields(
                 "restore".to_owned()
             });
             fields.push(targets.len().to_string());
+            for target in targets {
+                fields.extend(encode_stroke_ref_fields(target, version));
+            }
+        }
+        EditCommand::StrokeVisibility { targets, visible } => {
+            fields.extend([
+                "visibility".to_owned(),
+                visible.to_string(),
+                targets.len().to_string(),
+            ]);
             for target in targets {
                 fields.extend(encode_stroke_ref_fields(target, version));
             }
@@ -3346,6 +4009,37 @@ fn encode_stroke_ref_fields(target: &StrokeRef, version: u32) -> Vec<String> {
     fields
 }
 
+fn encode_stroke_view_frame_fields(frame: StrokeViewFrame) -> [String; STROKE_VIEW_FRAME_WIDTH] {
+    [
+        frame.screen_origin_x_px.to_string(),
+        frame.screen_origin_y_px.to_string(),
+        format!("{:016X}", frame.dpi_scale_factor_bits),
+        format!("{:016X}", frame.canvas_zoom_bits),
+        format!("{:016X}", frame.canvas_pan_x_bits),
+        format!("{:016X}", frame.canvas_pan_y_bits),
+        frame.toolbar_height_px.to_string(),
+    ]
+}
+
+fn parse_stroke_view_frame_fields(
+    fields: &[&str],
+    start: usize,
+) -> Result<StrokeViewFrame, JournalError> {
+    let frame = StrokeViewFrame {
+        screen_origin_x_px: parse_i64(fields[start], "stroke view origin x")?,
+        screen_origin_y_px: parse_i64(fields[start + 1], "stroke view origin y")?,
+        dpi_scale_factor_bits: parse_hex_u64(fields[start + 2], "stroke view DPI scale bits")?,
+        canvas_zoom_bits: parse_hex_u64(fields[start + 3], "stroke view zoom bits")?,
+        canvas_pan_x_bits: parse_hex_u64(fields[start + 4], "stroke view pan x bits")?,
+        canvas_pan_y_bits: parse_hex_u64(fields[start + 5], "stroke view pan y bits")?,
+        toolbar_height_px: parse_u32(fields[start + 6], "stroke view toolbar height")?,
+    };
+    if !frame.is_valid() {
+        return Err(JournalError::invalid("stroke start view frame is invalid"));
+    }
+    Ok(frame)
+}
+
 fn encode_metadata_fields(tag: &str, sequence: u64, metadata: &JournalMetadata) -> Vec<String> {
     vec![
         tag.to_owned(),
@@ -3366,6 +4060,53 @@ fn encode_metadata_scope(scope: MetadataScope) -> &'static str {
         MetadataScope::Session => "session",
         MetadataScope::Device => "device",
         MetadataScope::Configuration => "configuration",
+    }
+}
+
+fn encode_stroke_interruption_reason(reason: StrokeInterruptionReason) -> &'static str {
+    match reason {
+        StrokeInterruptionReason::PointerDownBeforePenUp => "pointer-down-before-pen-up",
+        StrokeInterruptionReason::PointerCaptureChanged => "pointer-capture-changed",
+        StrokeInterruptionReason::PointerLeave => "pointer-leave",
+        StrokeInterruptionReason::PointerReentryBoundary => "pointer-reentry-boundary",
+        StrokeInterruptionReason::DeviceOutOfRange => "device-out-of-range",
+        StrokeInterruptionReason::DeviceChanged => "device-changed",
+        StrokeInterruptionReason::DeviceReentryBoundary => "device-reentry-boundary",
+        StrokeInterruptionReason::ContactLostWithoutPenUp => "contact-lost-without-pen-up",
+        StrokeInterruptionReason::CanvasViewTransformChanged => "canvas-view-transform-changed",
+        StrokeInterruptionReason::CanvasToolChanged => "canvas-tool-changed",
+        StrokeInterruptionReason::CanceledNativeUp => "canceled-native-up",
+        StrokeInterruptionReason::UnattributedNativeUp => "unattributed-native-up",
+        StrokeInterruptionReason::AmbiguousNativeUp => "ambiguous-native-up",
+        StrokeInterruptionReason::MixedDeviceBatch => "mixed-device-batch",
+        StrokeInterruptionReason::WindowFocusLost => "window-focus-lost",
+        StrokeInterruptionReason::WriterBackpressure => "writer-backpressure",
+        StrokeInterruptionReason::ProcessEndedWithoutPenUp => "process-ended-without-pen-up",
+    }
+}
+
+fn parse_stroke_interruption_reason(value: &str) -> Result<StrokeInterruptionReason, JournalError> {
+    match value {
+        "pointer-down-before-pen-up" => Ok(StrokeInterruptionReason::PointerDownBeforePenUp),
+        "pointer-capture-changed" => Ok(StrokeInterruptionReason::PointerCaptureChanged),
+        "pointer-leave" => Ok(StrokeInterruptionReason::PointerLeave),
+        "pointer-reentry-boundary" => Ok(StrokeInterruptionReason::PointerReentryBoundary),
+        "device-out-of-range" => Ok(StrokeInterruptionReason::DeviceOutOfRange),
+        "device-changed" => Ok(StrokeInterruptionReason::DeviceChanged),
+        "device-reentry-boundary" => Ok(StrokeInterruptionReason::DeviceReentryBoundary),
+        "contact-lost-without-pen-up" => Ok(StrokeInterruptionReason::ContactLostWithoutPenUp),
+        "canvas-view-transform-changed" => Ok(StrokeInterruptionReason::CanvasViewTransformChanged),
+        "canvas-tool-changed" => Ok(StrokeInterruptionReason::CanvasToolChanged),
+        "canceled-native-up" => Ok(StrokeInterruptionReason::CanceledNativeUp),
+        "unattributed-native-up" => Ok(StrokeInterruptionReason::UnattributedNativeUp),
+        "ambiguous-native-up" => Ok(StrokeInterruptionReason::AmbiguousNativeUp),
+        "mixed-device-batch" => Ok(StrokeInterruptionReason::MixedDeviceBatch),
+        "window-focus-lost" => Ok(StrokeInterruptionReason::WindowFocusLost),
+        "writer-backpressure" => Ok(StrokeInterruptionReason::WriterBackpressure),
+        "process-ended-without-pen-up" => Ok(StrokeInterruptionReason::ProcessEndedWithoutPenUp),
+        other => Err(JournalError::invalid(format!(
+            "unknown stroke interruption reason {other:?}"
+        ))),
     }
 }
 
@@ -3440,7 +4181,7 @@ fn parse_record_fields(
         )?)),
         "META" => JournalEvent::Metadata(parse_metadata_fields(fields)?),
         "EPOCH" if version >= JOURNAL_SCHEMA_VERSION => {
-            require_fields(fields, 6, "EPOCH")?;
+            require_fields(fields, 7, "EPOCH")?;
             JournalEvent::SessionEpochStarted {
                 epoch: SessionEpoch {
                     session_id: app_epoch_id.clone(),
@@ -3450,8 +4191,45 @@ fn parse_record_fields(
                     )?,
                     config_id: decode_option_text(fields[4])?,
                     provenance: decode_field(fields[5])?,
+                    requires_stroke_commit: parse_bool(
+                        fields[6],
+                        "session epoch stroke-commit policy",
+                    )?,
                 },
                 app_arrival_elapsed_ns: parse_u128(fields[2], "session epoch app arrival")?,
+            }
+        }
+        "SBEG" if version >= JOURNAL_SCHEMA_VERSION => {
+            require_fields(
+                fields,
+                3 + STROKE_VIEW_FRAME_WIDTH + stroke_ref_width,
+                "SBEG",
+            )?;
+            let view_frame = parse_stroke_view_frame_fields(fields, 3)?;
+            JournalEvent::StrokeStarted {
+                app_arrival_elapsed_ns: parse_u128(fields[2], "stroke start app arrival")?,
+                view_frame,
+                target: parse_stroke_ref_fields(
+                    fields,
+                    3 + STROKE_VIEW_FRAME_WIDTH,
+                    version,
+                    &header.journal_id,
+                    &header.session_id,
+                )?,
+            }
+        }
+        "SINT" if version >= JOURNAL_SCHEMA_VERSION => {
+            require_fields(fields, 4 + stroke_ref_width, "SINT")?;
+            JournalEvent::StrokeInterrupted {
+                app_arrival_elapsed_ns: parse_u128(fields[2], "stroke interruption app arrival")?,
+                reason: parse_stroke_interruption_reason(fields[3])?,
+                target: parse_stroke_ref_fields(
+                    fields,
+                    4,
+                    version,
+                    &header.journal_id,
+                    &header.session_id,
+                )?,
             }
         }
         "ACT" if version >= JOURNAL_SCHEMA_VERSION => {
@@ -3530,6 +4308,35 @@ fn parse_record_fields(
                         )?,
                         corrected_text: decode_option_text(fields[6 + stroke_ref_width])?,
                     }
+                }
+                "visibility" => {
+                    require_at_least_fields(fields, 8, "ACT visibility")?;
+                    let visible = parse_bool(fields[6], "stroke visibility")?;
+                    let target_count = parse_usize(fields[7], "stroke visibility target count")?;
+                    if target_count == 0 || target_count > MAX_EDIT_TARGETS {
+                        return Err(JournalError::limit(
+                            "visibility target count is empty or exceeds the configured cap",
+                        ));
+                    }
+                    let expected_fields = 8usize
+                        .checked_add(target_count.saturating_mul(stroke_ref_width))
+                        .ok_or_else(|| JournalError::limit("visibility row width overflow"))?;
+                    require_fields(fields, expected_fields, "ACT visibility")?;
+                    let mut targets = Vec::new();
+                    targets
+                        .try_reserve_exact(target_count)
+                        .map_err(JournalError::allocation)?;
+                    for index in 0..target_count {
+                        let start = 8 + index * stroke_ref_width;
+                        targets.push(parse_stroke_ref_fields(
+                            fields,
+                            start,
+                            version,
+                            &header.journal_id,
+                            &header.session_id,
+                        )?);
+                    }
+                    EditCommand::StrokeVisibility { targets, visible }
                 }
                 other => {
                     return Err(JournalError::invalid(format!(
@@ -4499,7 +5306,11 @@ mod tests {
         second.config_id = Some("cfg-b".to_owned());
         let new_target = target_of(&second, &journal_header.journal_id);
         assert_ne!(old_target, new_target);
+        writer
+            .start_stroke(new_target.clone(), StrokeViewFrame::default(), 4)
+            .unwrap();
         writer.append_sample(second.clone()).unwrap();
+        writer.commit_stroke(new_target.clone(), 6).unwrap();
         writer.flush().unwrap();
         drop(writer);
 
@@ -4514,6 +5325,187 @@ mod tests {
         assert_eq!(visible.len(), 2);
         assert_eq!(visible[0].stroke_ref.as_ref(), Some(&old_target));
         assert_eq!(visible[1].stroke_ref.as_ref(), Some(&new_target));
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn committed_stroke_visibility_undo_redo_survives_project_reopen() {
+        let path = temp_path("stroke-commit-undo-redo");
+        let journal_header = header("journal-stroke-commit-undo-redo");
+        let mut writer = JournalWriter::create(path.clone(), journal_header.clone()).unwrap();
+        writer
+            .append_sample(sample(
+                "direct-wm-pointer",
+                "legacy-visible",
+                1,
+                10,
+                Some(10),
+                true,
+                10,
+            ))
+            .unwrap();
+        writer
+            .begin_session_epoch(
+                "session-2".to_owned(),
+                1_800_000_004_000_000_000,
+                Some("cfg-b".to_owned()),
+                "commit-undo-reopen".to_owned(),
+            )
+            .unwrap();
+        let mut live_sample = sample("direct-wm-pointer", "new-stroke", 1, 1, Some(20), true, 30);
+        live_sample.session_id = "session-2".to_owned();
+        live_sample.config_id = Some("cfg-b".to_owned());
+        let target = target_of(&live_sample, &journal_header.journal_id);
+        writer
+            .start_stroke(target.clone(), StrokeViewFrame::default(), 1)
+            .unwrap();
+        writer.append_sample(live_sample).unwrap();
+        let commit_action_id = writer.commit_stroke(target.clone(), 2).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let mut reopened = JournalWriter::open_append(path.clone()).unwrap();
+        assert_eq!(reopened.state.projected_samples().unwrap().len(), 2);
+        assert_eq!(reopened.undo_last_edit(3).unwrap(), commit_action_id);
+        assert_eq!(reopened.state.projected_samples().unwrap().len(), 1);
+        assert_eq!(reopened.redo_last_edit(4).unwrap(), commit_action_id);
+        assert_eq!(reopened.state.projected_samples().unwrap().len(), 2);
+        reopened
+            .apply_edit_action(
+                5,
+                EditCommand::Tombstone {
+                    targets: vec![target.clone()],
+                },
+            )
+            .unwrap();
+        assert_eq!(reopened.state.projected_samples().unwrap().len(), 1);
+        reopened
+            .apply_edit_action(
+                6,
+                EditCommand::Restore {
+                    targets: vec![target],
+                },
+            )
+            .unwrap();
+        assert_eq!(reopened.state.projected_samples().unwrap().len(), 2);
+        reopened.flush().unwrap();
+        drop(reopened);
+
+        let replayed = read_journal(&path).unwrap();
+        assert_eq!(replayed.state.projected_samples().unwrap().len(), 2);
+        assert_eq!(replayed.state.physical_samples.len(), 2);
+        assert_eq!(replayed.state.edit_actions.len(), 3);
+        assert!(replayed.state.edit_actions[0].active);
+        assert_eq!(replayed.state.edit_controls.len(), 2);
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn new_epoch_stroke_without_commit_stays_incomplete_and_loss_never_commits() {
+        let path = temp_path("stroke-lifecycle-incomplete");
+        let journal_header = header("journal-stroke-lifecycle-incomplete");
+        let mut writer = JournalWriter::create(path.clone(), journal_header.clone()).unwrap();
+        writer
+            .append_sample(sample(
+                "direct-wm-pointer",
+                "legacy-unmarked",
+                1,
+                10,
+                Some(1),
+                true,
+                1,
+            ))
+            .unwrap();
+        assert_eq!(writer.state.projected_samples().unwrap().len(), 1);
+
+        writer
+            .begin_session_epoch(
+                "session-2".to_owned(),
+                1_800_000_003_000_000_000,
+                Some("cfg-b".to_owned()),
+                "new capture epoch".to_owned(),
+            )
+            .unwrap();
+        let mut in_progress = sample("direct-wm-pointer", "in-progress", 1, 1, Some(2), true, 2);
+        in_progress.session_id = "session-2".to_owned();
+        in_progress.config_id = Some("cfg-b".to_owned());
+        let unstarted_error = writer.append_sample(in_progress.clone()).unwrap_err();
+        assert_eq!(unstarted_error.kind, JournalErrorKind::InvalidData);
+        assert_eq!(writer.state.physical_samples.len(), 1);
+
+        let target = target_of(&in_progress, &journal_header.journal_id);
+        writer
+            .start_stroke(target.clone(), StrokeViewFrame::default(), 1)
+            .unwrap();
+        writer.append_sample(in_progress).unwrap();
+        assert_eq!(writer.state.active_strokes.len(), 1);
+        assert_eq!(writer.state.incomplete_stroke_count(), 1);
+        assert_eq!(writer.state.projected_samples().unwrap().len(), 1);
+        writer.flush().unwrap();
+        drop(writer);
+
+        let recovered = read_journal(&path).unwrap();
+        assert_eq!(recovered.state.active_strokes.len(), 1);
+        assert_eq!(recovered.state.physical_samples.len(), 2);
+        assert_eq!(recovered.state.projected_samples().unwrap().len(), 1);
+
+        let mut writer = JournalWriter::open_append(path.clone()).unwrap();
+        writer
+            .begin_session_epoch(
+                "session-3".to_owned(),
+                1_800_000_005_000_000_000,
+                Some("cfg-c".to_owned()),
+                "second-process-resume".to_owned(),
+            )
+            .unwrap();
+        let mut capture_lost = sample("direct-wm-pointer", "capture-lost", 1, 1, Some(3), true, 3);
+        capture_lost.session_id = "session-3".to_owned();
+        capture_lost.config_id = Some("cfg-c".to_owned());
+        let lost_target = target_of(&capture_lost, &journal_header.journal_id);
+        writer
+            .start_stroke(lost_target.clone(), StrokeViewFrame::default(), 1)
+            .unwrap();
+        writer.append_sample(capture_lost).unwrap();
+        writer
+            .interrupt_stroke(
+                lost_target.clone(),
+                StrokeInterruptionReason::PointerCaptureChanged,
+                2,
+            )
+            .unwrap();
+        let restore_error = writer
+            .apply_edit_action(
+                3,
+                EditCommand::Restore {
+                    targets: vec![lost_target],
+                },
+            )
+            .unwrap_err();
+        assert_eq!(restore_error.kind, JournalErrorKind::InvalidData);
+        assert_eq!(writer.state.edit_actions.len(), 0);
+        writer.flush().unwrap();
+        drop(writer);
+        let interrupted = read_journal(&path).unwrap();
+        assert!(interrupted.state.active_strokes.is_empty());
+        assert_eq!(interrupted.state.stroke_interruptions.len(), 2);
+        assert_eq!(interrupted.state.edit_actions.len(), 0);
+        assert_eq!(interrupted.state.physical_samples.len(), 3);
+        assert_eq!(interrupted.state.projected_samples().unwrap().len(), 1);
+        assert!(matches!(
+            interrupted.records.last().unwrap().event,
+            JournalEvent::StrokeInterrupted {
+                reason: StrokeInterruptionReason::PointerCaptureChanged,
+                ..
+            }
+        ));
+        assert_eq!(
+            interrupted.state.stroke_interruptions[0].reason,
+            StrokeInterruptionReason::ProcessEndedWithoutPenUp
+        );
+        assert_eq!(
+            interrupted.state.stroke_interruptions[1].reason,
+            StrokeInterruptionReason::PointerCaptureChanged
+        );
         cleanup_journal(&path);
     }
 
@@ -4546,7 +5538,11 @@ mod tests {
         new_sample.session_id = "session-2".to_owned();
         new_sample.config_id = Some("cfg-b".to_owned());
         let new_target = target_of(&new_sample, &journal_header.journal_id);
+        writer
+            .start_stroke(new_target.clone(), StrokeViewFrame::default(), 1)
+            .unwrap();
         writer.append_sample(new_sample.clone()).unwrap();
+        writer.commit_stroke(new_target.clone(), 2).unwrap();
         assert_ne!(old_target, new_target);
         writer.write_snapshot(&snapshot_path).unwrap();
 
@@ -4586,10 +5582,10 @@ mod tests {
         assert_eq!(snapshot.disposition, SnapshotDisposition::Used);
         assert_eq!(snapshot.state, full.state);
         assert_eq!(full.state.physical_samples.len(), 2);
-        assert_eq!(full.state.edit_actions.len(), 2);
+        assert_eq!(full.state.edit_actions.len(), 3);
         assert_eq!(full.state.edit_controls.len(), 4);
         assert!(full.state.edit_actions.iter().all(|action| action.active));
-        assert_eq!(full.state.logical_revision, 6);
+        assert_eq!(full.state.logical_revision, 7);
         assert_eq!(
             full.state
                 .physical_samples
@@ -4623,7 +5619,11 @@ mod tests {
         new_sample.session_id = "session-2".to_owned();
         new_sample.config_id = Some("cfg-b".to_owned());
         let new_target = target_of(&new_sample, &journal_header.journal_id);
+        writer
+            .start_stroke(new_target.clone(), StrokeViewFrame::default(), 1)
+            .unwrap();
         writer.append_sample(new_sample).unwrap();
+        let commit_new = writer.commit_stroke(new_target.clone(), 1).unwrap();
         assert_ne!(old_target, new_target);
 
         let hide_old = writer
@@ -4652,7 +5652,7 @@ mod tests {
             .unwrap();
         writer.undo_last_edit(5).unwrap();
         writer.undo_last_edit(6).unwrap();
-        assert_eq!(writer.state.undo_stack, [hide_old]);
+        assert_eq!(writer.state.undo_stack, [commit_new, hide_old]);
         assert_eq!(writer.state.redo_stack, [restore_old, hide_new]);
         assert_eq!(
             writer
@@ -4661,7 +5661,7 @@ mod tests {
                 .iter()
                 .map(|action| action.active)
                 .collect::<Vec<_>>(),
-            [true, false, false]
+            [true, true, false, false]
         );
         writer.write_snapshot(&snapshot_path).unwrap();
 
@@ -4683,11 +5683,11 @@ mod tests {
         assert_eq!(restored.replayed_tail_records, 2);
         assert_eq!(restored.state, full.state);
         assert_eq!(full.state.session_epochs.len(), 2);
-        assert_eq!(full.state.edit_actions.len(), 4);
+        assert_eq!(full.state.edit_actions.len(), 5);
         assert_eq!(full.state.edit_controls.len(), 3);
         assert_eq!(
             full.state.undo_stack,
-            [hide_old, hide_new, restore_after_snapshot]
+            [commit_new, hide_old, hide_new, restore_after_snapshot]
         );
         assert!(full.state.redo_stack.is_empty());
         assert_eq!(
@@ -4696,9 +5696,111 @@ mod tests {
                 .iter()
                 .map(|action| action.active)
                 .collect::<Vec<_>>(),
-            [true, true, false, true]
+            [true, true, true, false, true]
         );
         assert_eq!(full.state.projected_samples().unwrap().len(), 1);
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn legacy_and_schema_three_moves_share_checked_projection_accumulation_order() {
+        let path = temp_path("move-accumulation-order");
+        let snapshot_path = default_snapshot_path(&path);
+        let journal_header = header("journal-move-accumulation-order");
+        let mut writer = JournalWriter::create(path.clone(), journal_header.clone()).unwrap();
+        let original = sample("direct-wm-pointer", "stroke-a", 1, 10, Some(5), true, 0);
+        let target = target_of(&original, &journal_header.journal_id);
+        writer.append_sample(original.clone()).unwrap();
+        writer
+            .begin_revision(11, "legacy adjustment".to_owned())
+            .unwrap();
+        writer
+            .move_stroke(
+                12,
+                target.clone(),
+                -1,
+                0,
+                "device-output".to_owned(),
+                "raw-units".to_owned(),
+            )
+            .unwrap();
+        assert_eq!(
+            writer.state.projected_samples().unwrap()[0]
+                .effective_position
+                .as_ref()
+                .unwrap()
+                .x_raw,
+            -1
+        );
+
+        writer
+            .apply_edit_action(
+                13,
+                EditCommand::Move {
+                    target: target.clone(),
+                    delta_x_raw: i64::MAX,
+                    delta_y_raw: 0,
+                    coordinate_space: "device-output".to_owned(),
+                    units: "raw-units".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            writer.state.projected_samples().unwrap()[0]
+                .effective_position
+                .as_ref()
+                .unwrap()
+                .x_raw,
+            i64::MAX - 1
+        );
+        writer.write_snapshot(&snapshot_path).unwrap();
+
+        writer
+            .apply_edit_action(
+                14,
+                EditCommand::Move {
+                    target,
+                    delta_x_raw: 1,
+                    delta_y_raw: 0,
+                    coordinate_space: "device-output".to_owned(),
+                    units: "raw-units".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            writer.state.projected_samples().unwrap()[0]
+                .effective_position
+                .as_ref()
+                .unwrap()
+                .x_raw,
+            i64::MAX
+        );
+        writer.flush().unwrap();
+        drop(writer);
+
+        let full = read_journal(&path).unwrap();
+        let restored = load_with_snapshot(&path, &snapshot_path).unwrap();
+        assert_eq!(restored.disposition, SnapshotDisposition::Used);
+        assert_eq!(restored.replayed_tail_records, 1);
+        assert_eq!(restored.state, full.state);
+        assert_eq!(
+            restored.state.projected_samples().unwrap()[0]
+                .effective_position
+                .as_ref()
+                .unwrap()
+                .x_raw,
+            i64::MAX
+        );
+        assert_eq!(
+            full.state.physical_samples[0]
+                .sample
+                .position
+                .as_ref()
+                .unwrap()
+                .x_raw,
+            0,
+            "movement is a derived view and leaves raw physical coordinates unchanged"
+        );
         cleanup_journal(&path);
     }
 
@@ -5010,6 +6112,11 @@ mod tests {
             migrated.state.migration_provenance[0].source_journal_id,
             "legacy-migration-id"
         );
+        assert_eq!(
+            migrated.state.projected_samples().unwrap().len(),
+            1,
+            "migrated legacy stroke without lifecycle markers remains visible"
+        );
         assert_eq!(preserved_source, source_bytes);
         fs::remove_file(source_path).unwrap();
         fs::remove_file(destination_path).unwrap();
@@ -5069,10 +6176,12 @@ mod tests {
                 .unwrap(),
             );
         }
+        source_bytes.extend_from_slice(b"torn-final-record-without-newline");
         fs::write(&source_path, &source_bytes).unwrap();
 
         let before = read_journal(&source_path).unwrap();
         assert_eq!(before.schema_version, PREVIOUS_JOURNAL_SCHEMA_VERSION);
+        assert!(before.recovery.truncated_final_record);
         assert!(before.state.projected_samples().unwrap().is_empty());
         let result = migrate_schema_two_to_three(&source_path, destination_path.clone()).unwrap();
         let after = read_journal(&destination_path).unwrap();
@@ -5081,6 +6190,7 @@ mod tests {
         assert_eq!(result.migrated_records, 3);
         assert_eq!(result.source_journal_id, "project-schema-two");
         assert_eq!(result.destination_journal_id, result.source_journal_id);
+        assert!(result.source_truncated_final_record);
         assert_eq!(after.schema_version, JOURNAL_SCHEMA_VERSION);
         assert_eq!(after.header.journal_id, before.header.journal_id);
         assert_eq!(after.header.session_id, before.header.session_id);

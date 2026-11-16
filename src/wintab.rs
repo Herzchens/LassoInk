@@ -2562,7 +2562,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the guarded isolated Windows UI test job"]
     fn real_window_subclass_observes_sent_wintab_lifecycle_controls() {
+        crate::require_native_ui_test_opt_in();
         let window = TestWindow::new();
         let context = 0x1122_isize;
         let origin = Instant::now() - Duration::from_secs(1);
@@ -2627,7 +2629,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the guarded isolated Windows UI test job"]
     fn initial_open_and_positive_self_top_overlap_clear_packet_block_after_safe_drain() {
+        crate::require_native_ui_test_opt_in();
         let window = TestWindow::new();
         let context = 0x1122_isize;
         let control_pending = Arc::new(AtomicBool::new(false));
@@ -2672,7 +2676,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the guarded isolated Windows UI test job"]
     fn posted_control_passes_hook_without_double_recording_then_reaches_subclass() {
+        crate::require_native_ui_test_opt_in();
         let window = TestWindow::new();
         let context = 0x1122_isize;
         let mut observer = WintabControlObserver::install(
@@ -2736,7 +2742,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the guarded isolated Windows UI test job"]
     fn sent_context_change_blocks_next_queued_packet_until_safe_close() {
+        crate::require_native_ui_test_opt_in();
         let window = TestWindow::new();
         let context = 0x1122_isize;
         let control_pending = Arc::new(AtomicBool::new(false));
@@ -2820,7 +2828,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the guarded isolated Windows UI test job"]
     fn reentrant_control_during_queue_query_prevents_any_packet_read() {
+        crate::require_native_ui_test_opt_in();
         let _serial = REENTRANT_CONTROL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2879,7 +2889,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the guarded isolated Windows UI test job"]
     fn reentrant_control_during_packet_read_stops_next_read_and_marks_batch_uncertain() {
+        crate::require_native_ui_test_opt_in();
         let _serial = REENTRANT_CONTROL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
