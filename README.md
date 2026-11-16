@@ -70,7 +70,7 @@ cargo +1.100.0 test --locked --workspace
 cargo +1.100.0 build --locked --workspace
 ```
 
-The default test command leaves native HWND, Winit event-loop, and GDI tests ignored, so it does not create a window or call the native UI harness. Windows CI runs those tests serially in a separate GitHub-hosted job after the default checks. That job opts in explicitly; the native tests also require the GitHub-hosted Windows runner marker and the `Herzchens/LassoInk` repository identity before they can call UI APIs. Under the current incident policy, executable validation must run in remote CI rather than on the local host.
+The default local test suite excludes native HWND, Winit event-loop, and GDI integration tests. They run only in a separate guarded GitHub-hosted Windows CI job after the default checks. The native tests require explicit opt-in, the GitHub-hosted Windows runner marker, and the `Herzchens/LassoInk` repository identity before they can call UI APIs.
 
 ## Data handling
 
