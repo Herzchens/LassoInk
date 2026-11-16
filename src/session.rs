@@ -3,6 +3,10 @@
 //! The versioned TSV stream is intentionally local-only. It keeps native clock
 //! domains separate, preserves raw records, and never deduplicates input rows.
 
+use crate::process_cpu::{
+    FileTimeWords, PROCESS_CPU_SCOPE, ProcessCpuMeasurement, ProcessCpuSnapshot,
+    ProcessCpuUnavailableReason,
+};
 use crate::win32_pointer::{
     DirectPenHistoryBatch, LifecycleEventRecord, PointerAttribution, PointerMessageKind,
     ProbeRecord, ProbeSummary, PublicWinitEventData, SessionOutputStage, WintabPacketBatch,
@@ -13,6 +17,7 @@ use std::{
     fmt::{self, Debug, Display, Formatter},
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
@@ -20,16 +25,23 @@ use std::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN,
 };
+use windows_sys::Win32::{
+    Foundation::GetLastError,
+    Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW},
+};
 
-pub(crate) const SESSION_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SESSION_SCHEMA_VERSION: u32 = 2;
 pub(crate) const MAX_SESSION_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const MAX_SESSION_LINE_BYTES: usize = 16 * 1024;
 const MAX_SESSION_LINES: u64 = 140_000;
 const MAX_REPORT_PARTITIONS: usize = 4096;
 const MAX_REPORT_FINGERPRINTS: usize = 131_072;
 const MAX_TRACKED_STROKES: usize = 4096;
+const MAX_PRESSURE_VALUES_PER_PARTITION: usize = 4096;
+const MAX_PRESSURE_DISTRIBUTION_ENTRIES: usize = 32_768;
 const MAX_SESSION_METADATA_ENTRIES: usize = 128;
 const MAX_SESSION_METADATA_TEXT_BYTES: usize = 4096;
+const WINTAB_TPS_QUEUE_ERR: u32 = 0x0002;
 static SESSION_FILENAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn default_session_path(directory: &Path) -> PathBuf {
@@ -73,6 +85,8 @@ pub(crate) struct SessionWriter {
     partial_path: PathBuf,
     file: Option<BufWriter<File>>,
     bytes_written: u64,
+    rows_written: u64,
+    max_session_lines: u64,
     metadata_keys: HashSet<String>,
 }
 
@@ -81,6 +95,20 @@ impl SessionWriter {
         final_path: PathBuf,
         metadata: &BTreeMap<String, String>,
     ) -> Result<Self, SessionIoError> {
+        Self::create_with_line_limit(final_path, metadata, MAX_SESSION_LINES)
+    }
+
+    fn create_with_line_limit(
+        final_path: PathBuf,
+        metadata: &BTreeMap<String, String>,
+        max_session_lines: u64,
+    ) -> Result<Self, SessionIoError> {
+        if max_session_lines < 3 {
+            return Err(SessionIoError::new(
+                SessionOutputStage::Write,
+                "session line limit must fit a header, CPU row, and END footer",
+            ));
+        }
         let parent = final_path
             .parent()
             .filter(|path| !path.as_os_str().is_empty());
@@ -99,6 +127,8 @@ impl SessionWriter {
             partial_path,
             file: Some(BufWriter::new(file)),
             bytes_written: 0,
+            rows_written: 0,
+            max_session_lines,
             metadata_keys: HashSet::new(),
         };
         writer.write_row(&[
@@ -148,8 +178,10 @@ impl SessionWriter {
         mut self,
         summary: ProbeSummary,
         ended_elapsed_ns: u128,
+        process_cpu: ProcessCpuMeasurement,
     ) -> Result<PathBuf, SessionIoError> {
-        self.write_row(&[
+        self.write_cpu_measurement(&process_cpu)?;
+        self.write_footer_row(&[
             "END".to_owned(),
             "finalized".to_owned(),
             ended_elapsed_ns.to_string(),
@@ -181,9 +213,44 @@ impl SessionWriter {
             .sync_all()
             .map_err(|error| SessionIoError::new(SessionOutputStage::Sync, error))?;
         drop(file);
-        fs::rename(&self.partial_path, &self.final_path)
+        publish_no_clobber(&self.partial_path, &self.final_path)
             .map_err(|error| SessionIoError::new(SessionOutputStage::Finalize, error))?;
         Ok(self.final_path.clone())
+    }
+
+    fn write_cpu_measurement(
+        &mut self,
+        measurement: &ProcessCpuMeasurement,
+    ) -> Result<(), SessionIoError> {
+        let mut fields = vec![
+            "CPU".to_owned(),
+            measurement.start.app_elapsed_ns.to_string(),
+            measurement.end.app_elapsed_ns.to_string(),
+            opt_display(measurement.app_interval_ns),
+        ];
+        for time in [
+            measurement.start.user,
+            measurement.start.kernel,
+            measurement.end.user,
+            measurement.end.kernel,
+        ] {
+            fields.push(opt_display(time.map(|value| value.low)));
+            fields.push(opt_display(time.map(|value| value.high)));
+        }
+        fields.extend([
+            opt_display(measurement.user_delta_100ns),
+            opt_display(measurement.kernel_delta_100ns),
+            measurement
+                .core_equivalent_percent
+                .map_or_else(String::new, |value| format!("{:016X}", value.to_bits())),
+            measurement
+                .unavailable_reason
+                .as_ref()
+                .map_or_else(String::new, cpu_unavailable_reason_label),
+            opt_display(measurement.start.win32_error),
+            opt_display(measurement.end.win32_error),
+        ]);
+        self.write_cpu_row(&fields)
     }
 
     fn flush(&mut self) -> Result<(), SessionIoError> {
@@ -492,6 +559,7 @@ impl SessionWriter {
             format!("{:?}", batch.packet_time_mode),
             batch.app_observed_elapsed_ns.to_string(),
             batch.control_transition_observed_during_read.to_string(),
+            batch.packet_quality_issue_observed.to_string(),
             batch.packets.len().to_string(),
         ])?;
         for packet in &batch.packets {
@@ -513,6 +581,22 @@ impl SessionWriter {
     }
 
     fn write_row(&mut self, fields: &[String]) -> Result<(), SessionIoError> {
+        self.write_row_with_reservation(fields, 2)
+    }
+
+    fn write_cpu_row(&mut self, fields: &[String]) -> Result<(), SessionIoError> {
+        self.write_row_with_reservation(fields, 1)
+    }
+
+    fn write_footer_row(&mut self, fields: &[String]) -> Result<(), SessionIoError> {
+        self.write_row_with_reservation(fields, 0)
+    }
+
+    fn write_row_with_reservation(
+        &mut self,
+        fields: &[String],
+        reserved_following_lines: u64,
+    ) -> Result<(), SessionIoError> {
         let row = encode_row(fields);
         if row.len() > MAX_SESSION_LINE_BYTES {
             return Err(SessionIoError::new(
@@ -527,12 +611,55 @@ impl SessionWriter {
                 "session byte cap reached; partial file retained",
             ));
         }
+        let rows_after_write = self.rows_written.saturating_add(1);
+        let required_lines = rows_after_write.saturating_add(reserved_following_lines);
+        if required_lines > self.max_session_lines {
+            return Err(SessionIoError::new(
+                SessionOutputStage::Write,
+                format!(
+                    "session line cap reached at {}; {reserved_following_lines} required line(s) are reserved",
+                    self.max_session_lines,
+                ),
+            ));
+        }
         self.file
             .as_mut()
             .expect("session writer owns an open file")
             .write_all(&row)
             .map_err(|error| SessionIoError::new(SessionOutputStage::Write, error))?;
         self.bytes_written = self.bytes_written.saturating_add(row_len);
+        self.rows_written = rows_after_write;
+        Ok(())
+    }
+}
+
+fn publish_no_clobber(partial_path: &Path, final_path: &Path) -> io::Result<()> {
+    let partial_wide = partial_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let final_wide = final_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both paths are NUL-terminated UTF-16 buffers alive for the call.
+    // Only MOVEFILE_WRITE_THROUGH is set; omitting REPLACE_EXISTING makes an
+    // existing destination a hard failure while preserving its bytes.
+    let succeeded = unsafe {
+        MoveFileExW(
+            partial_wide.as_ptr(),
+            final_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if succeeded == 0 {
+        // SAFETY: GetLastError has no preconditions and is called immediately
+        // after the failed Win32 operation on this thread.
+        let error = unsafe { GetLastError() };
+        Err(io::Error::from_raw_os_error(error as i32))
+    } else {
         Ok(())
     }
 }
@@ -567,6 +694,18 @@ fn opt_display<T: Display>(value: Option<T>) -> String {
 
 fn debug_opt<T: Debug>(value: Option<T>) -> String {
     value.map_or_else(String::new, |value| format!("{value:?}"))
+}
+
+fn cpu_unavailable_reason_label(reason: &ProcessCpuUnavailableReason) -> String {
+    match reason {
+        ProcessCpuUnavailableReason::StartSnapshotFailed { .. } => "StartSnapshotFailed",
+        ProcessCpuUnavailableReason::EndSnapshotFailed { .. } => "EndSnapshotFailed",
+        ProcessCpuUnavailableReason::SnapshotValuesUnavailable => "SnapshotValuesUnavailable",
+        ProcessCpuUnavailableReason::AppClockRegressed => "AppClockRegressed",
+        ProcessCpuUnavailableReason::ZeroMeasurementInterval => "ZeroMeasurementInterval",
+        ProcessCpuUnavailableReason::ProcessTimeRegressed => "ProcessTimeRegressed",
+    }
+    .to_owned()
 }
 
 fn force_parts(force: Option<winit::event::Force>) -> (String, String, String, String) {
@@ -610,6 +749,7 @@ pub(crate) struct SessionReport {
     pub batches_not_retained: u64,
     pub samples_not_retained: u64,
     pub schema_version: Option<u32>,
+    pub process_cpu: Option<ProcessCpuMeasurement>,
     pub metadata: BTreeMap<String, String>,
     pub parsed_rows: u64,
     pub direct_batches: u64,
@@ -636,6 +776,11 @@ pub(crate) struct SessionReport {
     pub lifecycle_events: u64,
     pub issue_records: u64,
     pub exact_raw_duplicate_fingerprints: u64,
+    pub pressure_distribution_value_entries: u64,
+    pub pressure_distribution_cap_reached: bool,
+    pub pressure_run_tracker_cap_reached: bool,
+    pub unqualified_wintab_pressure_rows: u64,
+    pub pressure_null_reasons: BTreeMap<String, u64>,
     pub native_clock_regressions: u64,
     pub qpc_message_to_hook_age_samples: u64,
     pub qpc_age_null_reasons: BTreeMap<String, u64>,
@@ -656,6 +801,7 @@ pub(crate) struct MetricKey {
     pub pointer: String,
     pub stroke: String,
     pub native_clock: String,
+    pub pressure_representation: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -670,6 +816,13 @@ pub(crate) struct MetricBucket {
     pub uncertain_wintab_packets: u64,
     pub exact_raw_duplicate_fingerprints: u64,
     pub native_clock_regressions: u64,
+    pub pressure_metric_samples: u64,
+    pub pressure_value_counts: BTreeMap<u64, u64>,
+    pub pressure_distribution_truncated: bool,
+    pub pressure_repeated_values: u64,
+    pub pressure_plateau_runs: u64,
+    pub pressure_transitions: u64,
+    pub pressure_max_run_length: u64,
     qpc_age_ns: Vec<u128>,
     qpc_age_null_reasons: BTreeMap<String, u64>,
     qpc_sample_interval_ns: Vec<u128>,
@@ -712,12 +865,31 @@ impl MetricBucket {
         );
     }
 
+    fn pressure_entropy_bits(&self) -> Option<f64> {
+        if self.pressure_distribution_truncated {
+            return None;
+        }
+        let sample_count = self.pressure_value_counts.values().copied().sum::<u64>();
+        if sample_count == 0 {
+            return None;
+        }
+        let entropy = self
+            .pressure_value_counts
+            .values()
+            .map(|count| {
+                let probability = *count as f64 / sample_count as f64;
+                -probability * probability.log2()
+            })
+            .sum();
+        Some(entropy)
+    }
+
     fn qpc_age_percentile_ms(&mut self, percentile: usize) -> Option<f64> {
         if self.qpc_age_ns.is_empty() {
             return None;
         }
         self.qpc_age_ns.sort_unstable();
-        let index = (self.qpc_age_ns.len() - 1).saturating_mul(percentile) / 100;
+        let index = nearest_rank_index(self.qpc_age_ns.len(), percentile)?;
         Some(self.qpc_age_ns[index] as f64 / 1_000_000.0)
     }
 
@@ -726,9 +898,29 @@ impl MetricBucket {
             return None;
         }
         self.qpc_sample_interval_ns.sort_unstable();
-        let index = (self.qpc_sample_interval_ns.len() - 1).saturating_mul(percentile) / 100;
+        let index = nearest_rank_index(self.qpc_sample_interval_ns.len(), percentile)?;
         Some(self.qpc_sample_interval_ns[index] as f64 / 1_000_000.0)
     }
+}
+
+/// Selects the discrete nearest-rank sample at ceil(n*p/100), with rank 1
+/// returned for p=0 and the rank capped to the available sample count.
+fn nearest_rank_index(sample_count: usize, percentile: usize) -> Option<usize> {
+    if sample_count == 0 {
+        return None;
+    }
+    let percentile = percentile.min(100);
+    let rank = sample_count
+        .saturating_mul(percentile)
+        .div_ceil(100)
+        .clamp(1, sample_count);
+    Some(rank - 1)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PressureRunState {
+    value: u64,
+    length: u64,
 }
 
 #[derive(Debug)]
@@ -760,6 +952,12 @@ struct DirectBatchMeta {
     qpc_frequency_hz: Option<u64>,
 }
 
+struct DirectMetricTrackers<'a> {
+    fingerprints: &'a mut HashSet<String>,
+    last_qpc: &'a mut HashMap<MetricKey, u64>,
+    pressure_runs: &'a mut HashMap<MetricKey, PressureRunState>,
+}
+
 #[derive(Clone, Copy)]
 struct WintabBatchMeta {
     sequence: u64,
@@ -767,6 +965,7 @@ struct WintabBatchMeta {
     device_raw: u32,
     packet_time_mode: WintabPacketTimeMode,
     uncertain: bool,
+    quality_issue_observed: bool,
 }
 
 #[derive(Default)]
@@ -932,6 +1131,13 @@ pub(crate) fn read_report(path: &Path) -> Result<SessionReport, SessionReadError
 }
 
 pub(crate) fn parse_session(reader: impl Read) -> Result<SessionReport, SessionReadError> {
+    parse_session_with_line_limit(reader, MAX_SESSION_LINES)
+}
+
+fn parse_session_with_line_limit(
+    reader: impl Read,
+    max_session_lines: u64,
+) -> Result<SessionReport, SessionReadError> {
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
     let mut report = SessionReport::default();
@@ -940,12 +1146,14 @@ pub(crate) fn parse_session(reader: impl Read) -> Result<SessionReport, SessionR
     let mut total_session_bytes = 0u64;
     let mut saw_header = false;
     let mut saw_end = false;
+    let mut saw_cpu = false;
     let mut direct_batch: Option<DirectBatchMeta> = None;
     let mut wintab_batch: Option<WintabBatchMeta> = None;
     let mut strokes = StrokeTracker::default();
     let mut direct_dispatches = HashSet::new();
     let mut fingerprints = HashSet::new();
     let mut last_direct_qpc: HashMap<MetricKey, u64> = HashMap::new();
+    let mut direct_pressure_runs: HashMap<MetricKey, PressureRunState> = HashMap::new();
 
     loop {
         line.clear();
@@ -974,9 +1182,9 @@ pub(crate) fn parse_session(reader: impl Read) -> Result<SessionReport, SessionR
             break;
         }
         line_number = line_number.saturating_add(1);
-        if line_number > MAX_SESSION_LINES {
+        if line_number > max_session_lines {
             return Err(SessionReadError::invalid(format!(
-                "session exceeds the {MAX_SESSION_LINES}-line parser limit"
+                "session exceeds the {max_session_lines}-line parser limit"
             )));
         }
         if line.last() == Some(&b'\n') {
@@ -1012,7 +1220,7 @@ pub(crate) fn parse_session(reader: impl Read) -> Result<SessionReport, SessionR
                 ));
             }
             let version = parse_u32(fields[1], line_number, "schema version")?;
-            if version != SESSION_SCHEMA_VERSION {
+            if !matches!(version, 1 | SESSION_SCHEMA_VERSION) {
                 return Err(SessionReadError::invalid(format!(
                     "unsupported session schema version {version}"
                 )));
@@ -1099,21 +1307,32 @@ pub(crate) fn parse_session(reader: impl Read) -> Result<SessionReport, SessionR
                 update_direct_metrics(
                     &mut report,
                     &mut strokes,
-                    &mut fingerprints,
-                    &mut last_direct_qpc,
+                    &mut DirectMetricTrackers {
+                        fingerprints: &mut fingerprints,
+                        last_qpc: &mut last_direct_qpc,
+                        pressure_runs: &mut direct_pressure_runs,
+                    },
                     batch,
                     &fields,
                     line_number,
                 )?;
             }
             "W_BATCH" => {
-                require_fields(&fields, 17, line_number)?;
+                let schema_version = report.schema_version.unwrap_or(1);
+                let quality_issue_observed = if schema_version >= 2 {
+                    require_fields(&fields, 18, line_number)?;
+                    parse_bool(fields[16], line_number, "Wintab batch quality issue")?
+                } else {
+                    require_fields(&fields, 17, line_number)?;
+                    false
+                };
                 wintab_batch = Some(WintabBatchMeta {
                     sequence: parse_u64(fields[1], line_number, "Wintab batch sequence")?,
                     context_raw: parse_i64(fields[7], line_number, "Wintab context")?,
                     device_raw: parse_u32(fields[10], line_number, "Wintab device selector")?,
                     packet_time_mode: parse_wintab_time_mode(fields[13], line_number)?,
                     uncertain: parse_bool(fields[15], line_number, "Wintab uncertainty")?,
+                    quality_issue_observed,
                 });
             }
             "W_PACKET" => {
@@ -1174,6 +1393,99 @@ pub(crate) fn parse_session(reader: impl Read) -> Result<SessionReport, SessionR
                 report.wintab_control_notifications =
                     report.wintab_control_notifications.saturating_add(1);
             }
+            "CPU" => {
+                if report.schema_version.unwrap_or(1) < 2 {
+                    return Err(SessionReadError::invalid(
+                        "CPU rows require schema version 2",
+                    ));
+                }
+                require_fields(&fields, 18, line_number)?;
+                if saw_cpu {
+                    return Err(SessionReadError::invalid(
+                        "session contains more than one CPU measurement row",
+                    ));
+                }
+                let parse_words =
+                    |low: &str,
+                     high: &str,
+                     label: &str|
+                     -> Result<Option<FileTimeWords>, SessionReadError> {
+                        match (low.is_empty(), high.is_empty()) {
+                            (true, true) => Ok(None),
+                            (false, false) => Ok(Some(FileTimeWords {
+                                low: parse_u32(low, line_number, &format!("{label} FILETIME low"))?,
+                                high: parse_u32(
+                                    high,
+                                    line_number,
+                                    &format!("{label} FILETIME high"),
+                                )?,
+                            })),
+                            _ => Err(SessionReadError::invalid(format!(
+                                "line {line_number} has a partial {label} FILETIME"
+                            ))),
+                        }
+                    };
+                let start = ProcessCpuSnapshot {
+                    app_elapsed_ns: parse_u128(fields[1], line_number, "CPU start app arrival")?,
+                    user: parse_words(fields[4], fields[5], "start user")?,
+                    kernel: parse_words(fields[6], fields[7], "start kernel")?,
+                    win32_error: parse_option_u32(fields[16], line_number, "start CPU error")?,
+                };
+                let end = ProcessCpuSnapshot {
+                    app_elapsed_ns: parse_u128(fields[2], line_number, "CPU end app arrival")?,
+                    user: parse_words(fields[8], fields[9], "end user")?,
+                    kernel: parse_words(fields[10], fields[11], "end kernel")?,
+                    win32_error: parse_option_u32(fields[17], line_number, "end CPU error")?,
+                };
+                if start.win32_error.is_some() && (start.user.is_some() || start.kernel.is_some())
+                    || end.win32_error.is_some() && (end.user.is_some() || end.kernel.is_some())
+                {
+                    return Err(SessionReadError::invalid(format!(
+                        "line {line_number} has FILETIME values attached to a failed CPU snapshot"
+                    )));
+                }
+                let cached_app_interval_ns =
+                    parse_option_u128(fields[3], line_number, "CPU app interval")?;
+                let cached_user_delta_100ns =
+                    parse_option_u128(fields[12], line_number, "CPU user delta")?;
+                let cached_kernel_delta_100ns =
+                    parse_option_u128(fields[13], line_number, "CPU kernel delta")?;
+                let cached_core_equivalent_percent = if fields[14].is_empty() {
+                    None
+                } else {
+                    let bits = u64::from_str_radix(fields[14], 16).map_err(|_| {
+                        SessionReadError::invalid(format!(
+                            "line {line_number} has an invalid CPU ratio bit pattern"
+                        ))
+                    })?;
+                    let value = f64::from_bits(bits);
+                    if !value.is_finite() || value < 0.0 {
+                        return Err(SessionReadError::invalid(format!(
+                            "line {line_number} has a non-finite or negative CPU ratio"
+                        )));
+                    }
+                    Some(value)
+                };
+                let measured = crate::process_cpu::measure(start, end);
+                let expected_reason = measured
+                    .unavailable_reason
+                    .as_ref()
+                    .map(cpu_unavailable_reason_label)
+                    .unwrap_or_default();
+                if cached_app_interval_ns != measured.app_interval_ns
+                    || cached_user_delta_100ns != measured.user_delta_100ns
+                    || cached_kernel_delta_100ns != measured.kernel_delta_100ns
+                    || cached_core_equivalent_percent.map(f64::to_bits)
+                        != measured.core_equivalent_percent.map(f64::to_bits)
+                    || fields[15] != expected_reason
+                {
+                    return Err(SessionReadError::invalid(format!(
+                        "line {line_number} cached CPU metrics disagree with raw FILETIME snapshots and app-arrival times"
+                    )));
+                }
+                report.process_cpu = Some(measured);
+                saw_cpu = true;
+            }
             "IGNORED" => {
                 require_fields(&fields, 12, line_number)?;
                 report.ignored_non_pen_events = report.ignored_non_pen_events.saturating_add(1);
@@ -1181,6 +1493,13 @@ pub(crate) fn parse_session(reader: impl Read) -> Result<SessionReport, SessionR
             "END" => {
                 require_fields(&fields, 21, line_number)?;
                 report.complete = fields[1] == "finalized";
+                if report.complete && report.schema_version.unwrap_or(1) >= 2 && !saw_cpu {
+                    report.complete = false;
+                    report.capture_incomplete = true;
+                    report.warnings.push(
+                        "schema 2 finalized session is missing its CPU measurement row".to_owned(),
+                    );
+                }
                 report.wintab_status = Some(fields[12].to_owned());
                 report.pointer_api_available = Some(parse_bool(
                     fields[13],
@@ -1255,14 +1574,24 @@ pub(crate) fn parse_session(reader: impl Read) -> Result<SessionReport, SessionR
                 .to_owned(),
         );
     }
+    if report.pressure_distribution_cap_reached {
+        report.warnings.push(
+            "pressure value distribution cap reached; raw rows remain intact and retained histograms are partial".to_owned(),
+        );
+    }
+    if report.pressure_run_tracker_cap_reached {
+        report.warnings.push(
+            "pressure repeat-run tracker cap reached; later run statistics are incomplete"
+                .to_owned(),
+        );
+    }
     Ok(report)
 }
 
 fn update_direct_metrics(
     report: &mut SessionReport,
     strokes: &mut StrokeTracker,
-    fingerprints: &mut HashSet<String>,
-    last_direct_qpc: &mut HashMap<MetricKey, u64>,
+    trackers: &mut DirectMetricTrackers<'_>,
     batch: DirectBatchMeta,
     fields: &[&str],
     line_number: u64,
@@ -1335,25 +1664,34 @@ fn update_direct_metrics(
         pointer: format!("pointerId:{pointer_id}"),
         stroke,
         native_clock: clock,
+        pressure_representation: "POINTER_INFO.pressure raw u32; valid mask range 0..1024"
+            .to_owned(),
     };
     let fingerprint = format!("D|{}", fields[5..32].join("|"));
-    let duplicate = note_fingerprint(report, fingerprints, fingerprint);
+    let duplicate = note_fingerprint(report, trackers.fingerprints, fingerprint);
     let stroke_is_classified = key.stroke.starts_with("observed-direct-stroke-");
     let partition_tracking_available =
         report.partitions.contains_key(&key) || report.partitions.len() < MAX_REPORT_PARTITIONS;
     let qpc_tracking_available =
-        last_direct_qpc.contains_key(&key) || last_direct_qpc.len() < MAX_REPORT_PARTITIONS;
-    let qpc_tracking_enabled = stroke_is_classified
+        trackers.last_qpc.contains_key(&key) || trackers.last_qpc.len() < MAX_REPORT_PARTITIONS;
+    let qpc_tracking_enabled = valid
+        && stroke_is_classified
         && !duplicate
         && partition_tracking_available
         && qpc_tracking_available;
     let previous_qpc = if qpc_tracking_enabled {
-        last_direct_qpc.insert(key.clone(), qpc)
+        trackers.last_qpc.insert(key.clone(), qpc)
     } else {
+        if !valid {
+            trackers.last_qpc.remove(&key);
+            trackers.pressure_runs.remove(&key);
+        }
         None
     };
     let (qpc_interval_ns, interval_null_reason, clock_regressed) = if duplicate {
         (None, Some("duplicate_raw_fingerprint"), false)
+    } else if !valid {
+        (None, Some("invalid_direct_pen_candidate"), false)
     } else if !stroke_is_classified {
         (None, Some("stroke_unclassified"), false)
     } else if !partition_tracking_available || !qpc_tracking_available {
@@ -1384,17 +1722,21 @@ fn update_direct_metrics(
             .entry(reason.to_owned())
             .or_default() += 1;
     }
-    let (age, null_reason) = match (batch.hook_qpc, batch.qpc_frequency_hz) {
-        (None, _) => (None, Some("hook_qpc_unavailable")),
-        (_, None | Some(0)) => (None, Some("qpc_frequency_unavailable")),
-        (Some(hook), Some(frequency)) if hook >= qpc => {
-            let delta = u128::from(hook - qpc);
-            (
-                Some(delta.saturating_mul(1_000_000_000) / u128::from(frequency)),
-                None,
-            )
+    let (age, null_reason) = if !valid {
+        (None, Some("invalid_direct_pen_candidate"))
+    } else {
+        match (batch.hook_qpc, batch.qpc_frequency_hz) {
+            (None, _) => (None, Some("hook_qpc_unavailable")),
+            (_, None | Some(0)) => (None, Some("qpc_frequency_unavailable")),
+            (Some(hook), Some(frequency)) if hook >= qpc => {
+                let delta = u128::from(hook - qpc);
+                (
+                    Some(delta.saturating_mul(1_000_000_000) / u128::from(frequency)),
+                    None,
+                )
+            }
+            (Some(_), Some(_)) => (None, Some("hook_qpc_precedes_performance_count")),
         }
-        (Some(_), Some(_)) => (None, Some("hook_qpc_precedes_performance_count")),
     };
     if age.is_some() {
         report.qpc_message_to_hook_age_samples =
@@ -1409,7 +1751,9 @@ fn update_direct_metrics(
         bucket.raw_rows = bucket.raw_rows.saturating_add(1);
         if valid {
             bucket.valid_direct_pen_samples = bucket.valid_direct_pen_samples.saturating_add(1);
-            bucket.note_valid_pressure(pressure);
+            if !duplicate {
+                bucket.note_valid_pressure(pressure);
+            }
         } else {
             bucket.invalid_direct_pen_samples = bucket.invalid_direct_pen_samples.saturating_add(1);
         }
@@ -1426,6 +1770,25 @@ fn update_direct_metrics(
         bucket.add_qpc_interval(qpc_interval_ns, interval_null_reason);
         bucket.add_qpc_age(age, null_reason);
     }
+    if valid && !duplicate {
+        record_pressure_value(
+            report,
+            &key,
+            u64::from(pressure),
+            Some(trackers.pressure_runs),
+            stroke_is_classified,
+        );
+    } else if duplicate || !valid {
+        let reason = if duplicate {
+            "duplicate_raw_fingerprint"
+        } else {
+            "invalid_direct_pen_candidate"
+        };
+        *report
+            .pressure_null_reasons
+            .entry(reason.to_owned())
+            .or_default() += 1;
+    }
     Ok(())
 }
 
@@ -1437,7 +1800,8 @@ fn update_wintab_metrics(
     line_number: u64,
 ) -> Result<(), SessionReadError> {
     let context = parse_i64(fields[2], line_number, "packet context")?;
-    if context != batch.context_raw {
+    let context_mismatch = context != batch.context_raw;
+    if context_mismatch {
         report.wintab_context_mismatch_packets =
             report.wintab_context_mismatch_packets.saturating_add(1);
     }
@@ -1454,10 +1818,38 @@ fn update_wintab_metrics(
         pointer: format!("cursor:{cursor}"),
         stroke: "unclassified-wintab-stroke".to_owned(),
         native_clock: format!("Wintab pkTime {:?};raw-u32", batch.packet_time_mode),
+        pressure_representation:
+            "Wintab NORMAL_PRESSURE raw u32; uncalibrated; driver range unknown".to_owned(),
     };
     let fingerprint =
         format!("W|{context}|{status}|{packet_time}|{serial}|{cursor}|{x}|{y}|{pressure}");
     let duplicate = note_fingerprint(report, fingerprints, fingerprint);
+    let pressure_valid = !batch.uncertain
+        && !batch.quality_issue_observed
+        && !context_mismatch
+        && status & WINTAB_TPS_QUEUE_ERR == 0
+        && !duplicate;
+    if !pressure_valid {
+        report.unqualified_wintab_pressure_rows =
+            report.unqualified_wintab_pressure_rows.saturating_add(1);
+        let reason = if duplicate {
+            "duplicate_raw_fingerprint"
+        } else if batch.uncertain {
+            "wintab_control_transition_during_read"
+        } else if batch.quality_issue_observed {
+            "wintab_packet_quality_issue"
+        } else if context_mismatch {
+            "wintab_context_mismatch"
+        } else if status & WINTAB_TPS_QUEUE_ERR != 0 {
+            "wintab_queue_error_status"
+        } else {
+            "wintab_pressure_unqualified"
+        };
+        *report
+            .pressure_null_reasons
+            .entry(reason.to_owned())
+            .or_default() += 1;
+    }
     if batch.uncertain {
         report.uncertain_wintab_packets = report.uncertain_wintab_packets.saturating_add(1);
     } else {
@@ -1467,7 +1859,7 @@ fn update_wintab_metrics(
         .qpc_age_null_reasons
         .entry("wintab_clock_not_compared_to_qpc".to_owned())
         .or_default() += 1;
-    if let Some(bucket) = bucket_mut(report, key) {
+    if let Some(bucket) = bucket_mut(report, key.clone()) {
         bucket.raw_rows = bucket.raw_rows.saturating_add(1);
         if batch.uncertain {
             bucket.uncertain_wintab_packets = bucket.uncertain_wintab_packets.saturating_add(1);
@@ -1481,7 +1873,73 @@ fn update_wintab_metrics(
         }
         bucket.add_qpc_age(None, Some("wintab_clock_not_compared_to_qpc"));
     }
+    if pressure_valid {
+        record_pressure_value(report, &key, u64::from(pressure), None, false);
+    }
     Ok(())
+}
+
+fn record_pressure_value(
+    report: &mut SessionReport,
+    key: &MetricKey,
+    value: u64,
+    run_states: Option<&mut HashMap<MetricKey, PressureRunState>>,
+    track_runs: bool,
+) {
+    let global_value_capacity =
+        report.pressure_distribution_value_entries < MAX_PRESSURE_DISTRIBUTION_ENTRIES as u64;
+    let mut inserted_new_value = false;
+    let mut skipped_new_value = false;
+    let mut run_cap_reached = false;
+    if let Some(bucket) = bucket_mut(report, key.clone()) {
+        bucket.pressure_metric_samples = bucket.pressure_metric_samples.saturating_add(1);
+        if let Some(count) = bucket.pressure_value_counts.get_mut(&value) {
+            *count = count.saturating_add(1);
+        } else if bucket.pressure_value_counts.len() < MAX_PRESSURE_VALUES_PER_PARTITION
+            && global_value_capacity
+        {
+            bucket.pressure_value_counts.insert(value, 1);
+            inserted_new_value = true;
+        } else {
+            bucket.pressure_distribution_truncated = true;
+            skipped_new_value = true;
+        }
+
+        if track_runs && let Some(states) = run_states {
+            if let Some(previous) = states.get_mut(key) {
+                if previous.value == value {
+                    previous.length = previous.length.saturating_add(1);
+                    bucket.pressure_repeated_values =
+                        bucket.pressure_repeated_values.saturating_add(1);
+                    if previous.length == 2 {
+                        bucket.pressure_plateau_runs =
+                            bucket.pressure_plateau_runs.saturating_add(1);
+                    }
+                    bucket.pressure_max_run_length =
+                        bucket.pressure_max_run_length.max(previous.length);
+                } else {
+                    previous.value = value;
+                    previous.length = 1;
+                    bucket.pressure_transitions = bucket.pressure_transitions.saturating_add(1);
+                }
+            } else if states.len() < MAX_REPORT_PARTITIONS {
+                states.insert(key.clone(), PressureRunState { value, length: 1 });
+                bucket.pressure_max_run_length = bucket.pressure_max_run_length.max(1);
+            } else {
+                run_cap_reached = true;
+            }
+        }
+    }
+    if inserted_new_value {
+        report.pressure_distribution_value_entries =
+            report.pressure_distribution_value_entries.saturating_add(1);
+    }
+    if skipped_new_value {
+        report.pressure_distribution_cap_reached = true;
+    }
+    if run_cap_reached {
+        report.pressure_run_tracker_cap_reached = true;
+    }
 }
 
 fn update_public_metrics(
@@ -1503,16 +1961,67 @@ fn update_public_metrics(
     let mut pointer = "none".to_owned();
     let mut stroke = "unclassified-no-public-stroke".to_owned();
     let mut confirmed_pen = false;
+    let mut pressure_representation = "Winit Force absent or not applicable".to_owned();
+    let mut public_force_value = None;
     if event_kind == "Touch" {
         report.public_touch_events = report.public_touch_events.saturating_add(1);
         let touch_id = parse_u64(fields[12], line_number, "public Touch ID")?;
         let phase = decode_field(fields[13], line_number)?;
+        let public_pen_classification = decode_field(fields[22], line_number)?;
         pointer = format!("public-touch-id:{touch_id}");
         stroke = strokes.public_touch_stroke(&device, touch_id, &phase);
-        confirmed_pen = fields[22].contains("ConfirmedPen");
+        confirmed_pen = public_pen_classification == "ConfirmedPen";
         if confirmed_pen {
             report.confirmed_public_pen_events =
                 report.confirmed_public_pen_events.saturating_add(1);
+        }
+        pressure_representation =
+            format!("Winit Touch Force classification={public_pen_classification}; force absent");
+        match fields[16] {
+            "Normalized" => {
+                let bits = parse_hex_u64(fields[17], line_number, "normalized public force")?;
+                let value = f64::from_bits(bits);
+                pressure_representation = format!(
+                    "Winit Force::Normalized raw f64 bits; classification={public_pen_classification}"
+                );
+                if value.is_finite() {
+                    public_force_value = Some(bits);
+                } else {
+                    *report
+                        .pressure_null_reasons
+                        .entry("public_force_nonfinite".to_owned())
+                        .or_default() += 1;
+                }
+            }
+            "Calibrated" => {
+                let bits = parse_hex_u64(fields[17], line_number, "calibrated public force")?;
+                let max_bits =
+                    parse_hex_u64(fields[18], line_number, "calibrated public force maximum")?;
+                let value = f64::from_bits(bits);
+                let maximum = f64::from_bits(max_bits);
+                pressure_representation = format!(
+                    "Winit Force::Calibrated raw f64 bits; maximum bits {max_bits:016X}; classification={public_pen_classification}"
+                );
+                if value.is_finite() && maximum.is_finite() && maximum > 0.0 {
+                    public_force_value = Some(bits);
+                } else {
+                    *report
+                        .pressure_null_reasons
+                        .entry("public_force_calibration_unusable".to_owned())
+                        .or_default() += 1;
+                }
+            }
+            "None" | "" => {
+                *report
+                    .pressure_null_reasons
+                    .entry("public_force_absent".to_owned())
+                    .or_default() += 1;
+            }
+            other => {
+                return Err(SessionReadError::invalid(format!(
+                    "line {line_number} has an unknown public force representation {other:?}"
+                )));
+            }
         }
     }
     if let Some(associated_sequence) =
@@ -1528,12 +2037,13 @@ fn update_public_metrics(
         pointer,
         stroke,
         native_clock: "none;Winit native timestamp null".to_owned(),
+        pressure_representation,
     };
     *report
         .qpc_age_null_reasons
         .entry("public_native_timestamp_absent".to_owned())
         .or_default() += 1;
-    if let Some(bucket) = bucket_mut(report, key) {
+    if let Some(bucket) = bucket_mut(report, key.clone()) {
         bucket.raw_rows = bucket.raw_rows.saturating_add(1);
         bucket.public_events = bucket.public_events.saturating_add(1);
         if confirmed_pen {
@@ -1541,6 +2051,9 @@ fn update_public_metrics(
                 bucket.confirmed_public_pen_events.saturating_add(1);
         }
         bucket.add_qpc_age(None, Some("public_native_timestamp_absent"));
+    }
+    if let Some(value) = public_force_value {
+        record_pressure_value(report, &key, value, None, false);
     }
     Ok(())
 }
@@ -1752,7 +2265,47 @@ impl SessionReport {
         .ok();
         writeln!(
             output,
-            "Metric partitions (API | device | pointer | stroke | native clock):"
+            "Pressure metric null/exclusion reasons: {:?}; Wintab unqualified raw pressure rows: {}",
+            self.pressure_null_reasons,
+            self.unqualified_wintab_pressure_rows
+        )
+        .ok();
+        writeln!(output, "Process CPU scope: {PROCESS_CPU_SCOPE}").ok();
+        match &self.process_cpu {
+            Some(cpu) => {
+                writeln!(
+                    output,
+                    "Process CPU measurement app-arrival ns: {}..{}; interval ns: {:?}; raw FILETIME user start/end: {:?}/{:?}; kernel start/end: {:?}/{:?}; deltas user/kernel: {:?}/{:?} 100ns; whole-process core-equivalent percent: {}; unavailable reason: {:?}",
+                    cpu.start.app_elapsed_ns,
+                    cpu.end.app_elapsed_ns,
+                    cpu.app_interval_ns,
+                    cpu.start.user,
+                    cpu.end.user,
+                    cpu.start.kernel,
+                    cpu.end.kernel,
+                    cpu.user_delta_100ns,
+                    cpu.kernel_delta_100ns,
+                    cpu.core_equivalent_percent.map_or_else(|| "null".to_owned(), |value| format!("{value:.3}%")),
+                    cpu.unavailable_reason
+                )
+                .ok();
+            }
+            None => {
+                writeln!(
+                    output,
+                    "Process CPU measurement: unavailable (CPU row absent)"
+                )
+                .ok();
+            }
+        }
+        writeln!(
+            output,
+            "QPC age and direct interval percentiles use discrete nearest-rank (ceil(n*p/100), rank at least 1)."
+        )
+        .ok();
+        writeln!(
+            output,
+            "Metric partitions (API | device | pointer | stroke | native clock | pressure representation):"
         )
         .ok();
         for (key, bucket) in &mut self.partitions {
@@ -1762,20 +2315,27 @@ impl SessionReport {
             let p95 = bucket
                 .qpc_age_percentile_ms(95)
                 .map_or_else(|| "null".to_owned(), |value| format!("{value:.3}ms"));
+            let p99 = bucket
+                .qpc_age_percentile_ms(99)
+                .map_or_else(|| "null".to_owned(), |value| format!("{value:.3}ms"));
             let interval_p50 = bucket
                 .qpc_interval_percentile_ms(50)
                 .map_or_else(|| "null".to_owned(), |value| format!("{value:.3}ms"));
             let interval_p95 = bucket
                 .qpc_interval_percentile_ms(95)
                 .map_or_else(|| "null".to_owned(), |value| format!("{value:.3}ms"));
+            let interval_p99 = bucket
+                .qpc_interval_percentile_ms(99)
+                .map_or_else(|| "null".to_owned(), |value| format!("{value:.3}ms"));
             writeln!(
                 output,
-                "  {} | {} | {} | {} | {}: raw={}, validDirect={}, invalidDirect={}, publicEvents={}, wintabUninterrupted={}, wintabUncertain={}, duplicateFingerprints={}, clockRegressions={}, qpcAgeP50={}, qpcAgeP95={}, qpcAgeNull={:?}, qpcIntervalP50={}, qpcIntervalP95={}, qpcIntervalNull={:?}, pressureRange={:?}..{:?}",
+                "  {} | {} | {} | {} | {} | {}: raw={}, validDirect={}, invalidDirect={}, publicEvents={}, wintabUninterrupted={}, wintabUncertain={}, duplicateFingerprints={}, clockRegressions={}, qpcAgeP50={}, qpcAgeP95={}, qpcAgeP99={}, qpcAgeNull={:?}, qpcIntervalP50={}, qpcIntervalP95={}, qpcIntervalP99={}, qpcIntervalNull={:?}, pressureSamples={}, pressureDistinct={}, pressureEntropyBits={}, pressureRepeats={}, pressurePlateauRuns={}, pressureTransitions={}, pressureMaxRun={}, pressureDistribution={:?}, pressureDistributionTruncated={}, pressureRange={:?}..{:?}",
                 key.api,
                 key.device,
                 key.pointer,
                 key.stroke,
                 key.native_clock,
+                key.pressure_representation,
                 bucket.raw_rows,
                 bucket.valid_direct_pen_samples,
                 bucket.invalid_direct_pen_samples,
@@ -1786,10 +2346,21 @@ impl SessionReport {
                 bucket.native_clock_regressions,
                 p50,
                 p95,
+                p99,
                 bucket.qpc_age_null_reasons,
                 interval_p50,
                 interval_p95,
+                interval_p99,
                 bucket.qpc_interval_null_reasons,
+                bucket.pressure_metric_samples,
+                bucket.pressure_value_counts.len(),
+                bucket.pressure_entropy_bits().map_or_else(|| "null".to_owned(), |value| format!("{value:.6}")),
+                bucket.pressure_repeated_values,
+                bucket.pressure_plateau_runs,
+                bucket.pressure_transitions,
+                bucket.pressure_max_run_length,
+                bucket.pressure_value_counts,
+                bucket.pressure_distribution_truncated,
                 bucket.valid_pressure_min,
                 bucket.valid_pressure_max
             )
@@ -1797,7 +2368,7 @@ impl SessionReport {
         }
         writeln!(
             output,
-            "Raw rows are preserved. Duplicate fingerprints are diagnostic only; repeated fingerprints are skipped only when forming direct inter-sample QPC intervals. No cross-source per-sample joins, clock bridges, or CT430 hardware conclusions are produced by this report."
+            "Raw rows are preserved. Exact repeated direct-history fingerprints remain counted but are skipped in derived direct QPC intervals and pressure distributions. Direct pressure metrics require a valid PT_PEN type/ID/pressure mask/range. Wintab NORMAL_PRESSURE remains uncalibrated raw data with unknown driver range and is never normalized or compared with direct pressure. Repeat-run statistics cover valid unique direct rows inside an observed stroke only. Jitter is unresolved because no calibrated position-noise procedure is measured here. Physical end-to-end latency is unresolved because there is no trusted pen-sensing/display clock bridge or instrumented display endpoint. No 220 Hz threshold, frame-lock conclusion, cross-source per-sample join, or CT430 hardware conclusion is produced."
         )
         .ok();
         for warning in &self.warnings {
@@ -1827,10 +2398,40 @@ fn parse_u64(value: &str, line: u64, name: &str) -> Result<u64, SessionReadError
     })
 }
 
+fn parse_hex_u64(value: &str, line: u64, name: &str) -> Result<u64, SessionReadError> {
+    u64::from_str_radix(value, 16).map_err(|_| {
+        SessionReadError::invalid(format!(
+            "line {line} has an invalid {name} bit pattern: {value:?}"
+        ))
+    })
+}
+
+fn parse_u128(value: &str, line: u64, name: &str) -> Result<u128, SessionReadError> {
+    value.parse().map_err(|_| {
+        SessionReadError::invalid(format!("line {line} has an invalid {name}: {value:?}"))
+    })
+}
+
+fn parse_option_u128(value: &str, line: u64, name: &str) -> Result<Option<u128>, SessionReadError> {
+    if value.is_empty() || value == "~" {
+        Ok(None)
+    } else {
+        parse_u128(value, line, name).map(Some)
+    }
+}
+
 fn parse_u32(value: &str, line: u64, name: &str) -> Result<u32, SessionReadError> {
     value.parse().map_err(|_| {
         SessionReadError::invalid(format!("line {line} has an invalid {name}: {value:?}"))
     })
+}
+
+fn parse_option_u32(value: &str, line: u64, name: &str) -> Result<Option<u32>, SessionReadError> {
+    if value.is_empty() || value == "~" {
+        Ok(None)
+    } else {
+        parse_u32(value, line, name).map(Some)
+    }
 }
 
 fn parse_i64(value: &str, line: u64, name: &str) -> Result<i64, SessionReadError> {
@@ -2096,8 +2697,112 @@ mod tests {
         })
     }
 
+    fn public_touch_with_force(
+        sequence: u64,
+        touch_id: u64,
+        phase: winit::event::TouchPhase,
+        force: winit::event::Force,
+    ) -> ProbeRecord {
+        public_touch_with_force_classification(
+            sequence,
+            touch_id,
+            phase,
+            force,
+            PublicPenClassification::Unclassified(PublicUnclassifiedReason::NoMatchedNativeMessage),
+        )
+    }
+
+    fn public_touch_with_force_classification(
+        sequence: u64,
+        touch_id: u64,
+        phase: winit::event::TouchPhase,
+        force: winit::event::Force,
+        classification: PublicPenClassification,
+    ) -> ProbeRecord {
+        let mut record = public_touch_event(sequence, touch_id, phase);
+        if let ProbeRecord::PublicWinitEvent(event) = &mut record
+            && let PublicWinitEventData::Touch {
+                public_winit_force,
+                pen_classification,
+                ..
+            } = &mut event.data
+        {
+            *public_winit_force = Some(force);
+            *pen_classification = classification;
+        }
+        record
+    }
+
     fn temporary_session_path() -> PathBuf {
         default_session_path(&std::env::temp_dir())
+    }
+
+    fn cpu_measurement_for_tests() -> ProcessCpuMeasurement {
+        crate::process_cpu::measure(
+            ProcessCpuSnapshot {
+                app_elapsed_ns: 10,
+                user: None,
+                kernel: None,
+                win32_error: Some(5),
+            },
+            ProcessCpuSnapshot {
+                app_elapsed_ns: 20,
+                user: Some(FileTimeWords { low: 2, high: 3 }),
+                kernel: Some(FileTimeWords { low: 4, high: 5 }),
+                win32_error: None,
+            },
+        )
+    }
+
+    fn available_cpu_measurement_for_tests() -> ProcessCpuMeasurement {
+        crate::process_cpu::measure(
+            ProcessCpuSnapshot {
+                app_elapsed_ns: 0,
+                user: Some(FileTimeWords {
+                    low: 10_000_000,
+                    high: 0,
+                }),
+                kernel: Some(FileTimeWords {
+                    low: 10_000_000,
+                    high: 0,
+                }),
+                win32_error: None,
+            },
+            ProcessCpuSnapshot {
+                app_elapsed_ns: 1_000_000_000,
+                user: Some(FileTimeWords {
+                    low: 20_000_000,
+                    high: 0,
+                }),
+                kernel: Some(FileTimeWords {
+                    low: 20_000_000,
+                    high: 0,
+                }),
+                win32_error: None,
+            },
+        )
+    }
+
+    fn save_cpu_only_session(cpu: ProcessCpuMeasurement) -> PathBuf {
+        let path = temporary_session_path();
+        let writer = SessionWriter::create(path.clone(), &BTreeMap::new()).unwrap();
+        writer
+            .finish(ProbeSummary::default(), 1_000_000_000, cpu)
+            .unwrap();
+        path
+    }
+
+    fn replace_cpu_row_field(path: &Path, field_index: usize, value: &str) {
+        let text = fs::read_to_string(path).unwrap();
+        let mut lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
+        let cpu_line = lines
+            .iter_mut()
+            .find(|line| line.starts_with("CPU\t"))
+            .unwrap();
+        let mut fields = cpu_line.split('\t').map(str::to_owned).collect::<Vec<_>>();
+        fields[field_index] = value.to_owned();
+        *cpu_line = fields.join("\t");
+        fs::write(path, format!("{}\n", lines.join("\n"))).unwrap();
     }
 
     fn save_records(records: &[ProbeRecord]) -> PathBuf {
@@ -2136,7 +2841,9 @@ mod tests {
                 _ => {}
             }
         }
-        writer.finish(summary, 30_000).unwrap()
+        writer
+            .finish(summary, 30_000, cpu_measurement_for_tests())
+            .unwrap()
     }
 
     #[test]
@@ -2154,7 +2861,22 @@ mod tests {
         assert_eq!(report.pointer_id_mismatch_samples, 1);
         assert_eq!(report.valid_direct_pen_samples, 0);
         assert_eq!(report.invalid_direct_pen_samples, 1);
-        assert_eq!(report.qpc_message_to_hook_age_samples, 1);
+        assert_eq!(report.qpc_message_to_hook_age_samples, 0);
+        assert_eq!(
+            report
+                .qpc_age_null_reasons
+                .get("invalid_direct_pen_candidate"),
+            Some(&1)
+        );
+        assert_eq!(report.qpc_native_interval_samples, 0);
+        assert_eq!(
+            report
+                .partitions
+                .values()
+                .map(|bucket| bucket.pressure_metric_samples)
+                .sum::<u64>(),
+            0
+        );
         assert!(raw.contains("D_SAMPLE\t"));
         assert!(raw.contains("\t777\tNotReported\t"));
         assert!(text.contains("Raw direct samples: 1"));
@@ -2231,6 +2953,15 @@ mod tests {
         assert_eq!(report.valid_direct_pen_samples, 4);
         assert_eq!(report.exact_raw_duplicate_fingerprints, 1);
         assert_eq!(report.qpc_native_interval_samples, 2);
+        let direct_bucket = report
+            .partitions
+            .iter()
+            .find(|(key, _)| key.api == "direct-wm-pointer")
+            .map(|(_, bucket)| bucket)
+            .unwrap();
+        assert_eq!(direct_bucket.pressure_metric_samples, 3);
+        assert_eq!(direct_bucket.pressure_value_counts.values().sum::<u64>(), 3);
+        assert_eq!(direct_bucket.pressure_repeated_values, 2);
         assert_eq!(
             report
                 .qpc_interval_null_reasons
@@ -2240,6 +2971,226 @@ mod tests {
         assert_eq!(report.native_clock_regressions, 0);
         assert!(text.contains("duplicate_raw_fingerprint"));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pressure_distribution_entropy_and_repeat_runs_use_valid_unique_direct_rows() {
+        let pressures = [100, 100, 200, 200];
+        let samples = pressures
+            .into_iter()
+            .enumerate()
+            .map(|(index, pressure)| {
+                let mut sample = sample(3, 7, PEN_MASK_PRESSURE, pressure);
+                sample.performance_count_qpc_raw = 900 + index as u64;
+                sample.frame_id_raw = 40 + index as u32;
+                sample
+            })
+            .collect();
+        let path = save_records(&[direct_batch_with_kind(
+            samples,
+            11,
+            PointerMessageKind::Down,
+        )]);
+        let mut report = read_report(&path).unwrap();
+        let text = report.format_text();
+        let (key, bucket) = report
+            .partitions
+            .iter()
+            .find(|(key, _)| key.api == "direct-wm-pointer")
+            .unwrap();
+
+        assert!(
+            key.pressure_representation
+                .contains("valid mask range 0..1024")
+        );
+        assert_eq!(bucket.pressure_metric_samples, 4);
+        assert_eq!(bucket.pressure_value_counts.len(), 2);
+        assert_eq!(bucket.pressure_value_counts.get(&100), Some(&2));
+        assert_eq!(bucket.pressure_value_counts.get(&200), Some(&2));
+        assert!((bucket.pressure_entropy_bits().unwrap() - 1.0).abs() < f64::EPSILON);
+        assert_eq!(bucket.pressure_repeated_values, 2);
+        assert_eq!(bucket.pressure_plateau_runs, 2);
+        assert_eq!(bucket.pressure_transitions, 1);
+        assert_eq!(bucket.pressure_max_run_length, 2);
+        assert!(text.contains("pressureEntropyBits=1.000000"));
+        assert!(text.contains("pressurePlateauRuns=2"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn truncated_pressure_histogram_reports_null_entropy_and_explicit_cap_state() {
+        let mut report = SessionReport::default();
+        let key = MetricKey {
+            api: "direct-wm-pointer".to_owned(),
+            device: "device:test".to_owned(),
+            pointer: "pointer:7".to_owned(),
+            stroke: "observed-direct-stroke-1".to_owned(),
+            native_clock: "QPC:test".to_owned(),
+            pressure_representation: "test raw integer".to_owned(),
+        };
+        for value in 0..=MAX_PRESSURE_VALUES_PER_PARTITION as u64 {
+            record_pressure_value(&mut report, &key, value, None, false);
+        }
+        let bucket = report.partitions.get(&key).unwrap();
+
+        assert!(bucket.pressure_distribution_truncated);
+        assert!(report.pressure_distribution_cap_reached);
+        assert_eq!(bucket.pressure_entropy_bits(), None);
+        let text = report.format_text();
+        assert!(text.contains("pressureEntropyBits=null"));
+        assert!(text.contains("pressureDistributionTruncated=true"));
+    }
+
+    #[test]
+    fn public_winit_force_distribution_keeps_its_separate_representation() {
+        let path = save_records(&[
+            public_touch_with_force(
+                1,
+                7,
+                winit::event::TouchPhase::Started,
+                winit::event::Force::Normalized(0.25),
+            ),
+            public_touch_with_force(
+                2,
+                7,
+                winit::event::TouchPhase::Moved,
+                winit::event::Force::Normalized(0.75),
+            ),
+        ]);
+        let report = read_report(&path).unwrap();
+        let (key, bucket) = report
+            .partitions
+            .iter()
+            .find(|(key, _)| key.api == "public-winit")
+            .unwrap();
+
+        assert!(key.pressure_representation.contains("Force::Normalized"));
+        assert_eq!(bucket.pressure_metric_samples, 2);
+        assert_eq!(bucket.pressure_value_counts.len(), 2);
+        assert!((bucket.pressure_entropy_bits().unwrap() - 1.0).abs() < f64::EPSILON);
+        assert_eq!(
+            report
+                .partitions
+                .keys()
+                .filter(|key| key.api == "direct-wm-pointer")
+                .count(),
+            0
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn public_force_distribution_partitions_by_pen_classification() {
+        let force = winit::event::Force::Normalized(0.5);
+        let path = save_records(&[
+            public_touch_with_force_classification(
+                1,
+                7,
+                winit::event::TouchPhase::Moved,
+                force,
+                PublicPenClassification::ConfirmedPen,
+            ),
+            public_touch_with_force_classification(
+                2,
+                7,
+                winit::event::TouchPhase::Moved,
+                force,
+                PublicPenClassification::ConfirmedNonPen {
+                    pointer_type_raw: 2,
+                },
+            ),
+            public_touch_with_force_classification(
+                3,
+                7,
+                winit::event::TouchPhase::Moved,
+                force,
+                PublicPenClassification::Unclassified(
+                    PublicUnclassifiedReason::PointerTypeApiUnavailable,
+                ),
+            ),
+        ]);
+        let report = read_report(&path).unwrap();
+        let public_keys = report
+            .partitions
+            .keys()
+            .filter(|key| key.api == "public-winit")
+            .collect::<Vec<_>>();
+
+        assert_eq!(public_keys.len(), 3);
+        assert!(public_keys.iter().any(|key| {
+            key.pressure_representation
+                .contains("classification=ConfirmedPen")
+        }));
+        assert!(
+            public_keys
+                .iter()
+                .any(|key| key.pressure_representation.contains("ConfirmedNonPen"))
+        );
+        assert!(public_keys.iter().any(|key| {
+            key.pressure_representation
+                .contains("PointerTypeApiUnavailable")
+        }));
+        assert_eq!(
+            report
+                .partitions
+                .iter()
+                .filter(|(key, _)| key.api == "public-winit")
+                .map(|(_, bucket)| bucket.pressure_metric_samples)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn qpc_report_includes_p99_for_age_and_unique_observed_stroke_intervals() {
+        let samples = (1..=100)
+            .map(|qpc| {
+                let mut sample = sample(3, 7, PEN_MASK_PRESSURE, 512);
+                sample.performance_count_qpc_raw = qpc;
+                sample.frame_id_raw = qpc as u32;
+                sample
+            })
+            .collect();
+        let mut batch = match direct_batch_with_kind(samples, 12, PointerMessageKind::Down) {
+            ProbeRecord::DirectPenHistory(batch) => batch,
+            _ => unreachable!(),
+        };
+        batch.hook_qpc_count_raw = Some(100);
+        batch.native_history_count = 100;
+        let path = save_records(&[ProbeRecord::DirectPenHistory(batch)]);
+        let mut report = read_report(&path).unwrap();
+        let text = report.format_text();
+        let bucket = report
+            .partitions
+            .values_mut()
+            .find(|bucket| bucket.valid_direct_pen_samples == 100)
+            .unwrap();
+
+        assert_eq!(bucket.qpc_age_ns.len(), 100);
+        assert_eq!(bucket.qpc_sample_interval_ns.len(), 99);
+        assert!((bucket.qpc_age_percentile_ms(99).unwrap() - 0.0098).abs() < 1e-12);
+        assert!((bucket.qpc_interval_percentile_ms(99).unwrap() - 0.0001).abs() < 1e-12);
+        assert!(text.contains("qpcAgeP99="));
+        assert!(text.contains("qpcIntervalP99="));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn qpc_nearest_rank_percentiles_use_upper_rank_for_small_p95_p99_samples() {
+        let mut bucket = MetricBucket::default();
+        bucket.add_qpc_age(Some(1_000_000), None);
+        bucket.add_qpc_age(Some(9_000_000), None);
+        bucket.add_qpc_interval(Some(1_000_000), None);
+        bucket.add_qpc_interval(Some(9_000_000), None);
+
+        assert_eq!(bucket.qpc_age_percentile_ms(50), Some(1.0));
+        assert_eq!(bucket.qpc_age_percentile_ms(95), Some(9.0));
+        assert_eq!(bucket.qpc_age_percentile_ms(99), Some(9.0));
+        assert_eq!(bucket.qpc_interval_percentile_ms(50), Some(1.0));
+        assert_eq!(bucket.qpc_interval_percentile_ms(95), Some(9.0));
+        assert_eq!(bucket.qpc_interval_percentile_ms(99), Some(9.0));
+        assert_eq!(nearest_rank_index(1, 99), Some(0));
     }
 
     #[test]
@@ -2482,6 +3433,7 @@ mod tests {
             packet_time_mode: WintabPacketTimeMode::AbsoluteSystemTime,
             app_observed_elapsed_ns: 22,
             control_transition_observed_during_read: true,
+            packet_quality_issue_observed: false,
             packets: vec![WintabPacketSample {
                 context_handle_raw_session_scoped: 7,
                 status_raw: 0,
@@ -2494,12 +3446,37 @@ mod tests {
                 normal_pressure_raw: 512,
             }],
         };
-        let path = save_records(&[ProbeRecord::WintabPackets(batch)]);
+        let mut quality_issue = batch.clone();
+        quality_issue.message_sequence = 4;
+        quality_issue.control_transition_observed_during_read = false;
+        quality_issue.packet_quality_issue_observed = true;
+        quality_issue.packets[0].status_raw = WINTAB_TPS_QUEUE_ERR;
+        quality_issue.packets[0].serial_number_raw = 2;
+        let mut valid = batch.clone();
+        valid.message_sequence = 5;
+        valid.control_transition_observed_during_read = false;
+        valid.packets[0].serial_number_raw = 3;
+        valid.packets[0].normal_pressure_raw = 513;
+        let path = save_records(&[
+            ProbeRecord::WintabPackets(batch),
+            ProbeRecord::WintabPackets(quality_issue),
+            ProbeRecord::WintabPackets(valid),
+        ]);
         let report = read_report(&path).unwrap();
 
-        assert_eq!(report.raw_wintab_packets, 1);
+        assert_eq!(report.raw_wintab_packets, 3);
         assert_eq!(report.uncertain_wintab_packets, 1);
-        assert_eq!(report.uninterrupted_wintab_packets, 0);
+        assert_eq!(report.uninterrupted_wintab_packets, 2);
+        assert_eq!(report.unqualified_wintab_pressure_rows, 2);
+        let (key, bucket) = report
+            .partitions
+            .iter()
+            .find(|(key, _)| key.api == "wintab")
+            .unwrap();
+        assert!(key.pressure_representation.contains("uncalibrated"));
+        assert!(key.pressure_representation.contains("driver range unknown"));
+        assert_eq!(bucket.pressure_metric_samples, 1);
+        assert_eq!(bucket.pressure_value_counts.get(&513), Some(&1));
         fs::remove_file(path).unwrap();
     }
 
@@ -2594,6 +3571,15 @@ mod tests {
     }
 
     #[test]
+    fn parser_keeps_legacy_schema_one_session_without_cpu_row() {
+        let input = b"LASSOINK-SESSION\t1\nEND\tfinalized\t20\t0\t0\t0\t0\t0\t0\t0\t\t0\tNotSelected\ttrue\tDirectWmPointer\t\t\t\t0\t0\t0\n";
+        let report = parse_session(Cursor::new(input)).unwrap();
+        assert!(report.complete);
+        assert_eq!(report.schema_version, Some(1));
+        assert!(report.process_cpu.is_none());
+    }
+
+    #[test]
     fn writer_rejects_metadata_values_over_parser_limit_and_keeps_partial_path() {
         let path = temporary_session_path();
         let mut metadata = BTreeMap::new();
@@ -2619,6 +3605,172 @@ mod tests {
         let partial = partial_session_path(&path);
         assert!(partial.exists());
         fs::remove_file(partial).unwrap();
+    }
+
+    #[test]
+    fn writer_and_parser_share_total_line_cap_and_reserve_end_footer() {
+        let path = temporary_session_path();
+        let mut writer =
+            SessionWriter::create_with_line_limit(path.clone(), &BTreeMap::new(), 6).unwrap();
+        writer.write_metadata("repeat", "one").unwrap();
+        writer.write_metadata("repeat", "two").unwrap();
+        writer.write_metadata("repeat", "three").unwrap();
+        writer
+            .finish(ProbeSummary::default(), 20, cpu_measurement_for_tests())
+            .unwrap();
+
+        let complete_bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            complete_bytes.iter().filter(|byte| **byte == b'\n').count(),
+            6
+        );
+        let parsed = parse_session_with_line_limit(Cursor::new(complete_bytes), 6).unwrap();
+        assert!(parsed.complete);
+        fs::remove_file(&path).unwrap();
+
+        let over_path = temporary_session_path();
+        let mut writer =
+            SessionWriter::create_with_line_limit(over_path.clone(), &BTreeMap::new(), 6).unwrap();
+        writer.write_metadata("repeat", "one").unwrap();
+        writer.write_metadata("repeat", "two").unwrap();
+        writer.write_metadata("repeat", "three").unwrap();
+        let error = writer.write_metadata("repeat", "four").unwrap_err();
+        assert_eq!(error.stage, SessionOutputStage::Write);
+        writer.flush().unwrap();
+        let partial_path = partial_session_path(&over_path);
+        let partial = fs::read(&partial_path).unwrap();
+        assert_eq!(partial.iter().filter(|byte| **byte == b'\n').count(), 4);
+        let parsed_partial = parse_session_with_line_limit(Cursor::new(partial), 6).unwrap();
+        assert!(!parsed_partial.complete);
+        assert!(parsed_partial.capture_incomplete);
+        assert!(!over_path.exists());
+        fs::remove_file(partial_path).unwrap();
+    }
+
+    #[test]
+    fn no_clobber_finalize_preserves_preexisting_destination_and_partial() {
+        let path = temporary_session_path();
+        fs::write(&path, b"owner destination bytes\n").unwrap();
+        let mut writer = SessionWriter::create(path.clone(), &BTreeMap::new()).unwrap();
+        writer.write_metadata("session", "new data").unwrap();
+        let error = writer
+            .finish(ProbeSummary::default(), 20, cpu_measurement_for_tests())
+            .unwrap_err();
+        assert_eq!(error.stage, SessionOutputStage::Finalize);
+        assert_eq!(fs::read(&path).unwrap(), b"owner destination bytes\n");
+        let partial_path = partial_session_path(&path);
+        let parsed = read_report(&partial_path).unwrap();
+        assert!(!parsed.complete);
+        assert_eq!(
+            parsed.metadata.get("session").map(String::as_str),
+            Some("new data")
+        );
+        fs::remove_file(path).unwrap();
+        fs::remove_file(partial_path).unwrap();
+    }
+
+    #[test]
+    fn no_clobber_finalize_publishes_normal_session() {
+        let path = temporary_session_path();
+        let writer = SessionWriter::create(path.clone(), &BTreeMap::new()).unwrap();
+        let finalized = writer
+            .finish(ProbeSummary::default(), 20, cpu_measurement_for_tests())
+            .unwrap();
+        assert_eq!(finalized, path);
+        assert!(path.exists());
+        assert!(!partial_session_path(&path).exists());
+        assert!(read_report(&path).unwrap().complete);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn no_clobber_finalize_preserves_destination_created_after_writer_open() {
+        let path = temporary_session_path();
+        let mut writer = SessionWriter::create(path.clone(), &BTreeMap::new()).unwrap();
+        writer.write_metadata("session", "new data").unwrap();
+        fs::write(&path, b"late destination bytes\n").unwrap();
+        let error = writer
+            .finish(ProbeSummary::default(), 20, cpu_measurement_for_tests())
+            .unwrap_err();
+        assert_eq!(error.stage, SessionOutputStage::Finalize);
+        assert_eq!(fs::read(&path).unwrap(), b"late destination bytes\n");
+        let partial_path = partial_session_path(&path);
+        let parsed = read_report(&partial_path).unwrap();
+        assert!(!parsed.complete);
+        assert_eq!(
+            parsed.metadata.get("session").map(String::as_str),
+            Some("new data")
+        );
+        fs::remove_file(path).unwrap();
+        fs::remove_file(partial_path).unwrap();
+    }
+
+    #[test]
+    fn cpu_row_round_trips_raw_filetimes_and_explicit_unavailable_reason() {
+        let path = save_records(&[]);
+        let mut report = read_report(&path).unwrap();
+        let text = report.format_text();
+        let cpu = report.process_cpu.expect("CPU row should be persisted");
+        assert_eq!(cpu.start.app_elapsed_ns, 10);
+        assert_eq!(cpu.end.app_elapsed_ns, 20);
+        assert_eq!(cpu.start.win32_error, Some(5));
+        assert_eq!(cpu.start.user, None);
+        assert_eq!(cpu.end.user, Some(FileTimeWords { low: 2, high: 3 }));
+        assert_eq!(cpu.core_equivalent_percent, None);
+        assert_eq!(
+            cpu.unavailable_reason,
+            Some(ProcessCpuUnavailableReason::StartSnapshotFailed { win32_error: 5 })
+        );
+        assert!(text.contains("whole process/all threads"));
+        assert!(text.contains("core-equivalent percent: null"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cpu_row_round_trips_available_ratio_and_all_thread_scope() {
+        let path = save_cpu_only_session(available_cpu_measurement_for_tests());
+        let mut report = read_report(&path).unwrap();
+        let text = report.format_text();
+        let parsed_cpu = report.process_cpu.unwrap();
+
+        assert_eq!(parsed_cpu.user_delta_100ns, Some(10_000_000));
+        assert_eq!(parsed_cpu.kernel_delta_100ns, Some(10_000_000));
+        assert_eq!(parsed_cpu.core_equivalent_percent, Some(200.0));
+        assert!(text.contains("whole process/all threads"));
+        assert!(text.contains("whole-process core-equivalent percent: 200.000%"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parser_rejects_nonfinite_and_contradictory_cached_cpu_metrics() {
+        for (field_index, cached_value) in [
+            (14, "7FF8000000000000"), // NaN
+            (14, "7FF0000000000000"), // positive infinity
+            (14, "3FF0000000000000"), // finite but not the computed ratio
+            (3, "999"),               // contradictory app interval
+            (12, "1"),                // contradictory user delta
+            (13, "2"),                // contradictory kernel delta
+        ] {
+            let path = save_cpu_only_session(available_cpu_measurement_for_tests());
+            replace_cpu_row_field(&path, field_index, cached_value);
+            assert!(
+                parse_session(File::open(&path).unwrap()).is_err(),
+                "CPU row field {field_index} accepted contradictory value {cached_value}"
+            );
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn parser_rejects_available_cpu_metrics_when_raw_start_snapshot_failed() {
+        let path = save_cpu_only_session(available_cpu_measurement_for_tests());
+        for field_index in 4..=7 {
+            replace_cpu_row_field(&path, field_index, "");
+        }
+        replace_cpu_row_field(&path, 16, "5");
+
+        assert!(parse_session(File::open(&path).unwrap()).is_err());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2654,7 +3806,9 @@ mod tests {
             storage_limit: Some(StorageLimit::Samples),
             ..ProbeSummary::default()
         };
-        writer.finish(summary, 20).unwrap();
+        writer
+            .finish(summary, 20, cpu_measurement_for_tests())
+            .unwrap();
         let report = read_report(&path).unwrap();
 
         assert!(report.capture_incomplete);

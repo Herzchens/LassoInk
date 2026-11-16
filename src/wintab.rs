@@ -1192,6 +1192,7 @@ impl WintabCapture {
         }
 
         if !packets.is_empty() {
+            let packet_quality_issue_observed = packet_issue.is_some() || secondary_issue.is_some();
             state.record(ProbeRecord::WintabPackets(WintabPacketBatch {
                 source: CaptureSource::WintabPacket,
                 message_sequence,
@@ -1212,6 +1213,7 @@ impl WintabCapture {
                     .unwrap_or(WintabPacketTimeMode::AbsoluteSystemTime),
                 app_observed_elapsed_ns,
                 control_transition_observed_during_read: batch_control_transition_observed,
+                packet_quality_issue_observed,
                 packets,
             }));
         }

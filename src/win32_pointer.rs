@@ -389,6 +389,10 @@ pub(crate) struct WintabPacketBatch {
     /// retrieval was in flight. Retained packets are raw diagnostics and must
     /// not be counted as confidently attributed pen samples.
     pub control_transition_observed_during_read: bool,
+    /// True when queue or packet validation found an issue affecting this
+    /// batch. Raw rows remain persisted but are excluded from confident
+    /// Wintab pressure metrics.
+    pub packet_quality_issue_observed: bool,
     pub packets: Vec<WintabPacketSample>,
 }
 
@@ -2509,6 +2513,7 @@ mod tests {
             packet_time_mode: WintabPacketTimeMode::AbsoluteSystemTime,
             app_observed_elapsed_ns: sequence as u128,
             control_transition_observed_during_read: false,
+            packet_quality_issue_observed: false,
             packets: vec![packet; packet_count],
         })
     }

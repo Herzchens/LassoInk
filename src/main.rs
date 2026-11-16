@@ -1,10 +1,14 @@
 #[cfg(not(target_os = "windows"))]
 compile_error!("The LassoInk Gate 0 probe is Windows-only.");
 
+mod process_cpu;
 mod session;
 mod win32_pointer;
 mod wintab;
 
+use process_cpu::{
+    PROCESS_CPU_SCOPE, measure as measure_process_cpu, snapshot as process_cpu_snapshot,
+};
 use session::{SessionWriter, default_session_path, read_report};
 use std::{
     cell::RefCell,
@@ -22,6 +26,8 @@ use win32_pointer::{
     ProbeSummary, PublicEventCapability, PublicWinitEventData, PublicWinitEventRecord,
     StorageLimit, WintabPacketTimeMode, WintabStatus,
 };
+use winit::event::ElementState;
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, StartCause, WindowEvent},
@@ -53,8 +59,7 @@ struct ProbeApp {
     session_writer: Option<SessionWriter>,
     session_path: PathBuf,
     session_writer_failed: bool,
-    controlled_stall_ms: Option<u64>,
-    controlled_stall_triggered: bool,
+    controlled_stall: ControlledStallTrigger,
 }
 
 struct RunOptions {
@@ -62,6 +67,52 @@ struct RunOptions {
     session_path: PathBuf,
     metadata: BTreeMap<String, String>,
     controlled_stall_ms: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct ControlledStallTrigger {
+    duration_ms: Option<u64>,
+    armed: bool,
+    triggered: bool,
+}
+
+impl ControlledStallTrigger {
+    fn new(duration_ms: Option<u64>) -> Self {
+        Self {
+            duration_ms,
+            armed: false,
+            triggered: false,
+        }
+    }
+
+    fn observe_operator_key(
+        &mut self,
+        physical_key: &PhysicalKey,
+        state: ElementState,
+        repeat: bool,
+    ) -> bool {
+        if self.duration_ms.is_some()
+            && !self.triggered
+            && !repeat
+            && state == ElementState::Pressed
+            && *physical_key == PhysicalKey::Code(KeyCode::F9)
+        {
+            self.armed = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn take_armed_once(&mut self) -> Option<u64> {
+        if self.armed && !self.triggered {
+            self.armed = false;
+            self.triggered = true;
+            self.duration_ms
+        } else {
+            None
+        }
+    }
 }
 
 impl ProbeApp {
@@ -214,13 +265,9 @@ impl ProbeApp {
     }
 
     fn run_controlled_stall_if_requested(&mut self, event_loop: &ActiveEventLoop) -> bool {
-        if self.controlled_stall_triggered {
-            return true;
-        }
-        let Some(requested_ms) = self.controlled_stall_ms else {
+        let Some(requested_ms) = self.controlled_stall.take_armed_once() else {
             return true;
         };
-        self.controlled_stall_triggered = true;
         let requested_ns = u128::from(requested_ms).saturating_mul(1_000_000);
         self.record_controlled_stall(LifecycleEventKind::ControlledStallStart, requested_ns);
         if !self.flush_pending_records() {
@@ -725,6 +772,23 @@ impl ApplicationHandler for ProbeApp {
                 self.refresh_title();
                 println!("window resized: {}x{}", size.width, size.height);
             }
+            WindowEvent::KeyboardInput { event, .. }
+                if self.controlled_stall.observe_operator_key(
+                    &event.physical_key,
+                    event.state,
+                    event.repeat,
+                ) =>
+            {
+                println!(
+                    "F9 accepted: starting the requested {} ms controlled UI stall during capture.",
+                    self.controlled_stall.duration_ms.unwrap_or_default()
+                );
+                if !self.run_controlled_stall_if_requested(event_loop) {
+                    self.probe_state.borrow_mut().leave_winit_callback();
+                    return;
+                }
+            }
+            WindowEvent::KeyboardInput { .. } => {}
             _ => {}
         }
         self.probe_state.borrow_mut().leave_winit_callback();
@@ -776,10 +840,6 @@ impl ApplicationHandler for ProbeApp {
                 .close_after_stop_request(&mut state);
         }
         self.drain_wintab_control_notifications();
-        if !self.run_controlled_stall_if_requested(event_loop) {
-            self.probe_state.borrow_mut().leave_winit_callback();
-            return;
-        }
         self.refresh_title();
         if let Some(last_update) = self.last_title_update {
             event_loop
@@ -806,7 +866,7 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
             .unwrap_or("session-id-unavailable")
             .to_owned(),
     );
-    metadata.insert("schema_version".to_owned(), "1".to_owned());
+    metadata.insert("schema_version".to_owned(), "2".to_owned());
     metadata.insert("app_name".to_owned(), "LassoInk capture probe".to_owned());
     metadata.insert(
         "app_version".to_owned(),
@@ -815,6 +875,14 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
     metadata.insert(
         "capture_mode".to_owned(),
         capture_mode_label(capture_mode).to_owned(),
+    );
+    metadata.insert(
+        "capture_mode_declared".to_owned(),
+        match capture_mode {
+            CaptureMode::DirectWmPointer => "direct",
+            CaptureMode::Wintab => "wintab",
+        }
+        .to_owned(),
     );
     metadata.insert(
         "device_model_declared".to_owned(),
@@ -882,8 +950,20 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
     );
     metadata.insert(
         "dedup_policy".to_owned(),
-        "raw rows are never deduplicated; report exact raw fingerprints as diagnostic counts only"
+        "raw rows are never removed; exact repeated history fingerprints are counted and skipped in derived direct QPC interval and pressure distribution metrics"
             .to_owned(),
+    );
+    metadata.insert("process_cpu_scope".to_owned(), PROCESS_CPU_SCOPE.to_owned());
+    metadata.insert(
+        "controlled_stall_trigger".to_owned(),
+        "operator presses non-repeating F9 after the capture window is running; no startup pause"
+            .to_owned(),
+    );
+    metadata.insert(
+        "controlled_stall_requested_ms".to_owned(),
+        options
+            .controlled_stall_ms
+            .map_or_else(|| "not-requested".to_owned(), |value| value.to_string()),
     );
     metadata.insert(
         "event_loop_wake_marker_threshold_ns".to_owned(),
@@ -893,6 +973,7 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
         "hardware_gate_status".to_owned(),
         "pending owner CT430 evidence; software run does not pass Gate 0".to_owned(),
     );
+    let process_cpu_start = process_cpu_snapshot(app_clock_origin);
     let session_writer = SessionWriter::create(options.session_path.clone(), &metadata)?;
     let session_path = session_writer.path().to_path_buf();
     let probe_state = Rc::new(RefCell::new(ProbeState::default()));
@@ -929,8 +1010,7 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
         session_writer: Some(session_writer),
         session_path: session_path.clone(),
         session_writer_failed: false,
-        controlled_stall_ms: options.controlled_stall_ms,
-        controlled_stall_triggered: false,
+        controlled_stall: ControlledStallTrigger::new(options.controlled_stall_ms),
     };
     let run_result = event_loop.run_app(&mut app);
     if let Err(error) = &run_result {
@@ -973,9 +1053,12 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
         && probe_state.borrow().summary().storage_limit != Some(StorageLimit::SessionOutput)
         && let Some(writer) = app.session_writer.take()
     {
+        let process_cpu_end = process_cpu_snapshot(app.app_clock_origin);
+        let process_cpu_measurement = measure_process_cpu(process_cpu_start, process_cpu_end);
         match writer.finish(
             probe_state.borrow().summary(),
             app.app_clock_origin.elapsed().as_nanos(),
+            process_cpu_measurement,
         ) {
             Ok(path) => finalized_path = Some(path),
             Err(error) => {
@@ -1033,7 +1116,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!("  --tablet-profile default|osu|unknown");
         println!("  --driver-version TEXT --active-area TEXT --mapped-display TEXT");
         println!("  --pressure-curve TEXT --windows-build TEXT");
-        println!("  --controlled-stall-ms 1..30000");
+        println!("  --controlled-stall-ms 1..30000 (press F9 once while capture is running)");
         println!("  --report PATH --help --version --status");
         println!("{STATUS}");
         println!("{NOT_IMPLEMENTED}");
@@ -1262,5 +1345,46 @@ mod status_tests {
 
         assert!(timing_state(summary).contains("raw relative milliseconds"));
         assert!(timing_state(summary).contains("app clock separate"));
+    }
+}
+
+#[cfg(test)]
+mod controlled_stall_tests {
+    use super::ControlledStallTrigger;
+    use winit::{
+        event::ElementState,
+        keyboard::{KeyCode, PhysicalKey},
+    };
+
+    #[test]
+    fn startup_wait_does_not_arm_stall_and_operator_f9_triggers_once() {
+        let mut trigger = ControlledStallTrigger::new(Some(2_000));
+
+        // Startup/about-to-wait has no automatic path to arm or consume a stall.
+        assert_eq!(trigger.take_armed_once(), None);
+        assert!(!trigger.observe_operator_key(
+            &PhysicalKey::Code(KeyCode::F8),
+            ElementState::Pressed,
+            false,
+        ));
+        assert!(!trigger.observe_operator_key(
+            &PhysicalKey::Code(KeyCode::F9),
+            ElementState::Pressed,
+            true,
+        ));
+        assert_eq!(trigger.take_armed_once(), None);
+
+        assert!(trigger.observe_operator_key(
+            &PhysicalKey::Code(KeyCode::F9),
+            ElementState::Pressed,
+            false,
+        ));
+        assert_eq!(trigger.take_armed_once(), Some(2_000));
+        assert_eq!(trigger.take_armed_once(), None);
+        assert!(!trigger.observe_operator_key(
+            &PhysicalKey::Code(KeyCode::F9),
+            ElementState::Pressed,
+            false,
+        ));
     }
 }
