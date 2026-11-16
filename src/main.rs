@@ -1,6 +1,8 @@
 #[cfg(not(target_os = "windows"))]
 compile_error!("The LassoInk Gate 0 probe is Windows-only.");
 
+#[allow(dead_code)]
+mod journal;
 mod process_cpu;
 mod session;
 mod win32_pointer;
