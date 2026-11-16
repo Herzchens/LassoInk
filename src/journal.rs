@@ -17,14 +17,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(crate) const JOURNAL_SCHEMA_VERSION: u32 = 2;
+pub(crate) const JOURNAL_SCHEMA_VERSION: u32 = 3;
 const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 1;
+const PREVIOUS_JOURNAL_SCHEMA_VERSION: u32 = 2;
 const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_JOURNAL_LINE_BYTES: usize = 64 * 1024;
 const MAX_JOURNAL_RECORDS: usize = 131_072;
+const MAX_SNAPSHOT_STATE_ENTRIES: usize = MAX_JOURNAL_RECORDS * 2 + 1;
 const MAX_JOURNAL_TEXT_BYTES: usize = 4096;
 const MAX_RAW_PAYLOAD_BYTES: usize = 8192;
 const MAX_METADATA_TEXT_BYTES: usize = 4096;
+pub(crate) const MAX_EDIT_TARGETS: usize = 256;
 const FNV_OFFSET_BASIS: u64 = 14_695_981_039_346_656_037;
 const FNV_PRIME: u64 = 1_099_511_628_211;
 
@@ -42,6 +45,10 @@ pub(crate) struct JournalHeader {
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct StrokeRef {
+    /// Project journal identity; kept explicit so targets cannot cross projects.
+    pub journal_id: String,
+    /// Capture-session/arrival-clock epoch, distinct across resumed processes.
+    pub session_id: String,
     pub source_api: String,
     pub device_id: Option<String>,
     pub pointer_id: Option<u64>,
@@ -133,6 +140,7 @@ pub(crate) struct JournalMetadata {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredMetadata {
     pub sequence: u64,
+    pub app_epoch_id: String,
     pub metadata: JournalMetadata,
 }
 
@@ -140,6 +148,35 @@ pub(crate) struct StoredMetadata {
 pub(crate) enum JournalEvent {
     PhysicalSample(Box<PhysicalSample>),
     Metadata(JournalMetadata),
+    SessionEpochStarted {
+        epoch: SessionEpoch,
+        app_arrival_elapsed_ns: u128,
+    },
+    /// One durable row is one complete logical action. Multi-stroke actions
+    /// are bounded lists in this row, so a crash cannot expose a partial edit.
+    EditAction {
+        action_id: u64,
+        revision_id: u64,
+        app_arrival_elapsed_ns: u128,
+        command: EditCommand,
+    },
+    Undo {
+        action_id: u64,
+        revision_id: u64,
+        app_arrival_elapsed_ns: u128,
+    },
+    Redo {
+        action_id: u64,
+        revision_id: u64,
+        app_arrival_elapsed_ns: u128,
+    },
+    MigrationProvenance {
+        source_schema_version: u32,
+        source_journal_id: String,
+        source_prefix_fingerprint: u64,
+        source_record_count: u64,
+        app_arrival_elapsed_ns: Option<u128>,
+    },
     /// Starts a new logical edit revision while preserving prior physical rows.
     Revision {
         revision_id: u64,
@@ -172,7 +209,77 @@ pub(crate) enum JournalEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct JournalRecord {
     pub sequence: u64,
+    /// Monotonic application elapsed time is meaningful only within this epoch.
+    pub app_epoch_id: String,
     pub event: JournalEvent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionEpoch {
+    pub session_id: String,
+    /// Wall-clock context only; never used to convert native clocks.
+    pub started_at_unix_ns: Option<u128>,
+    pub config_id: Option<String>,
+    pub provenance: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredSessionEpoch {
+    pub sequence: u64,
+    pub epoch: SessionEpoch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EditCommand {
+    Tombstone {
+        targets: Vec<StrokeRef>,
+    },
+    Restore {
+        targets: Vec<StrokeRef>,
+    },
+    Move {
+        target: StrokeRef,
+        delta_x_raw: i64,
+        delta_y_raw: i64,
+        coordinate_space: String,
+        units: String,
+    },
+    Correction {
+        target: StrokeRef,
+        corrected_text: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredEditAction {
+    pub sequence: u64,
+    pub action_id: u64,
+    pub revision_id: u64,
+    pub app_epoch_id: String,
+    pub app_arrival_elapsed_ns: u128,
+    pub command: EditCommand,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredEditControl {
+    pub sequence: u64,
+    pub action_id: u64,
+    pub revision_id: u64,
+    pub app_epoch_id: String,
+    pub app_arrival_elapsed_ns: u128,
+    pub redo: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredMigrationProvenance {
+    pub sequence: u64,
+    pub app_epoch_id: String,
+    pub app_arrival_elapsed_ns: Option<u128>,
+    pub source_schema_version: u32,
+    pub source_journal_id: String,
+    pub source_prefix_fingerprint: u64,
+    pub source_record_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -185,6 +292,8 @@ pub(crate) struct StoredPhysicalSample {
 pub(crate) struct StoredMove {
     pub sequence: u64,
     pub logical_revision: u64,
+    pub app_epoch_id: String,
+    pub app_arrival_elapsed_ns: u128,
     pub target: StrokeRef,
     pub delta_x_raw: i64,
     pub delta_y_raw: i64,
@@ -196,21 +305,42 @@ pub(crate) struct StoredMove {
 pub(crate) struct StoredCorrection {
     pub sequence: u64,
     pub logical_revision: u64,
+    pub app_epoch_id: String,
+    pub app_arrival_elapsed_ns: u128,
     pub target: StrokeRef,
     pub corrected_text: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredTombstone {
+    pub sequence: u64,
+    pub logical_revision: u64,
+    pub app_epoch_id: String,
+    pub app_arrival_elapsed_ns: u128,
+    pub target: StrokeRef,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct JournalReplayState {
+    pub journal_id: String,
+    pub current_session_id: String,
     pub last_sequence: u64,
     pub logical_revision: u64,
     pub physical_samples: Vec<StoredPhysicalSample>,
+    pub session_epochs: Vec<StoredSessionEpoch>,
+    pub edit_actions: Vec<StoredEditAction>,
+    pub edit_controls: Vec<StoredEditControl>,
+    pub migration_provenance: Vec<StoredMigrationProvenance>,
     /// Full append-only metadata history; later values never overwrite prior
     /// declarations or observations.
     pub metadata_history: Vec<StoredMetadata>,
     pub tombstones: Vec<StrokeRef>,
+    pub tombstone_history: Vec<StoredTombstone>,
     pub moves: Vec<StoredMove>,
     pub corrections: Vec<StoredCorrection>,
+    session_ids: HashSet<String>,
+    undo_stack: Vec<u64>,
+    redo_stack: Vec<u64>,
     stroke_domains: HashMap<StrokeRef, HashSet<(String, String)>>,
     tombstone_set: HashSet<StrokeRef>,
     move_totals: HashMap<StrokeRef, ProjectedTransform>,
@@ -228,6 +358,7 @@ struct ProjectedTransform {
 pub(crate) struct ProjectedSample<'a> {
     pub sequence: u64,
     pub sample: &'a PhysicalSample,
+    pub stroke_ref: Option<StrokeRef>,
     /// A derived coordinate view. The stored raw sample is never modified.
     pub effective_position: Option<RawPosition>,
 }
@@ -344,6 +475,8 @@ pub(crate) struct SnapshotReplayResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct JournalMigrationResult {
     pub destination_path: PathBuf,
+    pub source_journal_id: String,
+    pub destination_journal_id: String,
     pub source_truncated_final_record: bool,
     pub migrated_records: u64,
 }
@@ -402,9 +535,29 @@ impl JournalHeader {
     }
 }
 
+impl SessionEpoch {
+    fn validate(&self) -> Result<(), JournalError> {
+        validate_text(&self.session_id, "session epoch ID", 256)?;
+        validate_optional_text(self.config_id.as_deref(), "session epoch configuration ID")?;
+        validate_text(
+            &self.provenance,
+            "session epoch provenance",
+            MAX_METADATA_TEXT_BYTES,
+        )?;
+        if self.session_id.is_empty() || self.provenance.is_empty() {
+            return Err(JournalError::invalid(
+                "session epoch ID and provenance must be nonempty",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl PhysicalSample {
-    fn stroke_ref(&self) -> Option<StrokeRef> {
+    fn stroke_ref(&self, journal_id: &str) -> Option<StrokeRef> {
         self.stroke_id.as_ref().map(|stroke_id| StrokeRef {
+            journal_id: journal_id.to_owned(),
+            session_id: self.session_id.clone(),
             source_api: self.source_api.clone(),
             device_id: self.source_device_id.clone(),
             pointer_id: self.pointer_id,
@@ -412,12 +565,7 @@ impl PhysicalSample {
         })
     }
 
-    fn validate(&self, header: &JournalHeader) -> Result<(), JournalError> {
-        if self.session_id != header.session_id {
-            return Err(JournalError::invalid(
-                "sample session ID differs from journal header",
-            ));
-        }
+    fn validate(&self) -> Result<(), JournalError> {
         validate_text(&self.session_id, "sample session ID", 256)?;
         validate_text(&self.source_api, "source API", MAX_JOURNAL_TEXT_BYTES)?;
         if self.source_api.is_empty() {
@@ -539,24 +687,48 @@ impl JournalMetadata {
         Ok(())
     }
 
-    fn validate(&self, header: &JournalHeader) -> Result<(), JournalError> {
-        self.validate_shape()?;
-        if self.scope == MetadataScope::Session && self.scope_id != header.session_id {
-            return Err(JournalError::invalid(
-                "session metadata ID differs from journal header",
-            ));
-        }
-        Ok(())
+    fn validate(&self) -> Result<(), JournalError> {
+        self.validate_shape()
     }
 }
 
 impl JournalReplayState {
+    fn for_header(header: &JournalHeader) -> Result<Self, JournalError> {
+        let initial_epoch = SessionEpoch {
+            session_id: header.session_id.clone(),
+            started_at_unix_ns: None,
+            config_id: header.config_id.clone(),
+            provenance: "initial journal header session; original app origin is implicit"
+                .to_owned(),
+        };
+        initial_epoch.validate()?;
+        let mut state = Self {
+            journal_id: header.journal_id.clone(),
+            current_session_id: header.session_id.clone(),
+            ..Self::default()
+        };
+        state
+            .session_ids
+            .try_reserve(1)
+            .map_err(JournalError::allocation)?;
+        state.session_ids.insert(header.session_id.clone());
+        state
+            .session_epochs
+            .try_reserve(1)
+            .map_err(JournalError::allocation)?;
+        state.session_epochs.push(StoredSessionEpoch {
+            sequence: 0,
+            epoch: initial_epoch,
+        });
+        Ok(state)
+    }
+
     fn contains_stroke(&self, target: &StrokeRef) -> bool {
         self.stroke_domains.contains_key(target)
     }
 
     fn index_sample(&mut self, sample: &PhysicalSample) -> Result<(), JournalError> {
-        let Some(stroke) = sample.stroke_ref() else {
+        let Some(stroke) = sample.stroke_ref(&self.journal_id) else {
             return Ok(());
         };
         let Some(position) = &sample.position else {
@@ -602,15 +774,7 @@ impl JournalReplayState {
         coordinate_space: &str,
         units: &str,
     ) -> Result<(), JournalError> {
-        let domains = self.stroke_domains.get(target).ok_or_else(|| {
-            JournalError::invalid("move target has no observed physical position")
-        })?;
-        if domains.len() != 1 || !domains.contains(&(coordinate_space.to_owned(), units.to_owned()))
-        {
-            return Err(JournalError::invalid(
-                "move must match the stroke's single observed raw position domain",
-            ));
-        }
+        self.validate_move_domain(target, coordinate_space, units)?;
         if let Some(transform) = self.move_totals.get_mut(target) {
             if transform.coordinate_space != coordinate_space || transform.units != units {
                 return Err(JournalError::invalid(
@@ -642,6 +806,37 @@ impl JournalReplayState {
         Ok(())
     }
 
+    fn validate_move_domain(
+        &self,
+        target: &StrokeRef,
+        coordinate_space: &str,
+        units: &str,
+    ) -> Result<(), JournalError> {
+        let domains = self.stroke_domains.get(target).ok_or_else(|| {
+            JournalError::invalid("move target has no observed physical position")
+        })?;
+        if domains.len() != 1 || !domains.contains(&(coordinate_space.to_owned(), units.to_owned()))
+        {
+            return Err(JournalError::invalid(
+                "move must match the stroke's single observed raw position domain",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_edit_target(&self, target: &StrokeRef) -> Result<(), JournalError> {
+        validate_stroke_ref(target)?;
+        if target.journal_id != self.journal_id
+            || !self.session_ids.contains(&target.session_id)
+            || !self.contains_stroke(target)
+        {
+            return Err(JournalError::invalid(
+                "edit target does not identify an observed project/session/source/device/pointer/stroke",
+            ));
+        }
+        Ok(())
+    }
+
     fn apply_move_total(&mut self, target: &StrokeRef, delta_x_raw: i64, delta_y_raw: i64) {
         let transform = self
             .move_totals
@@ -659,7 +854,7 @@ impl JournalReplayState {
 
     fn prepare_record(
         &mut self,
-        header: &JournalHeader,
+        _header: &JournalHeader,
         record: &JournalRecord,
     ) -> Result<(), JournalError> {
         let expected = self.last_sequence.saturating_add(1);
@@ -670,8 +865,41 @@ impl JournalReplayState {
             )));
         }
         match &record.event {
+            JournalEvent::SessionEpochStarted { epoch, .. } => {
+                epoch.validate()?;
+                if record.app_epoch_id != epoch.session_id {
+                    return Err(JournalError::invalid(
+                        "session-start event app epoch must match its new session ID",
+                    ));
+                }
+                if self.session_ids.contains(&epoch.session_id) {
+                    return Err(JournalError::invalid(
+                        "session epoch ID already exists in this project journal",
+                    ));
+                }
+                self.session_ids
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                self.session_epochs
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+            }
+            _ => {
+                if record.app_epoch_id != self.current_session_id {
+                    return Err(JournalError::invalid(
+                        "record app-arrival epoch is not the current session epoch",
+                    ));
+                }
+            }
+        }
+        match &record.event {
             JournalEvent::PhysicalSample(sample) => {
-                sample.validate(header)?;
+                sample.validate()?;
+                if sample.session_id != record.app_epoch_id {
+                    return Err(JournalError::invalid(
+                        "physical sample session ID differs from its app-arrival epoch",
+                    ));
+                }
                 if self.physical_samples.len() >= MAX_JOURNAL_RECORDS {
                     return Err(JournalError::limit("physical sample record cap reached"));
                 }
@@ -681,11 +909,96 @@ impl JournalReplayState {
                 self.index_sample(sample)?;
             }
             JournalEvent::Metadata(metadata) => {
-                metadata.validate(header)?;
+                metadata.validate()?;
+                if metadata.scope == MetadataScope::Session
+                    && !self.session_ids.contains(&metadata.scope_id)
+                {
+                    return Err(JournalError::invalid(
+                        "session metadata references an unknown session epoch",
+                    ));
+                }
                 if self.metadata_history.len() >= MAX_JOURNAL_RECORDS {
                     return Err(JournalError::limit("journal metadata history cap reached"));
                 }
                 self.metadata_history
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+            }
+            JournalEvent::SessionEpochStarted { .. } => {}
+            JournalEvent::MigrationProvenance {
+                source_schema_version,
+                source_journal_id,
+                ..
+            } => {
+                if !matches!(
+                    *source_schema_version,
+                    LEGACY_JOURNAL_SCHEMA_VERSION | PREVIOUS_JOURNAL_SCHEMA_VERSION
+                ) {
+                    return Err(JournalError::invalid(
+                        "migration provenance has an unsupported source schema",
+                    ));
+                }
+                validate_text(source_journal_id, "migration source journal ID", 128)?;
+                self.migration_provenance
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+            }
+            JournalEvent::EditAction {
+                action_id,
+                revision_id,
+                command,
+                ..
+            } => {
+                if *action_id != record.sequence
+                    || *revision_id != self.logical_revision.saturating_add(1)
+                {
+                    return Err(JournalError::invalid(
+                        "edit action ID or revision does not extend the current history",
+                    ));
+                }
+                validate_edit_command(self, command)?;
+                self.edit_actions
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                self.undo_stack
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+            }
+            JournalEvent::Undo {
+                action_id,
+                revision_id,
+                ..
+            } => {
+                if *revision_id != self.logical_revision.saturating_add(1)
+                    || self.undo_stack.last() != Some(action_id)
+                {
+                    return Err(JournalError::invalid(
+                        "undo must target the latest active edit action",
+                    ));
+                }
+                self.edit_controls
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                self.redo_stack
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+            }
+            JournalEvent::Redo {
+                action_id,
+                revision_id,
+                ..
+            } => {
+                if *revision_id != self.logical_revision.saturating_add(1)
+                    || self.redo_stack.last() != Some(action_id)
+                {
+                    return Err(JournalError::invalid(
+                        "redo must target the latest undone edit action",
+                    ));
+                }
+                self.edit_controls
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                self.undo_stack
                     .try_reserve(1)
                     .map_err(JournalError::allocation)?;
             }
@@ -776,16 +1089,15 @@ impl JournalReplayState {
             ));
         }
         validate_stroke_ref(target)?;
-        if !self.contains_stroke(target) {
-            return Err(JournalError::invalid(
-                "logical target does not identify an observed source/device/pointer/stroke",
-            ));
-        }
-        Ok(())
+        self.validate_edit_target(target)
     }
 
     fn apply_prepared(&mut self, record: JournalRecord) {
-        let JournalRecord { sequence, event } = record;
+        let JournalRecord {
+            sequence,
+            app_epoch_id,
+            event,
+        } = record;
         match event {
             JournalEvent::PhysicalSample(sample) => {
                 self.physical_samples.push(StoredPhysicalSample {
@@ -794,15 +1106,116 @@ impl JournalReplayState {
                 });
             }
             JournalEvent::Metadata(metadata) => {
-                self.metadata_history
-                    .push(StoredMetadata { sequence, metadata });
+                self.metadata_history.push(StoredMetadata {
+                    sequence,
+                    app_epoch_id: app_epoch_id.clone(),
+                    metadata,
+                });
+            }
+            JournalEvent::SessionEpochStarted { epoch, .. } => {
+                self.session_ids.insert(epoch.session_id.clone());
+                self.current_session_id = epoch.session_id.clone();
+                self.session_epochs
+                    .push(StoredSessionEpoch { sequence, epoch });
+            }
+            JournalEvent::MigrationProvenance {
+                source_schema_version,
+                source_journal_id,
+                source_prefix_fingerprint,
+                source_record_count,
+                app_arrival_elapsed_ns,
+            } => self.migration_provenance.push(StoredMigrationProvenance {
+                sequence,
+                app_epoch_id: app_epoch_id.clone(),
+                app_arrival_elapsed_ns,
+                source_schema_version,
+                source_journal_id,
+                source_prefix_fingerprint,
+                source_record_count,
+            }),
+            JournalEvent::EditAction {
+                action_id,
+                revision_id,
+                app_arrival_elapsed_ns,
+                command,
+            } => {
+                self.edit_actions.push(StoredEditAction {
+                    sequence,
+                    action_id,
+                    revision_id,
+                    app_epoch_id: app_epoch_id.clone(),
+                    app_arrival_elapsed_ns,
+                    command,
+                    active: true,
+                });
+                self.undo_stack.push(action_id);
+                self.redo_stack.clear();
+                self.logical_revision = revision_id;
+            }
+            JournalEvent::Undo {
+                action_id,
+                revision_id,
+                app_arrival_elapsed_ns,
+            } => {
+                self.undo_stack.pop();
+                self.redo_stack.push(action_id);
+                self.edit_actions
+                    .iter_mut()
+                    .find(|action| action.action_id == action_id)
+                    .expect("undo target was validated")
+                    .active = false;
+                self.edit_controls.push(StoredEditControl {
+                    sequence,
+                    action_id,
+                    revision_id,
+                    app_epoch_id: app_epoch_id.clone(),
+                    app_arrival_elapsed_ns,
+                    redo: false,
+                });
+                self.logical_revision = revision_id;
+            }
+            JournalEvent::Redo {
+                action_id,
+                revision_id,
+                app_arrival_elapsed_ns,
+            } => {
+                self.redo_stack.pop();
+                self.undo_stack.push(action_id);
+                self.edit_actions
+                    .iter_mut()
+                    .find(|action| action.action_id == action_id)
+                    .expect("redo target was validated")
+                    .active = true;
+                self.edit_controls.push(StoredEditControl {
+                    sequence,
+                    action_id,
+                    revision_id,
+                    app_epoch_id: app_epoch_id.clone(),
+                    app_arrival_elapsed_ns,
+                    redo: true,
+                });
+                self.logical_revision = revision_id;
             }
             JournalEvent::Revision { revision_id, .. } => {
                 self.logical_revision = revision_id;
             }
-            JournalEvent::Tombstone { target, .. } => self.tombstones.push(target),
+            JournalEvent::Tombstone {
+                logical_revision,
+                app_arrival_elapsed_ns,
+                target,
+            } => {
+                self.tombstones.push(target.clone());
+                self.tombstone_history.push(StoredTombstone {
+                    sequence,
+                    logical_revision,
+                    app_epoch_id: app_epoch_id.clone(),
+                    app_arrival_elapsed_ns,
+                    target,
+                });
+            }
             JournalEvent::StrokeMove {
                 logical_revision,
+                app_arrival_elapsed_ns,
                 target,
                 delta_x_raw,
                 delta_y_raw,
@@ -814,6 +1227,8 @@ impl JournalReplayState {
                 self.moves.push(StoredMove {
                     sequence,
                     logical_revision,
+                    app_epoch_id: app_epoch_id.clone(),
+                    app_arrival_elapsed_ns,
                     target,
                     delta_x_raw,
                     delta_y_raw,
@@ -823,12 +1238,15 @@ impl JournalReplayState {
             }
             JournalEvent::UserCorrection {
                 logical_revision,
+                app_arrival_elapsed_ns,
                 target,
                 corrected_text,
                 ..
             } => self.corrections.push(StoredCorrection {
                 sequence,
                 logical_revision,
+                app_epoch_id: app_epoch_id.clone(),
+                app_arrival_elapsed_ns,
                 target,
                 corrected_text,
             }),
@@ -837,42 +1255,111 @@ impl JournalReplayState {
     }
 
     pub(crate) fn projected_samples(&self) -> Result<Vec<ProjectedSample<'_>>, JournalError> {
+        let mut visibility = HashMap::<StrokeRef, bool>::new();
+        let mut edit_moves = HashMap::<StrokeRef, ProjectedTransform>::new();
+        visibility
+            .try_reserve(self.edit_actions.len())
+            .map_err(JournalError::allocation)?;
+        edit_moves
+            .try_reserve(self.edit_actions.len())
+            .map_err(JournalError::allocation)?;
+        for action in self.edit_actions.iter().filter(|action| action.active) {
+            match &action.command {
+                EditCommand::Tombstone { targets } => {
+                    for target in targets {
+                        visibility.insert(target.clone(), false);
+                    }
+                }
+                EditCommand::Restore { targets } => {
+                    for target in targets {
+                        visibility.insert(target.clone(), true);
+                    }
+                }
+                EditCommand::Move {
+                    target,
+                    delta_x_raw,
+                    delta_y_raw,
+                    coordinate_space,
+                    units,
+                } => {
+                    if let Some(total) = edit_moves.get_mut(target) {
+                        if total.coordinate_space != *coordinate_space || total.units != *units {
+                            return Err(JournalError::invalid(
+                                "active edit moves use inconsistent raw position domains",
+                            ));
+                        }
+                        total.delta_x_raw = total
+                            .delta_x_raw
+                            .checked_add(*delta_x_raw)
+                            .ok_or_else(|| JournalError::invalid("edit move x delta overflow"))?;
+                        total.delta_y_raw = total
+                            .delta_y_raw
+                            .checked_add(*delta_y_raw)
+                            .ok_or_else(|| JournalError::invalid("edit move y delta overflow"))?;
+                    } else {
+                        edit_moves.insert(
+                            target.clone(),
+                            ProjectedTransform {
+                                coordinate_space: coordinate_space.clone(),
+                                units: units.clone(),
+                                delta_x_raw: *delta_x_raw,
+                                delta_y_raw: *delta_y_raw,
+                            },
+                        );
+                    }
+                }
+                EditCommand::Correction { .. } => {}
+            }
+        }
+
         let mut projected = Vec::new();
         projected
             .try_reserve(self.physical_samples.len())
             .map_err(JournalError::allocation)?;
         for stored in &self.physical_samples {
-            let stroke = stored.sample.stroke_ref();
-            if stroke
-                .as_ref()
-                .is_some_and(|stroke| self.tombstone_set.contains(stroke))
-            {
-                continue;
+            let stroke = stored.sample.stroke_ref(&self.journal_id);
+            if let Some(stroke) = &stroke {
+                let visible = visibility
+                    .get(stroke)
+                    .copied()
+                    .unwrap_or_else(|| !self.tombstone_set.contains(stroke));
+                if !visible {
+                    continue;
+                }
             }
             let mut effective_position = stored.sample.position.clone();
-            if let Some(stroke) = &stroke
-                && let Some(transform) = self.move_totals.get(stroke)
-                && let Some(position) = effective_position.as_mut()
-            {
-                if position.coordinate_space != transform.coordinate_space
-                    || position.units != transform.units
+            if let Some(stroke) = &stroke {
+                for transform in [self.move_totals.get(stroke), edit_moves.get(stroke)]
+                    .into_iter()
+                    .flatten()
                 {
-                    return Err(JournalError::invalid(
-                        "stored move cannot be projected onto this position domain",
-                    ));
+                    if let Some(position) = effective_position.as_mut() {
+                        if position.coordinate_space != transform.coordinate_space
+                            || position.units != transform.units
+                        {
+                            return Err(JournalError::invalid(
+                                "stored move cannot be projected onto this position domain",
+                            ));
+                        }
+                        position.x_raw = position
+                            .x_raw
+                            .checked_add(transform.delta_x_raw)
+                            .ok_or_else(|| {
+                                JournalError::invalid("projected x coordinate overflow")
+                            })?;
+                        position.y_raw = position
+                            .y_raw
+                            .checked_add(transform.delta_y_raw)
+                            .ok_or_else(|| {
+                                JournalError::invalid("projected y coordinate overflow")
+                            })?;
+                    }
                 }
-                position.x_raw = position
-                    .x_raw
-                    .checked_add(transform.delta_x_raw)
-                    .ok_or_else(|| JournalError::invalid("projected x coordinate overflow"))?;
-                position.y_raw = position
-                    .y_raw
-                    .checked_add(transform.delta_y_raw)
-                    .ok_or_else(|| JournalError::invalid("projected y coordinate overflow"))?;
             }
             projected.push(ProjectedSample {
                 sequence: stored.sequence,
                 sample: &stored.sample,
+                stroke_ref: stroke,
                 effective_position,
             });
         }
@@ -910,11 +1397,12 @@ impl JournalWriter {
                 "journal header exceeds the file byte cap",
             ));
         }
+        let state = JournalReplayState::for_header(&header)?;
         let mut writer = Self {
             path,
             file,
             header,
-            state: JournalReplayState::default(),
+            state,
             bytes_written: 0,
             prefix_fingerprint: FNV_OFFSET_BASIS,
             poisoned: false,
@@ -960,7 +1448,7 @@ impl JournalWriter {
         let parsed = parse_journal(&mut file)?;
         if parsed.schema_version != JOURNAL_SCHEMA_VERSION {
             return Err(JournalError::invalid(
-                "legacy journal is read-only; migrate into a new schema 2 journal before append",
+                "legacy journal is read-only; migrate into a schema 3 project journal before append",
             ));
         }
         let recovered_truncated_final_record = parsed.recovery.truncated_final_record;
@@ -1005,7 +1493,30 @@ impl JournalWriter {
     }
 
     pub(crate) fn append_sample(&mut self, sample: PhysicalSample) -> Result<u64, JournalError> {
+        if sample.session_id != self.state.current_session_id {
+            return Err(JournalError::invalid(
+                "sample session ID must match the active app-arrival epoch",
+            ));
+        }
         self.append_event(JournalEvent::PhysicalSample(Box::new(sample)))
+    }
+
+    pub(crate) fn begin_session_epoch(
+        &mut self,
+        session_id: String,
+        started_at_unix_ns: u128,
+        config_id: Option<String>,
+        provenance: String,
+    ) -> Result<u64, JournalError> {
+        self.append_event(JournalEvent::SessionEpochStarted {
+            epoch: SessionEpoch {
+                session_id,
+                started_at_unix_ns: Some(started_at_unix_ns),
+                config_id,
+                provenance,
+            },
+            app_arrival_elapsed_ns: 0,
+        })
     }
 
     pub(crate) fn append_metadata(
@@ -1013,6 +1524,74 @@ impl JournalWriter {
         metadata: JournalMetadata,
     ) -> Result<u64, JournalError> {
         self.append_event(JournalEvent::Metadata(metadata))
+    }
+
+    pub(crate) fn apply_edit_action(
+        &mut self,
+        app_arrival_elapsed_ns: u128,
+        command: EditCommand,
+    ) -> Result<u64, JournalError> {
+        let action_id = self
+            .state
+            .last_sequence
+            .checked_add(1)
+            .ok_or_else(|| JournalError::limit("journal sequence counter overflow"))?;
+        let revision_id = self
+            .state
+            .logical_revision
+            .checked_add(1)
+            .ok_or_else(|| JournalError::limit("logical revision counter overflow"))?;
+        self.append_event(JournalEvent::EditAction {
+            action_id,
+            revision_id,
+            app_arrival_elapsed_ns,
+            command,
+        })?;
+        Ok(action_id)
+    }
+
+    pub(crate) fn undo_last_edit(
+        &mut self,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<u64, JournalError> {
+        let action_id = *self
+            .state
+            .undo_stack
+            .last()
+            .ok_or_else(|| JournalError::invalid("there is no active edit to undo"))?;
+        let revision_id = self
+            .state
+            .logical_revision
+            .checked_add(1)
+            .ok_or_else(|| JournalError::limit("logical revision counter overflow"))?;
+        self.append_event(JournalEvent::Undo {
+            action_id,
+            revision_id,
+            app_arrival_elapsed_ns,
+        })?;
+        Ok(action_id)
+    }
+
+    pub(crate) fn redo_last_edit(
+        &mut self,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<u64, JournalError> {
+        let action_id = *self
+            .state
+            .redo_stack
+            .last()
+            .ok_or_else(|| JournalError::invalid("there is no undone edit to redo"))?;
+        let revision_id = self
+            .state
+            .logical_revision
+            .checked_add(1)
+            .ok_or_else(|| JournalError::limit("logical revision counter overflow"))?;
+        self.append_event(JournalEvent::Redo {
+            action_id,
+            revision_id,
+            app_arrival_elapsed_ns,
+        })?;
+        Ok(action_id)
     }
 
     pub(crate) fn begin_revision(
@@ -1115,9 +1694,17 @@ impl JournalWriter {
             .last_sequence
             .checked_add(1)
             .ok_or_else(|| JournalError::limit("journal sequence counter overflow"))?;
-        let record = JournalRecord { sequence, event };
+        let app_epoch_id = match &event {
+            JournalEvent::SessionEpochStarted { epoch, .. } => epoch.session_id.clone(),
+            _ => self.state.current_session_id.clone(),
+        };
+        let record = JournalRecord {
+            sequence,
+            app_epoch_id,
+            event,
+        };
         validate_record_before_encoding(&self.header, &record)?;
-        let line = encode_row(&encode_record_fields(&record)?)?;
+        let line = encode_row(&encode_record_fields(&record, JOURNAL_SCHEMA_VERSION)?)?;
         if line.len() > MAX_JOURNAL_LINE_BYTES {
             return Err(JournalError::limit("journal record exceeds line cap"));
         }
@@ -1174,29 +1761,47 @@ pub(crate) fn read_journal(path: &Path) -> Result<JournalReadResult, JournalErro
     parse_journal(file)
 }
 
-/// Migrates a readable schema-1 journal into a new schema-2 journal with a
-/// caller-supplied new identity. Source bytes remain untouched. If the source
-/// had a torn final line, only its validated prefix is migrated and the result
-/// reports that recovery status to the caller.
-pub(crate) fn migrate_schema_one_to_two(
+/// Migrates a readable older journal into schema 3 while preserving its
+/// logical project identity and every validated physical field. The source
+/// file remains untouched; the migration row records the source prefix.
+pub(crate) fn migrate_schema_one_to_three(
     source_path: &Path,
     destination_path: PathBuf,
-    new_journal_id: String,
 ) -> Result<JournalMigrationResult, JournalError> {
     let source = read_journal(source_path)?;
     if source.schema_version != LEGACY_JOURNAL_SCHEMA_VERSION {
         return Err(JournalError::invalid(
-            "only schema 1 journals can be migrated by this migration function",
+            "only schema 1 journals can be migrated by this function",
         ));
     }
-    if new_journal_id == source.header.journal_id {
+    migrate_parsed_journal_to_three(source, destination_path)
+}
+
+pub(crate) fn migrate_schema_two_to_three(
+    source_path: &Path,
+    destination_path: PathBuf,
+) -> Result<JournalMigrationResult, JournalError> {
+    let source = read_journal(source_path)?;
+    if source.schema_version != PREVIOUS_JOURNAL_SCHEMA_VERSION {
         return Err(JournalError::invalid(
-            "migration requires a new journal identity",
+            "only schema 2 journals can be migrated by this function",
         ));
     }
-    let mut header = source.header.clone();
-    header.journal_id = new_journal_id;
-    let mut writer = JournalWriter::create(destination_path.clone(), header)?;
+    migrate_parsed_journal_to_three(source, destination_path)
+}
+
+fn migrate_parsed_journal_to_three(
+    source: JournalReadResult,
+    destination_path: PathBuf,
+) -> Result<JournalMigrationResult, JournalError> {
+    let source_journal_id = source.header.journal_id.clone();
+    let source_schema_version = source.schema_version;
+    let source_prefix_fingerprint = source
+        .checkpoints
+        .last()
+        .map(|checkpoint| checkpoint.fingerprint)
+        .ok_or_else(|| JournalError::invalid("legacy journal has no validated prefix"))?;
+    let mut writer = JournalWriter::create(destination_path.clone(), source.header.clone())?;
     let mut migrated_records = 0u64;
     for source_record in source.records {
         let sequence = writer.append_event(source_record.event)?;
@@ -1207,9 +1812,20 @@ pub(crate) fn migrate_schema_one_to_two(
             ));
         }
     }
+    writer.append_event(JournalEvent::MigrationProvenance {
+        source_schema_version,
+        source_journal_id: source_journal_id.clone(),
+        source_prefix_fingerprint,
+        source_record_count: migrated_records,
+        // Migration is an offline file operation with no capture-session
+        // monotonic timestamp. Preserve that absence rather than inventing 0.
+        app_arrival_elapsed_ns: None,
+    })?;
     writer.flush()?;
     Ok(JournalMigrationResult {
         destination_path,
+        source_journal_id: source_journal_id.clone(),
+        destination_journal_id: source_journal_id,
         source_truncated_final_record: source.recovery.truncated_final_record,
         migrated_records,
     })
@@ -1261,6 +1877,7 @@ pub(crate) fn parse_journal(reader: impl Read) -> Result<JournalReadResult, Jour
         if header.is_none() {
             let (version, parsed_header) = parse_header_fields(&fields)?;
             schema_version = version;
+            state = JournalReplayState::for_header(&parsed_header)?;
             header = Some(parsed_header);
             checkpoints.push(PrefixCheckpoint {
                 sequence: 0,
@@ -1273,7 +1890,11 @@ pub(crate) fn parse_journal(reader: impl Read) -> Result<JournalReadResult, Jour
         if records.len() >= MAX_JOURNAL_RECORDS {
             return Err(JournalError::limit("journal record cap reached"));
         }
-        let record = parse_record_fields(schema_version, &fields)?;
+        let record = parse_record_fields(
+            schema_version,
+            &fields,
+            header.as_ref().expect("header was parsed"),
+        )?;
         state.prepare_record(header.as_ref().expect("header was parsed"), &record)?;
         records.try_reserve(1).map_err(JournalError::allocation)?;
         let sequence = record.sequence;
@@ -1372,7 +1993,7 @@ pub(crate) fn load_with_snapshot(
         });
     }
 
-    let mut prefix_state = JournalReplayState::default();
+    let mut prefix_state = JournalReplayState::for_header(&journal.header)?;
     for record in journal
         .records
         .iter()
@@ -1454,19 +2075,23 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
         let fields = text.split('\t').collect::<Vec<_>>();
         if is_header {
             require_fields(&fields, 8, "LASSOINK-SNAPSHOT")?;
-            if fields[0] != "LASSOINK-SNAPSHOT" || fields[1] != "1" {
+            if fields[0] != "LASSOINK-SNAPSHOT" || fields[1] != "2" {
                 return Err(JournalError::invalid("unsupported snapshot header"));
             }
             let prefix_fingerprint = parse_hex_u64(fields[6], "snapshot prefix fingerprint")?;
             let state_fingerprint_expected =
                 parse_hex_u64(fields[7], "snapshot state fingerprint")?;
+            let journal_id = decode_field(fields[2])?;
             parsed = Some(ParsedSnapshot {
-                journal_id: decode_field(fields[2])?,
+                journal_id: journal_id.clone(),
                 prefix_bytes: parse_u64(fields[3], "snapshot prefix byte length")?,
                 prefix_sequence: parse_u64(fields[4], "snapshot prefix sequence")?,
                 logical_revision: parse_u64(fields[5], "snapshot logical revision")?,
                 prefix_fingerprint,
-                state: JournalReplayState::default(),
+                state: JournalReplayState {
+                    journal_id,
+                    ..JournalReplayState::default()
+                },
             });
             expected_state_fingerprint = Some(state_fingerprint_expected);
             saw_header = true;
@@ -1475,15 +2100,62 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
 
         let snapshot = parsed.as_mut().expect("snapshot header has been parsed");
         match fields.first().copied().unwrap_or_default() {
-            "SP" => {
-                if total_state_entries >= MAX_JOURNAL_RECORDS {
+            "EPO" => {
+                require_fields(&fields, 6, "EPO")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
                     return Err(JournalError::limit("snapshot state entry cap reached"));
                 }
-                let sample = parse_sample_fields(&fields, JOURNAL_SCHEMA_VERSION)?;
-                let sequence = parse_u64(fields[1], "snapshot sample sequence")?;
-                if sequence > snapshot.prefix_sequence {
+                let sequence = parse_u64(fields[1], "snapshot epoch sequence")?;
+                let epoch = SessionEpoch {
+                    session_id: decode_field(fields[2])?,
+                    started_at_unix_ns: parse_option_u128(
+                        fields[3],
+                        "snapshot epoch wall-clock start",
+                    )?,
+                    config_id: decode_option_text(fields[4])?,
+                    provenance: decode_field(fields[5])?,
+                };
+                epoch.validate()?;
+                if sequence > snapshot.prefix_sequence
+                    || snapshot.state.session_ids.contains(&epoch.session_id)
+                {
                     return Err(JournalError::invalid(
-                        "snapshot sample is past its declared prefix",
+                        "snapshot session epoch is duplicated or past its prefix",
+                    ));
+                }
+                if snapshot.state.session_epochs.is_empty() && sequence != 0 {
+                    return Err(JournalError::invalid(
+                        "snapshot is missing the header's initial session epoch",
+                    ));
+                }
+                snapshot
+                    .state
+                    .session_epochs
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                snapshot
+                    .state
+                    .session_ids
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                snapshot.state.session_ids.insert(epoch.session_id.clone());
+                snapshot.state.current_session_id = epoch.session_id.clone();
+                snapshot
+                    .state
+                    .session_epochs
+                    .push(StoredSessionEpoch { sequence, epoch });
+            }
+            "SP" => {
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
+                    return Err(JournalError::limit("snapshot state entry cap reached"));
+                }
+                let sample = parse_sample_fields(&fields, PREVIOUS_JOURNAL_SCHEMA_VERSION)?;
+                let sequence = parse_u64(fields[1], "snapshot sample sequence")?;
+                if sequence > snapshot.prefix_sequence
+                    || !snapshot.state.session_ids.contains(&sample.session_id)
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot sample is past its prefix or references an unknown session",
                     ));
                 }
                 snapshot
@@ -1498,8 +2170,8 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
                     .push(StoredPhysicalSample { sequence, sample });
             }
             "SMD" => {
-                require_fields(&fields, 10, "SMD")?;
-                if total_state_entries >= MAX_JOURNAL_RECORDS {
+                require_fields(&fields, 11, "SMD")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
                     return Err(JournalError::limit("snapshot state entry cap reached"));
                 }
                 let sequence = parse_u64(fields[1], "snapshot metadata sequence")?;
@@ -1508,23 +2180,62 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
                         "snapshot metadata is past its declared prefix",
                     ));
                 }
-                let metadata = parse_metadata_fields(&fields)?;
+                let app_epoch_id = decode_field(fields[2])?;
+                if !snapshot.state.session_ids.contains(&app_epoch_id) {
+                    return Err(JournalError::invalid(
+                        "snapshot metadata references an unknown app-arrival epoch",
+                    ));
+                }
+                let mut metadata_fields = Vec::new();
+                metadata_fields
+                    .try_reserve_exact(fields.len() - 1)
+                    .map_err(JournalError::allocation)?;
+                metadata_fields.extend_from_slice(&fields[..2]);
+                metadata_fields.extend_from_slice(&fields[3..]);
+                let metadata = parse_metadata_fields(&metadata_fields)?;
+                if metadata.scope == MetadataScope::Session
+                    && !snapshot.state.session_ids.contains(&metadata.scope_id)
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot session metadata references an unknown epoch",
+                    ));
+                }
                 snapshot
                     .state
                     .metadata_history
                     .try_reserve(1)
                     .map_err(JournalError::allocation)?;
-                snapshot
-                    .state
-                    .metadata_history
-                    .push(StoredMetadata { sequence, metadata });
+                snapshot.state.metadata_history.push(StoredMetadata {
+                    sequence,
+                    app_epoch_id,
+                    metadata,
+                });
             }
             "ST" => {
-                require_fields(&fields, 5, "ST")?;
-                if total_state_entries >= MAX_JOURNAL_RECORDS {
+                require_fields(&fields, 11, "ST")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
                     return Err(JournalError::limit("snapshot state entry cap reached"));
                 }
-                let target = parse_stroke_ref_fields(&fields, 1)?;
+                let sequence = parse_u64(fields[1], "snapshot tombstone sequence")?;
+                let logical_revision = parse_u64(fields[2], "snapshot tombstone revision")?;
+                let app_epoch_id = decode_field(fields[3])?;
+                let app_arrival_elapsed_ns =
+                    parse_u128(fields[4], "snapshot tombstone app arrival")?;
+                if sequence > snapshot.prefix_sequence
+                    || logical_revision > snapshot.logical_revision
+                    || !snapshot.state.session_ids.contains(&app_epoch_id)
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot tombstone is past its prefix/revision or has unknown epoch",
+                    ));
+                }
+                let target = parse_stroke_ref_fields(
+                    &fields,
+                    5,
+                    JOURNAL_SCHEMA_VERSION,
+                    &snapshot.journal_id,
+                    &snapshot.state.current_session_id,
+                )?;
                 snapshot
                     .state
                     .tombstones
@@ -1540,17 +2251,27 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
                         "duplicate stroke tombstone in snapshot",
                     ));
                 }
-                snapshot.state.tombstones.push(target);
+                snapshot.state.tombstones.push(target.clone());
+                snapshot.state.tombstone_history.push(StoredTombstone {
+                    sequence,
+                    logical_revision,
+                    app_epoch_id,
+                    app_arrival_elapsed_ns,
+                    target,
+                });
             }
             "SM" => {
-                require_fields(&fields, 11, "SM")?;
-                if total_state_entries >= MAX_JOURNAL_RECORDS {
+                require_fields(&fields, 15, "SM")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
                     return Err(JournalError::limit("snapshot state entry cap reached"));
                 }
                 let sequence = parse_u64(fields[1], "snapshot move sequence")?;
                 let logical_revision = parse_u64(fields[2], "snapshot move revision")?;
+                let app_epoch_id = decode_field(fields[3])?;
+                let app_arrival_elapsed_ns = parse_u128(fields[4], "snapshot move app arrival")?;
                 if sequence > snapshot.prefix_sequence
                     || logical_revision > snapshot.logical_revision
+                    || !snapshot.state.session_ids.contains(&app_epoch_id)
                 {
                     return Err(JournalError::invalid(
                         "snapshot move is past its declared prefix/revision",
@@ -1561,11 +2282,17 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
                     .moves
                     .try_reserve(1)
                     .map_err(JournalError::allocation)?;
-                let target = parse_stroke_ref_fields(&fields, 3)?;
-                let delta_x_raw = parse_i64(fields[7], "snapshot move delta x")?;
-                let delta_y_raw = parse_i64(fields[8], "snapshot move delta y")?;
-                let coordinate_space = decode_field(fields[9])?;
-                let units = decode_field(fields[10])?;
+                let target = parse_stroke_ref_fields(
+                    &fields,
+                    5,
+                    JOURNAL_SCHEMA_VERSION,
+                    &snapshot.journal_id,
+                    &snapshot.state.current_session_id,
+                )?;
+                let delta_x_raw = parse_i64(fields[11], "snapshot move delta x")?;
+                let delta_y_raw = parse_i64(fields[12], "snapshot move delta y")?;
+                let coordinate_space = decode_field(fields[13])?;
+                let units = decode_field(fields[14])?;
                 snapshot.state.prepare_move(
                     &target,
                     delta_x_raw,
@@ -1579,6 +2306,8 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
                 snapshot.state.moves.push(StoredMove {
                     sequence,
                     logical_revision,
+                    app_epoch_id,
+                    app_arrival_elapsed_ns,
                     target,
                     delta_x_raw,
                     delta_y_raw,
@@ -1587,14 +2316,18 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
                 });
             }
             "SC" => {
-                require_fields(&fields, 8, "SC")?;
-                if total_state_entries >= MAX_JOURNAL_RECORDS {
+                require_fields(&fields, 12, "SC")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
                     return Err(JournalError::limit("snapshot state entry cap reached"));
                 }
                 let sequence = parse_u64(fields[1], "snapshot correction sequence")?;
                 let logical_revision = parse_u64(fields[2], "snapshot correction revision")?;
+                let app_epoch_id = decode_field(fields[3])?;
+                let app_arrival_elapsed_ns =
+                    parse_u128(fields[4], "snapshot correction app arrival")?;
                 if sequence > snapshot.prefix_sequence
                     || logical_revision > snapshot.logical_revision
+                    || !snapshot.state.session_ids.contains(&app_epoch_id)
                 {
                     return Err(JournalError::invalid(
                         "snapshot correction is past its declared prefix/revision",
@@ -1608,9 +2341,165 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
                 snapshot.state.corrections.push(StoredCorrection {
                     sequence,
                     logical_revision,
-                    target: parse_stroke_ref_fields(&fields, 3)?,
-                    corrected_text: decode_field(fields[7])?,
+                    app_epoch_id,
+                    app_arrival_elapsed_ns,
+                    target: parse_stroke_ref_fields(
+                        &fields,
+                        5,
+                        JOURNAL_SCHEMA_VERSION,
+                        &snapshot.journal_id,
+                        &snapshot.state.current_session_id,
+                    )?,
+                    corrected_text: decode_field(fields[11])?,
                 });
+            }
+            "EA" => {
+                require_at_least_fields(&fields, 8, "EA")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
+                    return Err(JournalError::limit("snapshot state entry cap reached"));
+                }
+                let sequence = parse_u64(fields[1], "snapshot edit action sequence")?;
+                let app_epoch_id = decode_field(fields[2])?;
+                let revision_id = parse_u64(fields[3], "snapshot edit action revision")?;
+                if sequence > snapshot.prefix_sequence
+                    || revision_id > snapshot.logical_revision
+                    || !snapshot.state.session_ids.contains(&app_epoch_id)
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot edit action is past its prefix/revision or has unknown epoch",
+                    ));
+                }
+                let active = parse_bool(fields[6], "snapshot action active state")?;
+                let mut action_fields = Vec::new();
+                action_fields
+                    .try_reserve(fields.len() - 1)
+                    .map_err(JournalError::allocation)?;
+                action_fields.push("ACT");
+                action_fields.extend_from_slice(&fields[1..6]);
+                action_fields.extend_from_slice(&fields[7..]);
+                let action_header = JournalHeader {
+                    journal_id: snapshot.journal_id.clone(),
+                    session_id: snapshot.state.current_session_id.clone(),
+                    config_id: None,
+                    device_model_declared: None,
+                    tilt_supported_declared: None,
+                };
+                let parsed_action =
+                    parse_record_fields(JOURNAL_SCHEMA_VERSION, &action_fields, &action_header)?;
+                let JournalEvent::EditAction {
+                    action_id,
+                    revision_id: parsed_revision,
+                    app_arrival_elapsed_ns,
+                    command,
+                } = parsed_action.event
+                else {
+                    return Err(JournalError::invalid(
+                        "snapshot edit action row did not parse as an action",
+                    ));
+                };
+                if action_id != sequence || parsed_revision != revision_id {
+                    return Err(JournalError::invalid(
+                        "snapshot action identity differs from its event sequence/revision",
+                    ));
+                }
+                validate_edit_command_fields(&command)?;
+                validate_snapshot_edit_targets(&snapshot.state, &command)?;
+                snapshot
+                    .state
+                    .edit_actions
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                snapshot.state.edit_actions.push(StoredEditAction {
+                    sequence,
+                    action_id,
+                    revision_id,
+                    app_epoch_id,
+                    app_arrival_elapsed_ns,
+                    command,
+                    active,
+                });
+            }
+            "EC" => {
+                require_fields(&fields, 7, "EC")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
+                    return Err(JournalError::limit("snapshot state entry cap reached"));
+                }
+                let sequence = parse_u64(fields[1], "snapshot edit control sequence")?;
+                let app_epoch_id = decode_field(fields[2])?;
+                let revision_id = parse_u64(fields[3], "snapshot edit control revision")?;
+                if sequence > snapshot.prefix_sequence
+                    || revision_id > snapshot.logical_revision
+                    || !snapshot.state.session_ids.contains(&app_epoch_id)
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot edit control is past its prefix/revision or has unknown epoch",
+                    ));
+                }
+                snapshot
+                    .state
+                    .edit_controls
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                snapshot.state.edit_controls.push(StoredEditControl {
+                    sequence,
+                    app_epoch_id,
+                    revision_id,
+                    app_arrival_elapsed_ns: parse_u128(
+                        fields[4],
+                        "snapshot edit control app arrival",
+                    )?,
+                    action_id: parse_u64(fields[5], "snapshot edit control action ID")?,
+                    redo: parse_bool(fields[6], "snapshot edit control redo")?,
+                });
+            }
+            "US" | "RS" => {
+                require_fields(&fields, 2, "undo/redo stack")?;
+                let action_id = parse_u64(fields[1], "snapshot stack action ID")?;
+                let stack = if fields[0] == "US" {
+                    &mut snapshot.state.undo_stack
+                } else {
+                    &mut snapshot.state.redo_stack
+                };
+                stack.try_reserve(1).map_err(JournalError::allocation)?;
+                stack.push(action_id);
+            }
+            "MPR" => {
+                require_fields(&fields, 8, "MPR")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
+                    return Err(JournalError::limit("snapshot state entry cap reached"));
+                }
+                let sequence = parse_u64(fields[1], "snapshot migration sequence")?;
+                let app_epoch_id = decode_field(fields[2])?;
+                if sequence > snapshot.prefix_sequence
+                    || !snapshot.state.session_ids.contains(&app_epoch_id)
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot migration provenance is past its prefix or has unknown epoch",
+                    ));
+                }
+                snapshot
+                    .state
+                    .migration_provenance
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                snapshot
+                    .state
+                    .migration_provenance
+                    .push(StoredMigrationProvenance {
+                        sequence,
+                        app_epoch_id,
+                        app_arrival_elapsed_ns: parse_option_u128(
+                            fields[3],
+                            "snapshot migration app arrival",
+                        )?,
+                        source_schema_version: parse_u32(fields[4], "snapshot migration schema")?,
+                        source_journal_id: decode_field(fields[5])?,
+                        source_prefix_fingerprint: parse_hex_u64(
+                            fields[6],
+                            "snapshot migration source prefix",
+                        )?,
+                        source_record_count: parse_u64(fields[7], "snapshot source record count")?,
+                    });
             }
             "ENDSNAP" => {
                 require_fields(&fields, 1, "ENDSNAP")?;
@@ -1632,6 +2521,25 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
         ));
     }
     let snapshot = parsed.as_mut().expect("snapshot header has been parsed");
+    if snapshot
+        .state
+        .session_epochs
+        .first()
+        .is_none_or(|first| first.sequence != 0 || first.epoch.session_id.is_empty())
+    {
+        return Err(JournalError::invalid(
+            "snapshot is missing its initial session epoch",
+        ));
+    }
+    if !snapshot
+        .state
+        .session_ids
+        .contains(&snapshot.state.current_session_id)
+    {
+        return Err(JournalError::invalid(
+            "snapshot current session epoch is not declared",
+        ));
+    }
     snapshot.state.last_sequence = snapshot.prefix_sequence;
     snapshot.state.logical_revision = snapshot.logical_revision;
     let expected = expected_state_fingerprint
@@ -1652,22 +2560,43 @@ fn encode_snapshot(materialized: &MaterializedState) -> Result<Vec<u8>, JournalE
         ));
     }
     let mut body = Vec::new();
+    for stored in &materialized.state.session_epochs {
+        let fields = vec![
+            "EPO".to_owned(),
+            stored.sequence.to_string(),
+            encode_field(&stored.epoch.session_id),
+            opt_u128(stored.epoch.started_at_unix_ns),
+            encode_option_text(stored.epoch.config_id.as_deref()),
+            encode_field(&stored.epoch.provenance),
+        ];
+        append_encoded_row(&mut body, &fields)?;
+    }
     for stored in &materialized.state.physical_samples {
         let fields = encode_sample_fields(
             "SP",
             stored.sequence,
             &stored.sample,
-            JOURNAL_SCHEMA_VERSION,
+            PREVIOUS_JOURNAL_SCHEMA_VERSION,
         )?;
         append_encoded_row(&mut body, &fields)?;
     }
     for stored in &materialized.state.metadata_history {
-        let fields = encode_metadata_fields("SMD", stored.sequence, &stored.metadata);
+        let mut fields = encode_metadata_fields("SMD", stored.sequence, &stored.metadata);
+        fields.insert(2, encode_field(&stored.app_epoch_id));
         append_encoded_row(&mut body, &fields)?;
     }
-    for target in &materialized.state.tombstones {
-        let mut fields = vec!["ST".to_owned()];
-        fields.extend(encode_stroke_ref_fields(target));
+    for tombstone in &materialized.state.tombstone_history {
+        let mut fields = vec![
+            "ST".to_owned(),
+            tombstone.sequence.to_string(),
+            tombstone.logical_revision.to_string(),
+            encode_field(&tombstone.app_epoch_id),
+            tombstone.app_arrival_elapsed_ns.to_string(),
+        ];
+        fields.extend(encode_stroke_ref_fields(
+            &tombstone.target,
+            JOURNAL_SCHEMA_VERSION,
+        ));
         append_encoded_row(&mut body, &fields)?;
     }
     for movement in &materialized.state.moves {
@@ -1675,8 +2604,13 @@ fn encode_snapshot(materialized: &MaterializedState) -> Result<Vec<u8>, JournalE
             "SM".to_owned(),
             movement.sequence.to_string(),
             movement.logical_revision.to_string(),
+            encode_field(&movement.app_epoch_id),
+            movement.app_arrival_elapsed_ns.to_string(),
         ];
-        fields.extend(encode_stroke_ref_fields(&movement.target));
+        fields.extend(encode_stroke_ref_fields(
+            &movement.target,
+            JOURNAL_SCHEMA_VERSION,
+        ));
         fields.extend([
             movement.delta_x_raw.to_string(),
             movement.delta_y_raw.to_string(),
@@ -1690,16 +2624,70 @@ fn encode_snapshot(materialized: &MaterializedState) -> Result<Vec<u8>, JournalE
             "SC".to_owned(),
             correction.sequence.to_string(),
             correction.logical_revision.to_string(),
+            encode_field(&correction.app_epoch_id),
+            correction.app_arrival_elapsed_ns.to_string(),
         ];
-        fields.extend(encode_stroke_ref_fields(&correction.target));
+        fields.extend(encode_stroke_ref_fields(
+            &correction.target,
+            JOURNAL_SCHEMA_VERSION,
+        ));
         fields.push(encode_field(&correction.corrected_text));
         append_encoded_row(&mut body, &fields)?;
+    }
+    for action in &materialized.state.edit_actions {
+        let mut fields = encode_edit_action_fields(
+            action.sequence,
+            action.revision_id,
+            action.app_arrival_elapsed_ns,
+            action.action_id,
+            &action.command,
+            JOURNAL_SCHEMA_VERSION,
+        )?;
+        fields[0] = "EA".to_owned();
+        fields.insert(2, encode_field(&action.app_epoch_id));
+        fields.insert(6, action.active.to_string());
+        append_encoded_row(&mut body, &fields)?;
+    }
+    for control in &materialized.state.edit_controls {
+        append_encoded_row(
+            &mut body,
+            &[
+                "EC".to_owned(),
+                control.sequence.to_string(),
+                encode_field(&control.app_epoch_id),
+                control.revision_id.to_string(),
+                control.app_arrival_elapsed_ns.to_string(),
+                control.action_id.to_string(),
+                control.redo.to_string(),
+            ],
+        )?;
+    }
+    for action_id in &materialized.state.undo_stack {
+        append_encoded_row(&mut body, &["US".to_owned(), action_id.to_string()])?;
+    }
+    for action_id in &materialized.state.redo_stack {
+        append_encoded_row(&mut body, &["RS".to_owned(), action_id.to_string()])?;
+    }
+    for migration in &materialized.state.migration_provenance {
+        append_encoded_row(
+            &mut body,
+            &[
+                "MPR".to_owned(),
+                migration.sequence.to_string(),
+                encode_field(&migration.app_epoch_id),
+                opt_u128(migration.app_arrival_elapsed_ns),
+                migration.source_schema_version.to_string(),
+                encode_field(&migration.source_journal_id),
+                format!("{:016X}", migration.source_prefix_fingerprint),
+                migration.source_record_count.to_string(),
+            ],
+        )?;
     }
     append_encoded_row(&mut body, &["ENDSNAP".to_owned()])?;
     let state_fingerprint = fnv_update(FNV_OFFSET_BASIS, &body);
     let header = vec![
         "LASSOINK-SNAPSHOT".to_owned(),
-        "1".to_owned(),
+        "2".to_owned(),
         encode_field(&materialized.journal_id),
         materialized.prefix_bytes.to_string(),
         materialized.prefix_sequence.to_string(),
@@ -1761,7 +2749,7 @@ fn parse_header_fields(fields: &[&str]) -> Result<(u32, JournalHeader), JournalE
     let version = parse_u32(fields[1], "journal schema version")?;
     if !matches!(
         version,
-        LEGACY_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        LEGACY_JOURNAL_SCHEMA_VERSION | PREVIOUS_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(JournalError::invalid(format!(
             "unsupported journal schema version {version}"
@@ -1789,12 +2777,26 @@ fn parse_header_fields(fields: &[&str]) -> Result<(u32, JournalHeader), JournalE
 /// and the per-field caps; `encode_row` applies the final line cap before the
 /// replay state is prepared or changed.
 fn validate_record_before_encoding(
-    header: &JournalHeader,
+    _header: &JournalHeader,
     record: &JournalRecord,
 ) -> Result<(), JournalError> {
     match &record.event {
-        JournalEvent::PhysicalSample(sample) => sample.validate(header),
-        JournalEvent::Metadata(metadata) => metadata.validate(header),
+        JournalEvent::PhysicalSample(sample) => {
+            sample.validate()?;
+            if sample.session_id != record.app_epoch_id {
+                return Err(JournalError::invalid(
+                    "physical sample session ID differs from its app-arrival epoch",
+                ));
+            }
+            Ok(())
+        }
+        JournalEvent::Metadata(metadata) => metadata.validate(),
+        JournalEvent::SessionEpochStarted { epoch, .. } => epoch.validate(),
+        JournalEvent::EditAction { command, .. } => validate_edit_command_fields(command),
+        JournalEvent::Undo { .. } | JournalEvent::Redo { .. } => Ok(()),
+        JournalEvent::MigrationProvenance {
+            source_journal_id, ..
+        } => validate_text(source_journal_id, "migration source journal ID", 128),
         JournalEvent::Revision { note, .. } => validate_optional_text(Some(note), "revision note"),
         JournalEvent::Tombstone { target, .. } => validate_stroke_ref(target),
         JournalEvent::StrokeMove {
@@ -1828,7 +2830,166 @@ fn validate_record_before_encoding(
     }
 }
 
+fn validate_edit_command_fields(command: &EditCommand) -> Result<(), JournalError> {
+    match command {
+        EditCommand::Tombstone { targets } | EditCommand::Restore { targets } => {
+            validate_edit_target_list(targets)
+        }
+        EditCommand::Move {
+            target,
+            coordinate_space,
+            units,
+            ..
+        } => {
+            validate_stroke_ref(target)?;
+            validate_text(
+                coordinate_space,
+                "edit move coordinate space",
+                MAX_JOURNAL_TEXT_BYTES,
+            )?;
+            validate_text(units, "edit move units", MAX_JOURNAL_TEXT_BYTES)?;
+            if coordinate_space.is_empty() || units.is_empty() {
+                return Err(JournalError::invalid(
+                    "edit move coordinate space and units must be nonempty",
+                ));
+            }
+            Ok(())
+        }
+        EditCommand::Correction {
+            target,
+            corrected_text,
+        } => {
+            validate_stroke_ref(target)?;
+            validate_optional_text(corrected_text.as_deref(), "edit correction")
+        }
+    }
+}
+
+fn validate_snapshot_edit_targets(
+    state: &JournalReplayState,
+    command: &EditCommand,
+) -> Result<(), JournalError> {
+    match command {
+        EditCommand::Tombstone { targets } | EditCommand::Restore { targets } => {
+            for target in targets {
+                state.validate_edit_target(target)?;
+            }
+            Ok(())
+        }
+        EditCommand::Move {
+            target,
+            coordinate_space,
+            units,
+            ..
+        } => {
+            state.validate_edit_target(target)?;
+            state.validate_move_domain(target, coordinate_space, units)
+        }
+        EditCommand::Correction { target, .. } => state.validate_edit_target(target),
+    }
+}
+
+fn validate_edit_target_list(targets: &[StrokeRef]) -> Result<(), JournalError> {
+    if targets.is_empty() || targets.len() > MAX_EDIT_TARGETS {
+        return Err(JournalError::limit(format!(
+            "logical action must target between 1 and {MAX_EDIT_TARGETS} strokes"
+        )));
+    }
+    let mut unique = HashSet::new();
+    unique
+        .try_reserve(targets.len())
+        .map_err(JournalError::allocation)?;
+    for target in targets {
+        validate_stroke_ref(target)?;
+        if !unique.insert(target) {
+            return Err(JournalError::invalid(
+                "one logical action cannot repeat a stroke target",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_edit_command(
+    state: &JournalReplayState,
+    command: &EditCommand,
+) -> Result<(), JournalError> {
+    match command {
+        EditCommand::Tombstone { targets } | EditCommand::Restore { targets } => {
+            validate_edit_target_list(targets)?;
+            for target in targets {
+                state.validate_edit_target(target)?;
+            }
+            Ok(())
+        }
+        EditCommand::Move {
+            target,
+            delta_x_raw,
+            delta_y_raw,
+            coordinate_space,
+            units,
+        } => {
+            state.validate_edit_target(target)?;
+            validate_text(
+                coordinate_space,
+                "edit move coordinate space",
+                MAX_JOURNAL_TEXT_BYTES,
+            )?;
+            validate_text(units, "edit move units", MAX_JOURNAL_TEXT_BYTES)?;
+            if coordinate_space.is_empty() || units.is_empty() {
+                return Err(JournalError::invalid(
+                    "edit move coordinate space and units must be nonempty",
+                ));
+            }
+            state.validate_move_domain(target, coordinate_space, units)?;
+
+            let existing = state.move_totals.get(target);
+            let mut total_x = existing.map_or(0, |move_total| move_total.delta_x_raw);
+            let mut total_y = existing.map_or(0, |move_total| move_total.delta_y_raw);
+            for action in state.edit_actions.iter().filter(|action| action.active) {
+                if let EditCommand::Move {
+                    target: action_target,
+                    delta_x_raw,
+                    delta_y_raw,
+                    coordinate_space: action_space,
+                    units: action_units,
+                } = &action.command
+                    && action_target == target
+                {
+                    if action_space != coordinate_space || action_units != units {
+                        return Err(JournalError::invalid(
+                            "active moves on a stroke must use one raw position domain",
+                        ));
+                    }
+                    total_x = total_x.checked_add(*delta_x_raw).ok_or_else(|| {
+                        JournalError::invalid("combined active move x delta overflow")
+                    })?;
+                    total_y = total_y.checked_add(*delta_y_raw).ok_or_else(|| {
+                        JournalError::invalid("combined active move y delta overflow")
+                    })?;
+                }
+            }
+            total_x
+                .checked_add(*delta_x_raw)
+                .ok_or_else(|| JournalError::invalid("combined edit move x delta overflow"))?;
+            total_y
+                .checked_add(*delta_y_raw)
+                .ok_or_else(|| JournalError::invalid("combined edit move y delta overflow"))?;
+            Ok(())
+        }
+        EditCommand::Correction {
+            target,
+            corrected_text,
+        } => {
+            state.validate_edit_target(target)?;
+            validate_optional_text(corrected_text.as_deref(), "edit correction")
+        }
+    }
+}
+
 fn validate_stroke_ref(target: &StrokeRef) -> Result<(), JournalError> {
+    validate_text(&target.journal_id, "logical target journal ID", 128)?;
+    validate_text(&target.session_id, "logical target session ID", 256)?;
     validate_text(
         &target.source_api,
         "logical target source API",
@@ -1840,22 +3001,87 @@ fn validate_stroke_ref(target: &StrokeRef) -> Result<(), JournalError> {
         "logical target stroke ID",
         MAX_JOURNAL_TEXT_BYTES,
     )?;
-    if target.source_api.is_empty() || target.stroke_id.is_empty() {
+    if target.journal_id.is_empty()
+        || target.session_id.is_empty()
+        || target.source_api.is_empty()
+        || target.stroke_id.is_empty()
+    {
         return Err(JournalError::invalid(
-            "logical target source API and stroke ID must be nonempty",
+            "logical target journal/session/API/stroke IDs must be nonempty",
         ));
     }
     Ok(())
 }
 
-fn encode_record_fields(record: &JournalRecord) -> Result<Vec<String>, JournalError> {
-    let fields = match &record.event {
+fn encode_record_fields(record: &JournalRecord, version: u32) -> Result<Vec<String>, JournalError> {
+    let mut fields = match &record.event {
         JournalEvent::PhysicalSample(sample) => {
-            encode_sample_fields("P", record.sequence, sample, JOURNAL_SCHEMA_VERSION)?
+            encode_sample_fields("P", record.sequence, sample, version)?
         }
         JournalEvent::Metadata(metadata) => {
             encode_metadata_fields("META", record.sequence, metadata)
         }
+        JournalEvent::SessionEpochStarted {
+            epoch,
+            app_arrival_elapsed_ns,
+        } => vec![
+            "EPOCH".to_owned(),
+            record.sequence.to_string(),
+            app_arrival_elapsed_ns.to_string(),
+            opt_u128(epoch.started_at_unix_ns),
+            encode_option_text(epoch.config_id.as_deref()),
+            encode_field(&epoch.provenance),
+        ],
+        JournalEvent::EditAction {
+            action_id,
+            revision_id,
+            app_arrival_elapsed_ns,
+            command,
+        } => encode_edit_action_fields(
+            record.sequence,
+            *revision_id,
+            *app_arrival_elapsed_ns,
+            *action_id,
+            command,
+            version,
+        )?,
+        JournalEvent::Undo {
+            action_id,
+            revision_id,
+            app_arrival_elapsed_ns,
+        } => vec![
+            "UNDO".to_owned(),
+            record.sequence.to_string(),
+            revision_id.to_string(),
+            app_arrival_elapsed_ns.to_string(),
+            action_id.to_string(),
+        ],
+        JournalEvent::Redo {
+            action_id,
+            revision_id,
+            app_arrival_elapsed_ns,
+        } => vec![
+            "REDO".to_owned(),
+            record.sequence.to_string(),
+            revision_id.to_string(),
+            app_arrival_elapsed_ns.to_string(),
+            action_id.to_string(),
+        ],
+        JournalEvent::MigrationProvenance {
+            source_schema_version,
+            source_journal_id,
+            source_prefix_fingerprint,
+            source_record_count,
+            app_arrival_elapsed_ns,
+        } => vec![
+            "MIGR".to_owned(),
+            record.sequence.to_string(),
+            opt_u128(*app_arrival_elapsed_ns),
+            source_schema_version.to_string(),
+            encode_field(source_journal_id),
+            format!("{source_prefix_fingerprint:016X}"),
+            source_record_count.to_string(),
+        ],
         JournalEvent::Revision {
             revision_id,
             parent_revision,
@@ -1880,7 +3106,7 @@ fn encode_record_fields(record: &JournalRecord) -> Result<Vec<String>, JournalEr
                 app_arrival_elapsed_ns.to_string(),
                 logical_revision.to_string(),
             ];
-            fields.extend(encode_stroke_ref_fields(target));
+            fields.extend(encode_stroke_ref_fields(target, version));
             fields
         }
         JournalEvent::StrokeMove {
@@ -1898,7 +3124,7 @@ fn encode_record_fields(record: &JournalRecord) -> Result<Vec<String>, JournalEr
                 app_arrival_elapsed_ns.to_string(),
                 logical_revision.to_string(),
             ];
-            fields.extend(encode_stroke_ref_fields(target));
+            fields.extend(encode_stroke_ref_fields(target, version));
             fields.extend([
                 delta_x_raw.to_string(),
                 delta_y_raw.to_string(),
@@ -1919,11 +3145,69 @@ fn encode_record_fields(record: &JournalRecord) -> Result<Vec<String>, JournalEr
                 app_arrival_elapsed_ns.to_string(),
                 logical_revision.to_string(),
             ];
-            fields.extend(encode_stroke_ref_fields(target));
+            fields.extend(encode_stroke_ref_fields(target, version));
             fields.push(encode_field(corrected_text));
             fields
         }
     };
+    if version >= JOURNAL_SCHEMA_VERSION {
+        fields.insert(2, encode_field(&record.app_epoch_id));
+    }
+    Ok(fields)
+}
+
+fn encode_edit_action_fields(
+    sequence: u64,
+    revision_id: u64,
+    app_arrival_elapsed_ns: u128,
+    action_id: u64,
+    command: &EditCommand,
+    version: u32,
+) -> Result<Vec<String>, JournalError> {
+    let mut fields = vec![
+        "ACT".to_owned(),
+        sequence.to_string(),
+        revision_id.to_string(),
+        app_arrival_elapsed_ns.to_string(),
+        action_id.to_string(),
+    ];
+    match command {
+        EditCommand::Tombstone { targets } | EditCommand::Restore { targets } => {
+            fields.push(if matches!(command, EditCommand::Tombstone { .. }) {
+                "hide".to_owned()
+            } else {
+                "restore".to_owned()
+            });
+            fields.push(targets.len().to_string());
+            for target in targets {
+                fields.extend(encode_stroke_ref_fields(target, version));
+            }
+        }
+        EditCommand::Move {
+            target,
+            delta_x_raw,
+            delta_y_raw,
+            coordinate_space,
+            units,
+        } => {
+            fields.push("move".to_owned());
+            fields.extend(encode_stroke_ref_fields(target, version));
+            fields.extend([
+                delta_x_raw.to_string(),
+                delta_y_raw.to_string(),
+                encode_field(coordinate_space),
+                encode_field(units),
+            ]);
+        }
+        EditCommand::Correction {
+            target,
+            corrected_text,
+        } => {
+            fields.push("correction".to_owned());
+            fields.extend(encode_stroke_ref_fields(target, version));
+            fields.push(encode_option_text(corrected_text.as_deref()));
+        }
+    }
     Ok(fields)
 }
 
@@ -2042,13 +3326,21 @@ fn encode_sample_fields(
     Ok(fields)
 }
 
-fn encode_stroke_ref_fields(target: &StrokeRef) -> Vec<String> {
-    vec![
+fn encode_stroke_ref_fields(target: &StrokeRef, version: u32) -> Vec<String> {
+    let mut fields = Vec::new();
+    if version >= JOURNAL_SCHEMA_VERSION {
+        fields.extend([
+            encode_field(&target.journal_id),
+            encode_field(&target.session_id),
+        ]);
+    }
+    fields.extend([
         encode_field(&target.source_api),
         encode_option_text(target.device_id.as_deref()),
         opt_u64(target.pointer_id),
         encode_field(&target.stroke_id),
-    ]
+    ]);
+    fields
 }
 
 fn encode_metadata_fields(tag: &str, sequence: u64, metadata: &JournalMetadata) -> Vec<String> {
@@ -2100,80 +3392,257 @@ fn parse_metadata_fields(fields: &[&str]) -> Result<JournalMetadata, JournalErro
     Ok(metadata)
 }
 
-fn parse_record_fields(version: u32, fields: &[&str]) -> Result<JournalRecord, JournalError> {
+fn parse_record_fields(
+    version: u32,
+    fields: &[&str],
+    header: &JournalHeader,
+) -> Result<JournalRecord, JournalError> {
     let tag = fields
         .first()
+        .copied()
         .ok_or_else(|| JournalError::invalid("empty journal record"))?;
-    match *tag {
-        "P" => {
-            let sample = parse_sample_fields(fields, version)?;
-            let sequence = parse_u64(fields[1], "sample event sequence")?;
-            Ok(JournalRecord {
-                sequence,
-                event: JournalEvent::PhysicalSample(Box::new(sample)),
-            })
+    let (app_epoch_id, body_fields) = if version >= JOURNAL_SCHEMA_VERSION {
+        require_at_least_fields(fields, 3, tag)?;
+        let app_epoch_id = decode_field(fields[2])?;
+        let mut shifted = Vec::new();
+        shifted
+            .try_reserve(fields.len().saturating_sub(1))
+            .map_err(JournalError::allocation)?;
+        shifted.extend_from_slice(&fields[..2]);
+        shifted.extend_from_slice(&fields[3..]);
+        (app_epoch_id, shifted)
+    } else {
+        (header.session_id.clone(), fields.to_vec())
+    };
+    let fields = body_fields.as_slice();
+    let sequence = || parse_u64(fields[1], "journal event sequence");
+    let stroke_ref_width = if version >= JOURNAL_SCHEMA_VERSION {
+        6
+    } else {
+        4
+    };
+
+    let event = match fields
+        .first()
+        .copied()
+        .ok_or_else(|| JournalError::invalid("empty journal record"))?
+    {
+        "P" => JournalEvent::PhysicalSample(Box::new(parse_sample_fields(
+            fields,
+            if version >= JOURNAL_SCHEMA_VERSION {
+                PREVIOUS_JOURNAL_SCHEMA_VERSION
+            } else {
+                version
+            },
+        )?)),
+        "META" => JournalEvent::Metadata(parse_metadata_fields(fields)?),
+        "EPOCH" if version >= JOURNAL_SCHEMA_VERSION => {
+            require_fields(fields, 6, "EPOCH")?;
+            JournalEvent::SessionEpochStarted {
+                epoch: SessionEpoch {
+                    session_id: app_epoch_id.clone(),
+                    started_at_unix_ns: parse_option_u128(
+                        fields[3],
+                        "session epoch wall-clock start",
+                    )?,
+                    config_id: decode_option_text(fields[4])?,
+                    provenance: decode_field(fields[5])?,
+                },
+                app_arrival_elapsed_ns: parse_u128(fields[2], "session epoch app arrival")?,
+            }
         }
-        "META" => {
-            let metadata = parse_metadata_fields(fields)?;
-            Ok(JournalRecord {
-                sequence: parse_u64(fields[1], "metadata event sequence")?,
-                event: JournalEvent::Metadata(metadata),
-            })
+        "ACT" if version >= JOURNAL_SCHEMA_VERSION => {
+            require_at_least_fields(fields, 6, "ACT")?;
+            let revision_id = parse_u64(fields[2], "edit action revision")?;
+            let app_arrival_elapsed_ns = parse_u128(fields[3], "edit action app arrival")?;
+            let action_id = parse_u64(fields[4], "edit action ID")?;
+            let kind = fields[5];
+            let command = match kind {
+                "hide" | "restore" => {
+                    require_at_least_fields(fields, 7, "ACT targets")?;
+                    let target_count = parse_usize(fields[6], "edit target count")?;
+                    if target_count == 0 || target_count > MAX_EDIT_TARGETS {
+                        return Err(JournalError::limit(
+                            "edit target count is empty or exceeds the configured cap",
+                        ));
+                    }
+                    let expected_fields = 7usize
+                        .checked_add(target_count.saturating_mul(stroke_ref_width))
+                        .ok_or_else(|| JournalError::limit("edit target row width overflow"))?;
+                    require_fields(fields, expected_fields, "ACT targets")?;
+                    let mut targets = Vec::new();
+                    targets
+                        .try_reserve_exact(target_count)
+                        .map_err(JournalError::allocation)?;
+                    for index in 0..target_count {
+                        let start = 7 + index * stroke_ref_width;
+                        targets.push(parse_stroke_ref_fields(
+                            fields,
+                            start,
+                            version,
+                            &header.journal_id,
+                            &header.session_id,
+                        )?);
+                    }
+                    if kind == "hide" {
+                        EditCommand::Tombstone { targets }
+                    } else {
+                        EditCommand::Restore { targets }
+                    }
+                }
+                "move" => {
+                    let expected_fields = 6 + stroke_ref_width + 4;
+                    require_fields(fields, expected_fields, "ACT move")?;
+                    let start = 6;
+                    EditCommand::Move {
+                        target: parse_stroke_ref_fields(
+                            fields,
+                            start,
+                            version,
+                            &header.journal_id,
+                            &header.session_id,
+                        )?,
+                        delta_x_raw: parse_i64(
+                            fields[start + stroke_ref_width],
+                            "edit move delta x",
+                        )?,
+                        delta_y_raw: parse_i64(
+                            fields[start + stroke_ref_width + 1],
+                            "edit move delta y",
+                        )?,
+                        coordinate_space: decode_field(fields[start + stroke_ref_width + 2])?,
+                        units: decode_field(fields[start + stroke_ref_width + 3])?,
+                    }
+                }
+                "correction" => {
+                    let expected_fields = 6 + stroke_ref_width + 1;
+                    require_fields(fields, expected_fields, "ACT correction")?;
+                    EditCommand::Correction {
+                        target: parse_stroke_ref_fields(
+                            fields,
+                            6,
+                            version,
+                            &header.journal_id,
+                            &header.session_id,
+                        )?,
+                        corrected_text: decode_option_text(fields[6 + stroke_ref_width])?,
+                    }
+                }
+                other => {
+                    return Err(JournalError::invalid(format!(
+                        "unknown edit action kind {other:?}"
+                    )));
+                }
+            };
+            JournalEvent::EditAction {
+                action_id,
+                revision_id,
+                app_arrival_elapsed_ns,
+                command,
+            }
+        }
+        "UNDO" | "REDO" if version >= JOURNAL_SCHEMA_VERSION => {
+            require_fields(fields, 5, "undo/redo")?;
+            let action_id = parse_u64(fields[4], "undo/redo target action ID")?;
+            let revision_id = parse_u64(fields[2], "undo/redo revision")?;
+            let app_arrival_elapsed_ns = parse_u128(fields[3], "undo/redo app arrival")?;
+            if fields[0] == "UNDO" {
+                JournalEvent::Undo {
+                    action_id,
+                    revision_id,
+                    app_arrival_elapsed_ns,
+                }
+            } else {
+                JournalEvent::Redo {
+                    action_id,
+                    revision_id,
+                    app_arrival_elapsed_ns,
+                }
+            }
+        }
+        "MIGR" if version >= JOURNAL_SCHEMA_VERSION => {
+            require_fields(fields, 7, "MIGR")?;
+            JournalEvent::MigrationProvenance {
+                app_arrival_elapsed_ns: parse_option_u128(fields[2], "migration app arrival")?,
+                source_schema_version: parse_u32(fields[3], "migration source schema")?,
+                source_journal_id: decode_field(fields[4])?,
+                source_prefix_fingerprint: parse_hex_u64(fields[5], "migration source prefix")?,
+                source_record_count: parse_u64(fields[6], "migration source record count")?,
+            }
         }
         "REV" => {
             require_fields(fields, 6, "REV")?;
-            Ok(JournalRecord {
-                sequence: parse_u64(fields[1], "revision event sequence")?,
-                event: JournalEvent::Revision {
-                    app_arrival_elapsed_ns: parse_u128(fields[2], "revision app arrival")?,
-                    revision_id: parse_u64(fields[3], "logical revision ID")?,
-                    parent_revision: parse_u64(fields[4], "parent logical revision")?,
-                    note: decode_field(fields[5])?,
-                },
-            })
+            JournalEvent::Revision {
+                app_arrival_elapsed_ns: parse_u128(fields[2], "revision app arrival")?,
+                revision_id: parse_u64(fields[3], "logical revision ID")?,
+                parent_revision: parse_u64(fields[4], "parent logical revision")?,
+                note: decode_field(fields[5])?,
+            }
         }
         "TOMB" => {
-            require_fields(fields, 8, "TOMB")?;
-            Ok(JournalRecord {
-                sequence: parse_u64(fields[1], "tombstone sequence")?,
-                event: JournalEvent::Tombstone {
-                    app_arrival_elapsed_ns: parse_u128(fields[2], "tombstone app arrival")?,
-                    logical_revision: parse_u64(fields[3], "tombstone revision")?,
-                    target: parse_stroke_ref_fields(fields, 4)?,
-                },
-            })
+            require_fields(fields, 4 + stroke_ref_width, "TOMB")?;
+            JournalEvent::Tombstone {
+                app_arrival_elapsed_ns: parse_u128(fields[2], "tombstone app arrival")?,
+                logical_revision: parse_u64(fields[3], "tombstone revision")?,
+                target: parse_stroke_ref_fields(
+                    fields,
+                    4,
+                    version,
+                    &header.journal_id,
+                    &header.session_id,
+                )?,
+            }
         }
         "MOVE" => {
-            require_fields(fields, 12, "MOVE")?;
-            Ok(JournalRecord {
-                sequence: parse_u64(fields[1], "move sequence")?,
-                event: JournalEvent::StrokeMove {
-                    app_arrival_elapsed_ns: parse_u128(fields[2], "move app arrival")?,
-                    logical_revision: parse_u64(fields[3], "move revision")?,
-                    target: parse_stroke_ref_fields(fields, 4)?,
-                    delta_x_raw: parse_i64(fields[8], "move delta x")?,
-                    delta_y_raw: parse_i64(fields[9], "move delta y")?,
-                    coordinate_space: decode_field(fields[10])?,
-                    units: decode_field(fields[11])?,
-                },
-            })
+            let target_start = 4;
+            let expected_fields = target_start + stroke_ref_width + 4;
+            require_fields(fields, expected_fields, "MOVE")?;
+            JournalEvent::StrokeMove {
+                app_arrival_elapsed_ns: parse_u128(fields[2], "move app arrival")?,
+                logical_revision: parse_u64(fields[3], "move revision")?,
+                target: parse_stroke_ref_fields(
+                    fields,
+                    target_start,
+                    version,
+                    &header.journal_id,
+                    &header.session_id,
+                )?,
+                delta_x_raw: parse_i64(fields[target_start + stroke_ref_width], "move delta x")?,
+                delta_y_raw: parse_i64(
+                    fields[target_start + stroke_ref_width + 1],
+                    "move delta y",
+                )?,
+                coordinate_space: decode_field(fields[target_start + stroke_ref_width + 2])?,
+                units: decode_field(fields[target_start + stroke_ref_width + 3])?,
+            }
         }
         "CORR" => {
-            require_fields(fields, 9, "CORR")?;
-            Ok(JournalRecord {
-                sequence: parse_u64(fields[1], "correction sequence")?,
-                event: JournalEvent::UserCorrection {
-                    app_arrival_elapsed_ns: parse_u128(fields[2], "correction app arrival")?,
-                    logical_revision: parse_u64(fields[3], "correction revision")?,
-                    target: parse_stroke_ref_fields(fields, 4)?,
-                    corrected_text: decode_field(fields[8])?,
-                },
-            })
+            let expected_fields = 4 + stroke_ref_width + 1;
+            require_fields(fields, expected_fields, "CORR")?;
+            JournalEvent::UserCorrection {
+                app_arrival_elapsed_ns: parse_u128(fields[2], "correction app arrival")?,
+                logical_revision: parse_u64(fields[3], "correction revision")?,
+                target: parse_stroke_ref_fields(
+                    fields,
+                    4,
+                    version,
+                    &header.journal_id,
+                    &header.session_id,
+                )?,
+                corrected_text: decode_field(fields[4 + stroke_ref_width])?,
+            }
         }
-        other => Err(JournalError::invalid(format!(
-            "unknown journal record tag {other:?}"
-        ))),
-    }
+        other => {
+            return Err(JournalError::invalid(format!(
+                "unknown journal record tag {other:?}"
+            )));
+        }
+    };
+    Ok(JournalRecord {
+        sequence: sequence()?,
+        app_epoch_id,
+        event,
+    })
 }
 
 fn parse_sample_fields(fields: &[&str], version: u32) -> Result<PhysicalSample, JournalError> {
@@ -2318,12 +3787,33 @@ fn parse_optional_native_timestamp(
     }))
 }
 
-fn parse_stroke_ref_fields(fields: &[&str], start: usize) -> Result<StrokeRef, JournalError> {
+fn parse_stroke_ref_fields(
+    fields: &[&str],
+    start: usize,
+    version: u32,
+    journal_id: &str,
+    default_session_id: &str,
+) -> Result<StrokeRef, JournalError> {
+    let (target_journal_id, target_session_id, source_offset) = if version >= JOURNAL_SCHEMA_VERSION
+    {
+        (
+            decode_field(fields[start])?,
+            decode_field(fields[start + 1])?,
+            2,
+        )
+    } else {
+        (journal_id.to_owned(), default_session_id.to_owned(), 0)
+    };
     let target = StrokeRef {
-        source_api: decode_field(fields[start])?,
-        device_id: decode_option_text(fields[start + 1])?,
-        pointer_id: parse_option_u64(fields[start + 2], "logical target pointer ID")?,
-        stroke_id: decode_field(fields[start + 3])?,
+        journal_id: target_journal_id,
+        session_id: target_session_id,
+        source_api: decode_field(fields[start + source_offset])?,
+        device_id: decode_option_text(fields[start + source_offset + 1])?,
+        pointer_id: parse_option_u64(
+            fields[start + source_offset + 2],
+            "logical target pointer ID",
+        )?,
+        stroke_id: decode_field(fields[start + source_offset + 3])?,
     };
     if target.source_api.is_empty() || target.stroke_id.is_empty() {
         return Err(JournalError::invalid(
@@ -2407,6 +3897,10 @@ fn decode_option_text(value: &str) -> Result<Option<String>, JournalError> {
 }
 
 fn opt_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "~".to_owned(), |value| value.to_string())
+}
+
+fn opt_u128(value: Option<u128>) -> String {
     value.map_or_else(|| "~".to_owned(), |value| value.to_string())
 }
 
@@ -2505,10 +3999,24 @@ fn parse_u64(value: &str, name: &str) -> Result<u64, JournalError> {
         .map_err(|_| JournalError::invalid(format!("invalid {name}: {value:?}")))
 }
 
+fn parse_usize(value: &str, name: &str) -> Result<usize, JournalError> {
+    value
+        .parse()
+        .map_err(|_| JournalError::invalid(format!("invalid {name}: {value:?}")))
+}
+
 fn parse_u128(value: &str, name: &str) -> Result<u128, JournalError> {
     value
         .parse()
         .map_err(|_| JournalError::invalid(format!("invalid {name}: {value:?}")))
+}
+
+fn parse_option_u128(value: &str, name: &str) -> Result<Option<u128>, JournalError> {
+    if value == "~" {
+        Ok(None)
+    } else {
+        parse_u128(value, name).map(Some)
+    }
 }
 
 fn parse_option_u64(value: &str, name: &str) -> Result<Option<u64>, JournalError> {
@@ -2534,6 +4042,16 @@ fn parse_option_bool(value: &str, name: &str) -> Result<Option<bool>, JournalErr
         "false" => Ok(Some(false)),
         _ => Err(JournalError::invalid(format!(
             "invalid {name} declaration: {value:?}"
+        ))),
+    }
+}
+
+fn parse_bool(value: &str, name: &str) -> Result<bool, JournalError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(JournalError::invalid(format!(
+            "invalid {name} value: {value:?}"
         ))),
     }
 }
@@ -2668,8 +4186,8 @@ mod tests {
         }
     }
 
-    fn target_of(sample: &PhysicalSample) -> StrokeRef {
-        sample.stroke_ref().unwrap()
+    fn target_of(sample: &PhysicalSample, journal_id: &str) -> StrokeRef {
+        sample.stroke_ref(journal_id).unwrap()
     }
 
     fn cleanup_journal(path: &Path) {
@@ -2889,7 +4407,7 @@ mod tests {
         let path = temp_path("logical");
         let mut writer = JournalWriter::create(path.clone(), header("journal-logical")).unwrap();
         let original = sample("wintab", "stroke-a", 1, 100, Some(50), true, 10);
-        let target = target_of(&original);
+        let target = target_of(&original, "journal-logical");
         writer.append_sample(original).unwrap();
         let revision = writer
             .begin_revision(200, "move and annotate".to_owned())
@@ -2949,6 +4467,183 @@ mod tests {
     }
 
     #[test]
+    fn resumed_epoch_and_identity_scoped_targets_do_not_merge_colliding_strokes() {
+        let path = temp_path("resume-epoch");
+        let journal_header = header("journal-resume-epoch");
+        let mut writer = JournalWriter::create(path.clone(), journal_header.clone()).unwrap();
+        let first = sample(
+            "direct-wm-pointer",
+            "same-label",
+            1,
+            100,
+            Some(900),
+            true,
+            10,
+        );
+        let old_target = target_of(&first, &journal_header.journal_id);
+        writer.append_sample(first.clone()).unwrap();
+
+        writer
+            .begin_session_epoch(
+                "session-2".to_owned(),
+                1_800_000_000_000_000_000,
+                Some("cfg-b".to_owned()),
+                "resumed-process-new-Instant-origin".to_owned(),
+            )
+            .unwrap();
+        let mut second = sample("direct-wm-pointer", "same-label", 1, 5, Some(10), true, 20);
+        second.session_id = "session-2".to_owned();
+        second.config_id = Some("cfg-b".to_owned());
+        let new_target = target_of(&second, &journal_header.journal_id);
+        assert_ne!(old_target, new_target);
+        writer.append_sample(second.clone()).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let parsed = read_journal(&path).unwrap();
+        assert_eq!(parsed.state.session_epochs.len(), 2);
+        assert_eq!(parsed.state.current_session_id, "session-2");
+        assert_eq!(parsed.state.physical_samples.len(), 2);
+        assert_eq!(parsed.state.physical_samples[0].sample, first);
+        assert_eq!(parsed.state.physical_samples[1].sample, second);
+        assert_eq!(parsed.state.stroke_domains.len(), 2);
+        let visible = parsed.state.projected_samples().unwrap();
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].stroke_ref.as_ref(), Some(&old_target));
+        assert_eq!(visible[1].stroke_ref.as_ref(), Some(&new_target));
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn erase_undo_redo_restore_is_append_only_and_targets_the_old_epoch() {
+        let path = temp_path("undo-redo-epochs");
+        let journal_header = header("journal-undo-redo-epochs");
+        let snapshot_path = default_snapshot_path(&path);
+        let mut writer = JournalWriter::create(path.clone(), journal_header.clone()).unwrap();
+        let old_sample = sample(
+            "direct-wm-pointer",
+            "collision",
+            1,
+            100,
+            Some(100),
+            true,
+            10,
+        );
+        let old_target = target_of(&old_sample, &journal_header.journal_id);
+        writer.append_sample(old_sample.clone()).unwrap();
+        writer
+            .begin_session_epoch(
+                "session-2".to_owned(),
+                1_800_000_001_000_000_000,
+                Some("cfg-b".to_owned()),
+                "resumed-process".to_owned(),
+            )
+            .unwrap();
+        let mut new_sample = sample("direct-wm-pointer", "collision", 1, 1, Some(1), true, 50);
+        new_sample.session_id = "session-2".to_owned();
+        new_sample.config_id = Some("cfg-b".to_owned());
+        let new_target = target_of(&new_sample, &journal_header.journal_id);
+        writer.append_sample(new_sample.clone()).unwrap();
+        assert_ne!(old_target, new_target);
+        writer.write_snapshot(&snapshot_path).unwrap();
+
+        let action_id = writer
+            .apply_edit_action(
+                2,
+                EditCommand::Tombstone {
+                    targets: vec![old_target.clone()],
+                },
+            )
+            .unwrap();
+        assert_eq!(writer.state.projected_samples().unwrap().len(), 1);
+        assert_eq!(writer.undo_last_edit(3).unwrap(), action_id);
+        assert_eq!(writer.state.projected_samples().unwrap().len(), 2);
+        assert_eq!(writer.redo_last_edit(4).unwrap(), action_id);
+        assert_eq!(writer.state.projected_samples().unwrap().len(), 1);
+
+        let restore_id = writer
+            .apply_edit_action(
+                5,
+                EditCommand::Restore {
+                    targets: vec![old_target.clone()],
+                },
+            )
+            .unwrap();
+        assert_ne!(restore_id, action_id);
+        assert_eq!(writer.state.projected_samples().unwrap().len(), 2);
+        assert_eq!(writer.undo_last_edit(6).unwrap(), restore_id);
+        assert_eq!(writer.state.projected_samples().unwrap().len(), 1);
+        assert_eq!(writer.redo_last_edit(7).unwrap(), restore_id);
+        assert_eq!(writer.state.projected_samples().unwrap().len(), 2);
+        writer.flush().unwrap();
+        drop(writer);
+
+        let full = read_journal(&path).unwrap();
+        let snapshot = load_with_snapshot(&path, &snapshot_path).unwrap();
+        assert_eq!(snapshot.disposition, SnapshotDisposition::Used);
+        assert_eq!(snapshot.state, full.state);
+        assert_eq!(full.state.physical_samples.len(), 2);
+        assert_eq!(full.state.edit_actions.len(), 2);
+        assert_eq!(full.state.edit_controls.len(), 4);
+        assert!(full.state.edit_actions.iter().all(|action| action.active));
+        assert_eq!(full.state.logical_revision, 6);
+        assert_eq!(
+            full.state
+                .physical_samples
+                .iter()
+                .map(|stored| stored.sample.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["session-1", "session-2"]
+        );
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn interrupted_multi_stroke_action_is_not_partially_visible() {
+        let path = temp_path("interrupted-edit");
+        let journal_header = header("journal-interrupted-edit");
+        let mut writer = JournalWriter::create(path.clone(), journal_header.clone()).unwrap();
+        let first = sample("direct-wm-pointer", "first", 1, 10, Some(1), true, 1);
+        let second = sample("direct-wm-pointer", "second", 2, 20, Some(2), true, 2);
+        let first_target = target_of(&first, &journal_header.journal_id);
+        let second_target = target_of(&second, &journal_header.journal_id);
+        writer.append_sample(first).unwrap();
+        writer.append_sample(second).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let mut torn = OpenOptions::new().append(true).open(&path).unwrap();
+        torn.write_all(b"ACT\t3\tapp-epoch\t1\t30\t3\thide\t2\t")
+            .unwrap();
+        drop(torn);
+        let before_recovery = read_journal(&path).unwrap();
+        assert!(before_recovery.recovery.truncated_final_record);
+        assert_eq!(before_recovery.state.physical_samples.len(), 2);
+        assert_eq!(before_recovery.state.projected_samples().unwrap().len(), 2);
+        assert!(before_recovery.state.edit_actions.is_empty());
+
+        let mut recovered = JournalWriter::open_append(path.clone()).unwrap();
+        assert!(recovered.recovered_truncated_final_record());
+        assert_eq!(recovered.state.projected_samples().unwrap().len(), 2);
+        recovered
+            .apply_edit_action(
+                30,
+                EditCommand::Tombstone {
+                    targets: vec![first_target, second_target],
+                },
+            )
+            .unwrap();
+        assert!(recovered.state.projected_samples().unwrap().is_empty());
+        drop(recovered);
+
+        let after = read_journal(&path).unwrap();
+        assert_eq!(after.state.physical_samples.len(), 2);
+        assert_eq!(after.state.edit_actions.len(), 1);
+        assert_eq!(after.state.projected_samples().unwrap().len(), 0);
+        cleanup_journal(&path);
+    }
+
+    #[test]
     fn duplicate_source_stroke_labels_do_not_merge_without_api_device_provenance() {
         let path = temp_path("partition");
         let mut writer = JournalWriter::create(path.clone(), header("journal-partition")).unwrap();
@@ -2973,6 +4668,8 @@ mod tests {
             .tombstone(
                 31,
                 StrokeRef {
+                    journal_id: "journal-partition".to_owned(),
+                    session_id: "session-1".to_owned(),
                     source_api: "direct-wm-pointer".to_owned(),
                     device_id: Some("device-a".to_owned()),
                     pointer_id: Some(7),
@@ -3126,7 +4823,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_one_migration_writes_new_identity_without_mutating_source() {
+    fn schema_one_migration_preserves_identity_raw_history_and_source_bytes() {
         let source_path = temp_path("legacy-migration-source");
         let destination_path = temp_path("legacy-migration-destination");
         let legacy_header = header("legacy-migration-id");
@@ -3153,12 +4850,7 @@ mod tests {
         );
         fs::write(&source_path, &source_bytes).unwrap();
 
-        let result = migrate_schema_one_to_two(
-            &source_path,
-            destination_path.clone(),
-            "migrated-journal-id".to_owned(),
-        )
-        .unwrap();
+        let result = migrate_schema_one_to_three(&source_path, destination_path.clone()).unwrap();
         let mut migrated_writer = JournalWriter::open_append(destination_path.clone()).unwrap();
         migrated_writer
             .append_metadata(JournalMetadata {
@@ -3183,7 +4875,9 @@ mod tests {
         assert_eq!(result.migrated_records, 1);
         assert!(!result.source_truncated_final_record);
         assert_eq!(migrated.schema_version, JOURNAL_SCHEMA_VERSION);
-        assert_eq!(migrated.header.journal_id, "migrated-journal-id");
+        assert_eq!(migrated.header.journal_id, "legacy-migration-id");
+        assert_eq!(result.source_journal_id, result.destination_journal_id);
+        assert_eq!(migrated.records[0].app_epoch_id, "session-1");
         assert_eq!(migrated.header.config_id, Some("cfg-a".to_owned()));
         assert_eq!(
             migrated.header.device_model_declared,
@@ -3191,6 +4885,13 @@ mod tests {
         );
         assert_eq!(migrated.header.tilt_supported_declared, None);
         assert_eq!(sample.source_sequence, legacy_sample.source_sequence);
+        assert_eq!(sample.session_id, legacy_sample.session_id);
+        assert_eq!(
+            sample.app_arrival_elapsed_ns,
+            legacy_sample.app_arrival_elapsed_ns
+        );
+        assert_eq!(sample.position, legacy_sample.position);
+        assert_eq!(sample.native_timestamp, legacy_sample.native_timestamp);
         assert_eq!(sample.raw_payload, legacy_sample.raw_payload);
         assert_eq!(sample.pressure.as_ref().unwrap().mask_raw, None);
         assert_eq!(sample.tilt_x_raw, None);
@@ -3200,9 +4901,102 @@ mod tests {
             migrated.state.metadata_history[0].metadata.key,
             "migration-source-schema"
         );
+        assert_eq!(migrated.state.migration_provenance.len(), 1);
+        assert_eq!(
+            migrated.state.migration_provenance[0].source_journal_id,
+            "legacy-migration-id"
+        );
         assert_eq!(preserved_source, source_bytes);
         fs::remove_file(source_path).unwrap();
         fs::remove_file(destination_path).unwrap();
+    }
+
+    #[test]
+    fn schema_two_to_three_migration_preserves_raw_order_and_logical_view() {
+        let source_path = temp_path("schema-two-source");
+        let destination_path = temp_path("schema-two-migrated");
+        let legacy_header = header("project-schema-two");
+        let first = sample(
+            "direct-wm-pointer",
+            "legacy-stroke",
+            1,
+            100,
+            Some(900),
+            true,
+            10,
+        );
+        let target = target_of(&first, &legacy_header.journal_id);
+
+        let mut source_bytes = encode_row(&encode_header_fields(
+            &legacy_header,
+            PREVIOUS_JOURNAL_SCHEMA_VERSION,
+        ))
+        .unwrap();
+        let first_row = encode_row(
+            &encode_sample_fields("P", 1, &first, PREVIOUS_JOURNAL_SCHEMA_VERSION).unwrap(),
+        )
+        .unwrap();
+        source_bytes.extend_from_slice(&first_row);
+        for record in [
+            JournalRecord {
+                sequence: 2,
+                app_epoch_id: legacy_header.session_id.clone(),
+                event: JournalEvent::Revision {
+                    revision_id: 1,
+                    parent_revision: 0,
+                    app_arrival_elapsed_ns: 110,
+                    note: "legacy delete revision".to_owned(),
+                },
+            },
+            JournalRecord {
+                sequence: 3,
+                app_epoch_id: legacy_header.session_id.clone(),
+                event: JournalEvent::Tombstone {
+                    logical_revision: 1,
+                    app_arrival_elapsed_ns: 120,
+                    target,
+                },
+            },
+        ] {
+            source_bytes.extend_from_slice(
+                &encode_row(
+                    &encode_record_fields(&record, PREVIOUS_JOURNAL_SCHEMA_VERSION).unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        fs::write(&source_path, &source_bytes).unwrap();
+
+        let before = read_journal(&source_path).unwrap();
+        assert_eq!(before.schema_version, PREVIOUS_JOURNAL_SCHEMA_VERSION);
+        assert!(before.state.projected_samples().unwrap().is_empty());
+        let result = migrate_schema_two_to_three(&source_path, destination_path.clone()).unwrap();
+        let after = read_journal(&destination_path).unwrap();
+        let source_after = fs::read(&source_path).unwrap();
+
+        assert_eq!(result.migrated_records, 3);
+        assert_eq!(result.source_journal_id, "project-schema-two");
+        assert_eq!(result.destination_journal_id, result.source_journal_id);
+        assert_eq!(after.schema_version, JOURNAL_SCHEMA_VERSION);
+        assert_eq!(after.header.journal_id, before.header.journal_id);
+        assert_eq!(after.header.session_id, before.header.session_id);
+        assert_eq!(after.records[0].sequence, 1);
+        assert_eq!(after.records[0].app_epoch_id, before.header.session_id);
+        let JournalEvent::PhysicalSample(migrated_sample) = &after.records[0].event else {
+            panic!("first migrated source row remains physical history");
+        };
+        assert_eq!(migrated_sample.as_ref(), &first);
+        assert_eq!(after.state.logical_revision, before.state.logical_revision);
+        assert_eq!(
+            after.state.projected_samples().unwrap(),
+            before.state.projected_samples().unwrap()
+        );
+        assert_eq!(after.state.physical_samples.len(), 1);
+        assert_eq!(after.state.migration_provenance.len(), 1);
+        assert_eq!(after.state.migration_provenance[0].source_record_count, 3);
+        assert_eq!(source_after, source_bytes);
+        cleanup_journal(&source_path);
+        cleanup_journal(&destination_path);
     }
 
     #[test]
@@ -3220,7 +5014,7 @@ mod tests {
 
         let valid_sample = sample("direct-wm-pointer", "stroke-a", 1, 20, Some(6), true, 2);
         assert_eq!(writer.append_sample(valid_sample.clone()).unwrap(), 1);
-        let target = target_of(&valid_sample);
+        let target = target_of(&valid_sample, "journal-oversized-fields");
         assert_eq!(writer.begin_revision(21, "edit".to_owned()).unwrap(), 1);
 
         let oversized_metadata = JournalMetadata {
@@ -3509,7 +5303,7 @@ mod tests {
         let snapshot_path = default_snapshot_path(&path);
         let mut writer = JournalWriter::create(path.clone(), header("journal-snapshot")).unwrap();
         let first = sample("direct-wm-pointer", "stroke-a", 1, 10, Some(5), true, 10);
-        let target = target_of(&first);
+        let target = target_of(&first, "journal-snapshot");
         writer.append_sample(first).unwrap();
         let revision = writer
             .begin_revision(20, "logical edit".to_owned())
@@ -3668,7 +5462,7 @@ mod tests {
     #[test]
     fn short_snapshot_state_rows_reject_and_malformed_snapshot_falls_back() {
         let snapshot_header =
-            b"LASSOINK-SNAPSHOT\t1\tjournal-short-smd\t0\t0\t0\t0000000000000000\t0000000000000000\n";
+            b"LASSOINK-SNAPSHOT\t2\tjournal-short-smd\t0\t0\t0\t0000000000000000\t0000000000000000\n";
         for malformed_tag in ["SP", "SMD", "ST", "SM", "SC"] {
             let mut bytes = snapshot_header.to_vec();
             bytes.extend_from_slice(format!("{malformed_tag}\n").as_bytes());
@@ -3698,7 +5492,7 @@ mod tests {
         let full = read_journal(&path).unwrap();
 
         let mut malformed_snapshot =
-            b"LASSOINK-SNAPSHOT\t1\tjournal-short-smd-source\t0\t0\t0\t0000000000000000\t0000000000000000\n"
+            b"LASSOINK-SNAPSHOT\t2\tjournal-short-smd-source\t0\t0\t0\t0000000000000000\t0000000000000000\n"
                 .to_vec();
         malformed_snapshot.extend_from_slice(b"SMD\n");
         fs::write(&snapshot_path, malformed_snapshot).unwrap();
