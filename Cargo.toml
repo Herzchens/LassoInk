@@ -1,0 +1,24 @@
+[package]
+name = "lassoink-capture-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "Apache-2.0"
+description = "Winit diagnostic for the LassoInk Gate 0 Windows pen capture comparison"
+publish = false
+
+[dependencies]
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "=0.52.0", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Input_Pointer",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
