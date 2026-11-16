@@ -1,0 +1,3232 @@
+//! Versioned, source-agnostic recognition worker protocol for M4.
+//!
+//! This module defines a bounded local JSON/stdio boundary only. It does not
+//! register or ship a recognition provider, write results into the project
+//! journal, or select a capture source. Callers must supply an explicit
+//! operator-approved absolute executable path; project metadata is never a
+//! launch configuration source.
+
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    error::Error,
+    fmt,
+    io::{self, Read, Write},
+    path::PathBuf,
+    process::{Child, Command, ExitStatus, Stdio},
+    marker::PhantomData,
+    rc::Rc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    },
+    panic::AssertUnwindSafe,
+    thread,
+    time::{Duration, Instant},
+};
+
+use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError, de::SeqAccess, de::Visitor};
+use serde_json::Value;
+
+use crate::journal::{
+    JournalReplayState, NativeTimestamp, PhysicalSample, RawPosition, RawPressure, StrokeRef,
+    StrokeViewFrame,
+};
+
+pub(crate) const PROVIDER_PROTOCOL_VERSION: u32 = 1;
+const MAX_HANDSHAKE_FRAME_BYTES: usize = 64 * 1024;
+const MAX_REQUEST_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RESPONSE_FRAME_BYTES: usize = 2 * 1024 * 1024;
+const MAX_STDERR_BYTES: usize = 64 * 1024;
+const MAX_PROVIDER_STROKES: usize = 512;
+const MAX_PROVIDER_SAMPLES: usize = 4096;
+const MAX_PROVIDER_CANDIDATES: usize = 128;
+const MAX_PROVIDER_STROKE_RANGES: usize = 256;
+const MAX_RAW_SAMPLE_BYTES: usize = 8192;
+const MAX_TOTAL_RAW_SAMPLE_BYTES: usize = 1 * 1024 * 1024;
+const MAX_ID_BYTES: usize = 256;
+const MAX_TEXT_BYTES: usize = 4096;
+const MAX_LANGUAGE_HINTS: usize = 16;
+const MAX_LANGUAGE_TAG_BYTES: usize = 32;
+const MAX_SETTINGS: usize = 128;
+const MAX_SETTING_KEY_BYTES: usize = 128;
+const MAX_SETTING_VALUE_BYTES: usize = 2048;
+const MAX_ARGUMENTS: usize = 64;
+const MAX_ARGUMENT_BYTES: usize = 2048;
+const IO_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CHILD_CLEANUP_GRACE: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderSourceRevisionV1 {
+    pub journal_id: String,
+    pub logical_revision: u64,
+    pub last_sequence: u64,
+}
+
+impl ProviderSourceRevisionV1 {
+    pub(crate) fn from_journal(state: &JournalReplayState) -> Self {
+        Self {
+            journal_id: state.journal_id.clone(),
+            logical_revision: state.logical_revision,
+            last_sequence: state.last_sequence,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ProviderErrorKind> {
+        validate_text(&self.journal_id, MAX_ID_BYTES, "journal ID")?;
+        if self.journal_id.is_empty() {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "source journal ID must not be empty".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderConfigurationV1 {
+    pub configuration_id: String,
+    pub values: BTreeMap<String, String>,
+}
+
+impl ProviderConfigurationV1 {
+    fn validate(&self) -> Result<(), ProviderErrorKind> {
+        validate_text(&self.configuration_id, MAX_ID_BYTES, "provider config ID")?;
+        if self.configuration_id.is_empty() || self.values.len() > MAX_SETTINGS {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "provider configuration is empty or exceeds its entry cap".to_owned(),
+            ));
+        }
+        let mut total_bytes = self.configuration_id.len();
+        for (key, value) in &self.values {
+            validate_text(key, MAX_SETTING_KEY_BYTES, "provider setting key")?;
+            validate_text(value, MAX_SETTING_VALUE_BYTES, "provider setting value")?;
+            if key.is_empty() {
+                return Err(ProviderErrorKind::InvalidRequest(
+                    "provider setting keys must not be empty".to_owned(),
+                ));
+            }
+            total_bytes = total_bytes
+                .checked_add(key.len())
+                .and_then(|total| total.checked_add(value.len()))
+                .ok_or_else(|| {
+                    ProviderErrorKind::InvalidRequest(
+                        "provider configuration size overflow".to_owned(),
+                    )
+                })?;
+        }
+        if total_bytes > MAX_REQUEST_FRAME_BYTES / 4 {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "provider configuration exceeds its byte cap".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn fingerprint(&self) -> Result<String, ProviderErrorKind> {
+        self.validate()?;
+        let bytes = bounded_json_bytes(self, MAX_REQUEST_FRAME_BYTES / 4)?;
+        let hash = bytes.into_iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+        // This binds a result to the exact operator-supplied settings; it is
+        // an identifier, not an authentication or integrity signature.
+        Ok(format!("provider-config-v1-fnv64-{hash:016x}"))
+    }
+}
+
+/// This type can only be created from explicit caller-supplied configuration.
+/// There is deliberately no conversion from journal metadata or provider
+/// results, so opening a project cannot launch a metadata-selected program.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OperatorApprovedProviderConfig {
+    provider_id: String,
+    executable: PathBuf,
+    arguments: Vec<String>,
+    protocol_configuration: ProviderConfigurationV1,
+}
+
+impl OperatorApprovedProviderConfig {
+    pub(crate) fn from_explicit_selection(
+        provider_id: String,
+        executable: PathBuf,
+        arguments: Vec<String>,
+        protocol_configuration: ProviderConfigurationV1,
+    ) -> Result<Self, ProviderErrorKind> {
+        validate_text(&provider_id, MAX_ID_BYTES, "provider ID")?;
+        if provider_id.is_empty()
+            || !executable.is_absolute()
+            || executable.to_string_lossy().len() > MAX_ARGUMENT_BYTES
+        {
+            return Err(ProviderErrorKind::InvalidConfiguration(
+                "provider ID must be nonempty and executable path must be absolute and bounded"
+                    .to_owned(),
+            ));
+        }
+        if arguments.len() > MAX_ARGUMENTS
+            || arguments.iter().any(|argument| argument.len() > MAX_ARGUMENT_BYTES)
+            || arguments.iter().map(String::len).sum::<usize>() > 16 * 1024
+        {
+            return Err(ProviderErrorKind::InvalidConfiguration(
+                "provider command arguments exceed configured bounds".to_owned(),
+            ));
+        }
+        protocol_configuration.validate()?;
+        Ok(Self {
+            provider_id,
+            executable,
+            arguments,
+            protocol_configuration,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderStrokeRefV1 {
+    pub journal_id: String,
+    pub session_id: String,
+    pub source_api: String,
+    pub device_id: Option<String>,
+    pub pointer_id: Option<u64>,
+    pub stroke_id: String,
+}
+
+impl From<&StrokeRef> for ProviderStrokeRefV1 {
+    fn from(stroke: &StrokeRef) -> Self {
+        Self {
+            journal_id: stroke.journal_id.clone(),
+            session_id: stroke.session_id.clone(),
+            source_api: stroke.source_api.clone(),
+            device_id: stroke.device_id.clone(),
+            pointer_id: stroke.pointer_id,
+            stroke_id: stroke.stroke_id.clone(),
+        }
+    }
+}
+
+impl ProviderStrokeRefV1 {
+    fn validate(&self) -> Result<(), ProviderErrorKind> {
+        for (value, label) in [
+            (self.journal_id.as_str(), "stroke journal ID"),
+            (self.session_id.as_str(), "stroke session ID"),
+            (self.source_api.as_str(), "stroke source API"),
+            (self.stroke_id.as_str(), "stroke ID"),
+        ] {
+            validate_text(value, MAX_ID_BYTES, label)?;
+            if value.is_empty() {
+                return Err(ProviderErrorKind::InvalidRequest(format!(
+                    "{label} must not be empty"
+                )));
+            }
+        }
+        if let Some(device_id) = &self.device_id {
+            validate_text(device_id, MAX_ID_BYTES, "stroke device ID")?;
+            if device_id.is_empty() {
+                return Err(ProviderErrorKind::InvalidRequest(
+                    "stroke device ID must not be empty when present".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderViewFrameV1 {
+    pub screen_origin_x_px: i64,
+    pub screen_origin_y_px: i64,
+    pub dpi_scale_factor_bits: u64,
+    pub canvas_zoom_bits: u64,
+    pub canvas_pan_x_bits: u64,
+    pub canvas_pan_y_bits: u64,
+    pub toolbar_height_px: u32,
+}
+
+impl From<StrokeViewFrame> for ProviderViewFrameV1 {
+    fn from(frame: StrokeViewFrame) -> Self {
+        Self {
+            screen_origin_x_px: frame.screen_origin_x_px,
+            screen_origin_y_px: frame.screen_origin_y_px,
+            dpi_scale_factor_bits: frame.dpi_scale_factor_bits,
+            canvas_zoom_bits: frame.canvas_zoom_bits,
+            canvas_pan_x_bits: frame.canvas_pan_x_bits,
+            canvas_pan_y_bits: frame.canvas_pan_y_bits,
+            toolbar_height_px: frame.toolbar_height_px,
+        }
+    }
+}
+
+impl ProviderViewFrameV1 {
+    fn validate(self) -> Result<(), ProviderErrorKind> {
+        let dpi = f64::from_bits(self.dpi_scale_factor_bits);
+        let zoom = f64::from_bits(self.canvas_zoom_bits);
+        let pan_x = f64::from_bits(self.canvas_pan_x_bits);
+        let pan_y = f64::from_bits(self.canvas_pan_y_bits);
+        if !dpi.is_finite()
+            || dpi <= 0.0
+            || !zoom.is_finite()
+            || !(0.2..=8.0).contains(&zoom)
+            || !pan_x.is_finite()
+            || !pan_y.is_finite()
+            || self.toolbar_height_px > 4096
+        {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "stroke view frame is invalid".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderStrokeViewV1 {
+    pub stroke: ProviderStrokeRefV1,
+    /// Absent for legacy rows that have no persisted per-stroke view frame.
+    pub view_frame: Option<ProviderViewFrameV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderPositionV1 {
+    pub coordinate_space: String,
+    pub units: String,
+    pub x_raw: i64,
+    pub y_raw: i64,
+}
+
+impl From<&RawPosition> for ProviderPositionV1 {
+    fn from(position: &RawPosition) -> Self {
+        Self {
+            coordinate_space: position.coordinate_space.clone(),
+            units: position.units.clone(),
+            x_raw: position.x_raw,
+            y_raw: position.y_raw,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderPressureV1 {
+    pub representation: String,
+    pub units: String,
+    pub value_raw: u64,
+    pub mask_raw: Option<u64>,
+    pub minimum_raw: Option<u64>,
+    pub maximum_raw: Option<u64>,
+}
+
+impl From<&RawPressure> for ProviderPressureV1 {
+    fn from(pressure: &RawPressure) -> Self {
+        Self {
+            representation: pressure.representation.clone(),
+            units: pressure.units.clone(),
+            value_raw: pressure.value_raw,
+            mask_raw: pressure.mask_raw,
+            minimum_raw: pressure.minimum_raw,
+            maximum_raw: pressure.maximum_raw,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderNativeTimestampV1 {
+    pub clock_domain: String,
+    pub units: String,
+    pub count_raw: u64,
+    pub frequency_hz: Option<u64>,
+}
+
+impl From<&NativeTimestamp> for ProviderNativeTimestampV1 {
+    fn from(timestamp: &NativeTimestamp) -> Self {
+        Self {
+            clock_domain: timestamp.clock_domain.clone(),
+            units: timestamp.units.clone(),
+            count_raw: timestamp.count_raw,
+            frequency_hz: timestamp.frequency_hz,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderSampleV1 {
+    /// Canonical order in the append-only journal. Never timestamp-sorted.
+    pub journal_sequence: u64,
+    /// Original source sequence, retained separately from journal order.
+    pub source_sequence_raw: u64,
+    pub stroke: ProviderStrokeRefV1,
+    pub app_arrival_elapsed_ns_decimal: String,
+    pub config_id: Option<String>,
+    pub position: Option<ProviderPositionV1>,
+    /// Logical/document position after append-only edits. The raw sample
+    /// position above remains unchanged and separately preserved.
+    pub effective_position: Option<ProviderPositionV1>,
+    pub pressure: Option<ProviderPressureV1>,
+    pub native_timestamp: Option<ProviderNativeTimestampV1>,
+    pub contact_range_state: Option<String>,
+    pub button_state_raw: Option<u64>,
+    pub tilt_x_raw: Option<i32>,
+    pub tilt_y_raw: Option<i32>,
+    pub rotation_raw: Option<u64>,
+    /// Exact sample bytes represented as lowercase hex so JSON does not
+    /// coerce a byte array or normalize source-specific fields.
+    pub raw_payload_hex: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderRasterInputV1 {
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: String,
+    pub coordinate_space: String,
+    pub units: String,
+    pub raw_payload_hex: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecognitionRequestV1 {
+    pub protocol_version: u32,
+    pub request_id: String,
+    pub input_view_id: String,
+    pub source_revision: ProviderSourceRevisionV1,
+    pub region_id: String,
+    pub line_id: String,
+    pub coordinate_space: String,
+    pub coordinate_units: String,
+    pub language_hints: Vec<String>,
+    pub provider_configuration: ProviderConfigurationV1,
+    pub provider_configuration_fingerprint: String,
+    pub stroke_views: Vec<ProviderStrokeViewV1>,
+    /// Flat canonical sequence across selected strokes, not a render-plan sort.
+    pub samples: Vec<ProviderSampleV1>,
+    pub raster: Option<ProviderRasterInputV1>,
+}
+
+#[derive(Serialize)]
+struct RequestFingerprintV1<'a> {
+    protocol_version: u32,
+    source_revision: &'a ProviderSourceRevisionV1,
+    region_id: &'a str,
+    line_id: &'a str,
+    coordinate_space: &'a str,
+    coordinate_units: &'a str,
+    language_hints: &'a [String],
+    stroke_views: &'a [ProviderStrokeViewV1],
+    samples: &'a [ProviderSampleV1],
+    raster: &'a Option<ProviderRasterInputV1>,
+}
+
+/// Snapshot and hash the journal-selected view for provider work. This bounded
+/// projection is O(selected samples); callers should schedule it on the
+/// provider preparation worker rather than the redraw/event loop.
+pub(crate) fn build_recognition_request(
+    state: &JournalReplayState,
+    request_id: String,
+    region_id: String,
+    line_id: String,
+    coordinate_space: String,
+    coordinate_units: String,
+    language_hints: Vec<String>,
+    provider_configuration: ProviderConfigurationV1,
+    selected_strokes: &[StrokeRef],
+    raster: Option<ProviderRasterInputV1>,
+) -> Result<RecognitionRequestV1, ProviderErrorKind> {
+    validate_text(&state.journal_id, MAX_ID_BYTES, "journal ID")?;
+    if state.journal_id.is_empty() {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "source journal ID must not be empty".to_owned(),
+        ));
+    }
+    let source_revision = ProviderSourceRevisionV1::from_journal(state);
+    source_revision.validate()?;
+    validate_text(&request_id, MAX_ID_BYTES, "request ID")?;
+    validate_text(&region_id, MAX_ID_BYTES, "region ID")?;
+    validate_text(&line_id, MAX_ID_BYTES, "line ID")?;
+    validate_text(&coordinate_space, MAX_ID_BYTES, "request coordinate space")?;
+    validate_text(&coordinate_units, MAX_ID_BYTES, "request coordinate units")?;
+    if request_id.is_empty()
+        || region_id.is_empty()
+        || line_id.is_empty()
+        || coordinate_space.is_empty()
+        || coordinate_units.is_empty()
+    {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "request and region/line/coordinate identifiers must be nonempty".to_owned(),
+        ));
+    }
+    validate_language_hints(&language_hints)?;
+    provider_configuration.validate()?;
+    let provider_configuration_fingerprint = provider_configuration.fingerprint()?;
+    if selected_strokes.is_empty() || selected_strokes.len() > MAX_PROVIDER_STROKES {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "selected stroke count is empty or exceeds the protocol cap".to_owned(),
+        ));
+    }
+    let mut selected = HashSet::new();
+    selected
+        .try_reserve(selected_strokes.len())
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    for stroke in selected_strokes {
+        if stroke.journal_id != state.journal_id {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "selected StrokeRef belongs to another project journal".to_owned(),
+            ));
+        }
+        validate_core_stroke_ref(stroke)?;
+        selected.insert(stroke.clone());
+    }
+
+    let projected = state
+        .projected_samples()
+        .map_err(|error| ProviderErrorKind::InvalidRequest(error.to_string()))?;
+    let mut stroke_views = Vec::new();
+    stroke_views
+        .try_reserve(selected_strokes.len())
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    let mut seen_strokes = HashSet::new();
+    seen_strokes
+        .try_reserve(selected_strokes.len())
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    let mut samples = Vec::new();
+    let sample_capacity = projected
+        .iter()
+        .filter(|sample| sample.stroke_ref.as_ref().is_some_and(|stroke| selected.contains(stroke)))
+        .count();
+    if sample_capacity == 0 || sample_capacity > MAX_PROVIDER_SAMPLES {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "selected strokes have no visible samples or exceed the sample cap".to_owned(),
+        ));
+    }
+    samples
+        .try_reserve_exact(sample_capacity)
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    let mut total_raw_payload_bytes = 0usize;
+    for projected_sample in projected {
+        let Some(stroke) = projected_sample.stroke_ref.as_ref() else {
+            continue;
+        };
+        if !selected.contains(stroke) {
+            continue;
+        }
+        if seen_strokes.insert(stroke.clone()) {
+            validate_core_stroke_ref(stroke)?;
+            let view_frame = state
+                .stroke_starts
+                .iter()
+                .find(|start| start.target == *stroke)
+                .map(|start| ProviderViewFrameV1::from(start.view_frame));
+            stroke_views.push(ProviderStrokeViewV1 {
+                stroke: ProviderStrokeRefV1::from(stroke),
+                view_frame,
+            });
+        }
+        total_raw_payload_bytes = total_raw_payload_bytes
+            .checked_add(projected_sample.sample.raw_payload.len())
+            .ok_or_else(|| {
+                ProviderErrorKind::InvalidRequest("raw sample byte count overflow".to_owned())
+            })?;
+        if projected_sample.sample.raw_payload.len() > MAX_RAW_SAMPLE_BYTES
+            || total_raw_payload_bytes > MAX_TOTAL_RAW_SAMPLE_BYTES
+        {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "selected raw sample payload exceeds the protocol byte cap".to_owned(),
+            ));
+        }
+        validate_source_sample(&projected_sample.sample)?;
+        samples.push(provider_sample(
+            projected_sample.sequence,
+            projected_sample.sample,
+            projected_sample.effective_position.as_ref(),
+            stroke,
+        )?);
+    }
+    if seen_strokes != selected {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "every requested StrokeRef must have visible committed samples in the source revision"
+                .to_owned(),
+        ));
+    }
+    let mut request = RecognitionRequestV1 {
+        protocol_version: PROVIDER_PROTOCOL_VERSION,
+        request_id,
+        input_view_id: String::new(),
+        source_revision,
+        region_id,
+        line_id,
+        coordinate_space,
+        coordinate_units,
+        language_hints,
+        provider_configuration,
+        provider_configuration_fingerprint,
+        stroke_views,
+        samples,
+        raster,
+    };
+    request.input_view_id = input_view_id(&request)?;
+    validate_request(&request)?;
+    Ok(request)
+}
+
+fn provider_sample(
+    journal_sequence: u64,
+    sample: &PhysicalSample,
+    effective_position: Option<&RawPosition>,
+    stroke: &StrokeRef,
+) -> Result<ProviderSampleV1, ProviderErrorKind> {
+    let mut raw_payload_hex = String::new();
+    let encoded_capacity = sample
+        .raw_payload
+        .len()
+        .checked_mul(2)
+        .ok_or(ProviderErrorKind::AllocationFailed)?;
+    raw_payload_hex
+        .try_reserve_exact(encoded_capacity)
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in &sample.raw_payload {
+        raw_payload_hex.push(HEX[(*byte >> 4) as usize] as char);
+        raw_payload_hex.push(HEX[(*byte & 0x0f) as usize] as char);
+    }
+    Ok(ProviderSampleV1 {
+        journal_sequence,
+        source_sequence_raw: sample.source_sequence,
+        stroke: ProviderStrokeRefV1::from(stroke),
+        app_arrival_elapsed_ns_decimal: sample.app_arrival_elapsed_ns.to_string(),
+        config_id: sample.config_id.clone(),
+        position: sample.position.as_ref().map(ProviderPositionV1::from),
+        effective_position: effective_position.map(ProviderPositionV1::from),
+        pressure: sample.pressure.as_ref().map(ProviderPressureV1::from),
+        native_timestamp: sample
+            .native_timestamp
+            .as_ref()
+            .map(ProviderNativeTimestampV1::from),
+        contact_range_state: sample.contact_range_state.clone(),
+        button_state_raw: sample.button_state_raw,
+        tilt_x_raw: sample.tilt_x_raw,
+        tilt_y_raw: sample.tilt_y_raw,
+        rotation_raw: sample.rotation_raw,
+        raw_payload_hex,
+    })
+}
+
+fn validate_core_stroke_ref(stroke: &StrokeRef) -> Result<(), ProviderErrorKind> {
+    for (value, label) in [
+        (stroke.journal_id.as_str(), "stroke journal ID"),
+        (stroke.session_id.as_str(), "stroke session ID"),
+        (stroke.source_api.as_str(), "stroke source API"),
+        (stroke.stroke_id.as_str(), "stroke ID"),
+    ] {
+        validate_text(value, MAX_ID_BYTES, label)?;
+        if value.is_empty() {
+            return Err(ProviderErrorKind::InvalidRequest(format!(
+                "{label} must not be empty"
+            )));
+        }
+    }
+    if let Some(device_id) = &stroke.device_id {
+        validate_text(device_id, MAX_ID_BYTES, "stroke device ID")?;
+        if device_id.is_empty() {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "stroke device ID must not be empty when present".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_sample(sample: &PhysicalSample) -> Result<(), ProviderErrorKind> {
+    for (value, label) in [
+        (sample.session_id.as_str(), "sample session ID"),
+        (sample.source_api.as_str(), "sample source API"),
+    ] {
+        validate_text(value, MAX_ID_BYTES, label)?;
+        if value.is_empty() {
+            return Err(ProviderErrorKind::InvalidRequest(format!(
+                "{label} must not be empty"
+            )));
+        }
+    }
+    for (value, label) in [
+        (sample.source_device_id.as_deref(), "sample device ID"),
+        (sample.stroke_id.as_deref(), "sample stroke ID"),
+        (sample.config_id.as_deref(), "sample config ID"),
+    ] {
+        if let Some(value) = value {
+            validate_text(value, MAX_ID_BYTES, label)?;
+            if value.is_empty() {
+                return Err(ProviderErrorKind::InvalidRequest(format!(
+                    "{label} must not be empty when present"
+                )));
+            }
+        }
+    }
+    if let Some(position) = &sample.position {
+        validate_text(&position.coordinate_space, MAX_ID_BYTES, "position coordinate space")?;
+        validate_text(&position.units, MAX_ID_BYTES, "position units")?;
+    }
+    if let Some(pressure) = &sample.pressure {
+        validate_text(&pressure.representation, MAX_ID_BYTES, "pressure representation")?;
+        validate_text(&pressure.units, MAX_ID_BYTES, "pressure units")?;
+    }
+    if let Some(timestamp) = &sample.native_timestamp {
+        validate_text(&timestamp.clock_domain, MAX_ID_BYTES, "native clock domain")?;
+        validate_text(&timestamp.units, MAX_ID_BYTES, "native clock units")?;
+    }
+    if let Some(contact_range) = &sample.contact_range_state {
+        validate_text(contact_range, MAX_TEXT_BYTES, "contact/range state")?;
+    }
+    if sample.raw_payload.len() > MAX_RAW_SAMPLE_BYTES {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "source sample raw payload exceeds the per-sample cap".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn input_view_id(request: &RecognitionRequestV1) -> Result<String, ProviderErrorKind> {
+    let fingerprint = RequestFingerprintV1 {
+        protocol_version: request.protocol_version,
+        source_revision: &request.source_revision,
+        region_id: &request.region_id,
+        line_id: &request.line_id,
+        coordinate_space: &request.coordinate_space,
+        coordinate_units: &request.coordinate_units,
+        language_hints: &request.language_hints,
+        stroke_views: &request.stroke_views,
+        samples: &request.samples,
+        raster: &request.raster,
+    };
+    let bytes = bounded_json_bytes(&fingerprint, MAX_REQUEST_FRAME_BYTES)?;
+    // This ID is a deterministic view identifier, not an integrity signature.
+    let hash = bytes.into_iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    Ok(format!("input-view-v1-{hash:016x}"))
+}
+
+fn add_wire_estimate(estimate: &mut usize, amount: usize) -> Result<(), ProviderErrorKind> {
+    let next = estimate
+        .checked_add(amount)
+        .ok_or(ProviderErrorKind::AllocationFailed)?;
+    if next > MAX_REQUEST_FRAME_BYTES {
+        return Err(ProviderErrorKind::OversizedFrame {
+            actual: next,
+            maximum: MAX_REQUEST_FRAME_BYTES,
+        });
+    }
+    *estimate = next;
+    Ok(())
+}
+
+fn estimate_json_string_bytes(value: &str) -> Option<usize> {
+    let escaped = value.chars().try_fold(0usize, |total, character| {
+        let width = match character {
+            '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+            character if (character as u32) <= 0x1f => 6,
+            character if character.is_ascii() => 1,
+            _ => 6,
+        };
+        total.checked_add(width)
+    })?;
+    escaped.checked_add(2)
+}
+
+fn add_string_estimate(estimate: &mut usize, value: &str) -> Result<(), ProviderErrorKind> {
+    let bytes = estimate_json_string_bytes(value).ok_or(ProviderErrorKind::AllocationFailed)?;
+    add_wire_estimate(estimate, bytes)
+}
+
+/// Cheap, allocation-free admission check for the UI-facing `try_submit`.
+/// Full hashing, canonical-order validation, and JSON encoding happen in the
+/// dedicated provider worker before it spawns any executable.
+fn validate_request_admission(
+    request: &RecognitionRequestV1,
+) -> Result<(), ProviderErrorKind> {
+    if request.protocol_version != PROVIDER_PROTOCOL_VERSION {
+        return Err(ProviderErrorKind::ProtocolVersion {
+            expected: PROVIDER_PROTOCOL_VERSION,
+            actual: request.protocol_version,
+        });
+    }
+    if request.stroke_views.is_empty()
+        || request.stroke_views.len() > MAX_PROVIDER_STROKES
+        || request.samples.is_empty()
+        || request.samples.len() > MAX_PROVIDER_SAMPLES
+    {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "request stroke/sample count is empty or exceeds its fixed cap".to_owned(),
+        ));
+    }
+    request.source_revision.validate()?;
+    request.provider_configuration.validate()?;
+    validate_text(
+        &request.provider_configuration_fingerprint,
+        MAX_ID_BYTES,
+        "provider configuration fingerprint",
+    )?;
+    if request.provider_configuration_fingerprint.is_empty() {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "provider configuration fingerprint must not be empty".to_owned(),
+        ));
+    }
+    validate_language_hints(&request.language_hints)?;
+    for (value, label) in [
+        (request.request_id.as_str(), "request ID"),
+        (request.input_view_id.as_str(), "input-view ID"),
+        (request.region_id.as_str(), "region ID"),
+        (request.line_id.as_str(), "line ID"),
+        (request.coordinate_space.as_str(), "coordinate space"),
+        (request.coordinate_units.as_str(), "coordinate units"),
+    ] {
+        validate_text(value, MAX_ID_BYTES, label)?;
+        if value.is_empty() {
+            return Err(ProviderErrorKind::InvalidRequest(format!(
+                "{label} must not be empty"
+            )));
+        }
+    }
+
+    let mut estimate = 2048usize;
+    let mut raw_bytes = 0usize;
+    add_string_estimate(&mut estimate, &request.source_revision.journal_id)?;
+    add_string_estimate(&mut estimate, &request.request_id)?;
+    add_string_estimate(&mut estimate, &request.input_view_id)?;
+    add_string_estimate(&mut estimate, &request.region_id)?;
+    add_string_estimate(&mut estimate, &request.line_id)?;
+    add_string_estimate(&mut estimate, &request.coordinate_space)?;
+    add_string_estimate(&mut estimate, &request.coordinate_units)?;
+    add_string_estimate(
+        &mut estimate,
+        &request.provider_configuration.configuration_id,
+    )?;
+    add_string_estimate(&mut estimate, &request.provider_configuration_fingerprint)?;
+    for hint in &request.language_hints {
+        add_wire_estimate(&mut estimate, 32)?;
+        add_string_estimate(&mut estimate, hint)?;
+    }
+    for (key, value) in &request.provider_configuration.values {
+        add_wire_estimate(&mut estimate, 48)?;
+        add_string_estimate(&mut estimate, key)?;
+        add_string_estimate(&mut estimate, value)?;
+    }
+    for view in &request.stroke_views {
+        view.stroke.validate()?;
+        if view.stroke.journal_id != request.source_revision.journal_id {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "StrokeRef journal ID does not match source revision".to_owned(),
+            ));
+        }
+        add_wire_estimate(&mut estimate, 512)?;
+        add_string_estimate(&mut estimate, &view.stroke.journal_id)?;
+        add_string_estimate(&mut estimate, &view.stroke.session_id)?;
+        add_string_estimate(&mut estimate, &view.stroke.source_api)?;
+        add_string_estimate(&mut estimate, &view.stroke.stroke_id)?;
+        if let Some(device_id) = &view.stroke.device_id {
+            add_string_estimate(&mut estimate, device_id)?;
+        }
+        if let Some(frame) = view.view_frame {
+            frame.validate()?;
+        }
+    }
+    let mut previous_sequence = 0u64;
+    for sample in &request.samples {
+        sample.stroke.validate()?;
+        if sample.stroke.journal_id != request.source_revision.journal_id
+            || sample.journal_sequence <= previous_sequence
+            || sample.journal_sequence > request.source_revision.last_sequence
+        {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "sample journal sequence or StrokeRef does not match source revision".to_owned(),
+            ));
+        }
+        previous_sequence = sample.journal_sequence;
+        if sample.app_arrival_elapsed_ns_decimal.len() > 39
+            || sample
+                .app_arrival_elapsed_ns_decimal
+                .parse::<u128>()
+                .is_err()
+        {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "app-arrival time must be a bounded unsigned decimal string".to_owned(),
+            ));
+        }
+        if sample.raw_payload_hex.len() % 2 != 0
+            || sample.raw_payload_hex.len() / 2 > MAX_RAW_SAMPLE_BYTES
+            || !sample.raw_payload_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "raw sample payload must be bounded hex".to_owned(),
+            ));
+        }
+        raw_bytes = raw_bytes
+            .checked_add(sample.raw_payload_hex.len() / 2)
+            .ok_or(ProviderErrorKind::AllocationFailed)?;
+        if raw_bytes > MAX_TOTAL_RAW_SAMPLE_BYTES {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "total raw sample payload exceeds the protocol cap".to_owned(),
+            ));
+        }
+        add_wire_estimate(&mut estimate, 1024)?;
+        add_string_estimate(&mut estimate, &sample.stroke.journal_id)?;
+        add_string_estimate(&mut estimate, &sample.stroke.session_id)?;
+        add_string_estimate(&mut estimate, &sample.stroke.source_api)?;
+        add_string_estimate(&mut estimate, &sample.stroke.stroke_id)?;
+        add_string_estimate(&mut estimate, &sample.app_arrival_elapsed_ns_decimal)?;
+        add_wire_estimate(&mut estimate, sample.raw_payload_hex.len().saturating_add(2))?;
+        if let Some(device_id) = &sample.stroke.device_id {
+            add_string_estimate(&mut estimate, device_id)?;
+        }
+        if let Some(config_id) = &sample.config_id {
+            validate_text(config_id, MAX_ID_BYTES, "sample config ID")?;
+            add_string_estimate(&mut estimate, config_id)?;
+        }
+        if let Some(position) = &sample.position {
+            validate_text(&position.coordinate_space, MAX_ID_BYTES, "position coordinate space")?;
+            validate_text(&position.units, MAX_ID_BYTES, "position units")?;
+            add_string_estimate(&mut estimate, &position.coordinate_space)?;
+            add_string_estimate(&mut estimate, &position.units)?;
+        }
+        if let Some(position) = &sample.effective_position {
+            validate_text(
+                &position.coordinate_space,
+                MAX_ID_BYTES,
+                "effective position coordinate space",
+            )?;
+            validate_text(&position.units, MAX_ID_BYTES, "effective position units")?;
+            add_string_estimate(&mut estimate, &position.coordinate_space)?;
+            add_string_estimate(&mut estimate, &position.units)?;
+        }
+        if let Some(pressure) = &sample.pressure {
+            validate_text(&pressure.representation, MAX_ID_BYTES, "pressure representation")?;
+            validate_text(&pressure.units, MAX_ID_BYTES, "pressure units")?;
+            add_string_estimate(&mut estimate, &pressure.representation)?;
+            add_string_estimate(&mut estimate, &pressure.units)?;
+        }
+        if let Some(timestamp) = &sample.native_timestamp {
+            validate_text(&timestamp.clock_domain, MAX_ID_BYTES, "native clock domain")?;
+            validate_text(&timestamp.units, MAX_ID_BYTES, "native clock units")?;
+            add_string_estimate(&mut estimate, &timestamp.clock_domain)?;
+            add_string_estimate(&mut estimate, &timestamp.units)?;
+        }
+        if let Some(contact_state) = &sample.contact_range_state {
+            validate_text(contact_state, MAX_TEXT_BYTES, "contact/range state")?;
+            add_string_estimate(&mut estimate, contact_state)?;
+        }
+    }
+    if let Some(raster) = &request.raster {
+        add_wire_estimate(&mut estimate, 512)?;
+        add_string_estimate(&mut estimate, &raster.pixel_format)?;
+        add_string_estimate(&mut estimate, &raster.coordinate_space)?;
+        add_string_estimate(&mut estimate, &raster.units)?;
+        add_wire_estimate(&mut estimate, raster.raw_payload_hex.len())?;
+    }
+    Ok(())
+}
+
+fn validate_request(request: &RecognitionRequestV1) -> Result<(), ProviderErrorKind> {
+    if request.protocol_version != PROVIDER_PROTOCOL_VERSION {
+        return Err(ProviderErrorKind::ProtocolVersion {
+            expected: PROVIDER_PROTOCOL_VERSION,
+            actual: request.protocol_version,
+        });
+    }
+    validate_text(&request.request_id, MAX_ID_BYTES, "request ID")?;
+    validate_text(&request.input_view_id, MAX_ID_BYTES, "input-view ID")?;
+    validate_text(&request.region_id, MAX_ID_BYTES, "region ID")?;
+    validate_text(&request.line_id, MAX_ID_BYTES, "line ID")?;
+    validate_text(&request.coordinate_space, MAX_ID_BYTES, "coordinate space")?;
+    validate_text(&request.coordinate_units, MAX_ID_BYTES, "coordinate units")?;
+    request.source_revision.validate()?;
+    request.provider_configuration.validate()?;
+    if request.provider_configuration_fingerprint != request.provider_configuration.fingerprint()? {
+        return Err(ProviderErrorKind::ProviderConfigurationMismatch);
+    }
+    validate_language_hints(&request.language_hints)?;
+    if request.request_id.is_empty()
+        || request.input_view_id.is_empty()
+        || request.region_id.is_empty()
+        || request.line_id.is_empty()
+    {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "request, input-view, region, and line IDs must not be empty".to_owned(),
+        ));
+    }
+    if request.stroke_views.is_empty() || request.stroke_views.len() > MAX_PROVIDER_STROKES {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "stroke view count is empty or exceeds the protocol cap".to_owned(),
+        ));
+    }
+    if request.input_view_id != input_view_id(request)? {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "input-view ID does not match the exact request payload".to_owned(),
+        ));
+    }
+    if request.samples.is_empty() || request.samples.len() > MAX_PROVIDER_SAMPLES {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "sample count is empty or exceeds the protocol cap".to_owned(),
+        ));
+    }
+    let mut view_refs = HashSet::new();
+    view_refs
+        .try_reserve(request.stroke_views.len())
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    for view in &request.stroke_views {
+        view.stroke.validate()?;
+        if view.stroke.journal_id != request.source_revision.journal_id {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "StrokeRef journal ID does not match request source revision".to_owned(),
+            ));
+        }
+        if !view_refs.insert(view.stroke.clone()) {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "stroke view list contains duplicate StrokeRefs".to_owned(),
+            ));
+        }
+        if let Some(frame) = view.view_frame {
+            frame.validate()?;
+        }
+    }
+    let mut previous_sequence = 0u64;
+    let mut total_raw_bytes = 0usize;
+    let mut first_occurrence_order = Vec::new();
+    first_occurrence_order
+        .try_reserve(request.stroke_views.len())
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    let mut seen_sample_strokes = HashSet::new();
+    seen_sample_strokes
+        .try_reserve(request.stroke_views.len())
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    for sample in &request.samples {
+        sample.stroke.validate()?;
+        if !view_refs.contains(&sample.stroke)
+            || sample.stroke.journal_id != request.source_revision.journal_id
+            || sample.journal_sequence <= previous_sequence
+            || sample.journal_sequence > request.source_revision.last_sequence
+        {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "samples must reference request StrokeRefs in increasing journal sequence".to_owned(),
+            ));
+        }
+        previous_sequence = sample.journal_sequence;
+        if seen_sample_strokes.insert(sample.stroke.clone()) {
+            first_occurrence_order.push(sample.stroke.clone());
+        }
+        if sample.app_arrival_elapsed_ns_decimal.is_empty()
+            || sample.app_arrival_elapsed_ns_decimal.len() > 39
+            || sample
+                .app_arrival_elapsed_ns_decimal
+                .parse::<u128>()
+                .is_err()
+        {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "app-arrival time must be an unsigned decimal string".to_owned(),
+            ));
+        }
+        if sample.raw_payload_hex.len() % 2 != 0
+            || sample.raw_payload_hex.len() / 2 > MAX_RAW_SAMPLE_BYTES
+            || !sample.raw_payload_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "raw sample payload must be bounded hex".to_owned(),
+            ));
+        }
+        total_raw_bytes = total_raw_bytes
+            .checked_add(sample.raw_payload_hex.len() / 2)
+            .ok_or_else(|| {
+                ProviderErrorKind::InvalidRequest("raw sample byte count overflow".to_owned())
+            })?;
+        if total_raw_bytes > MAX_TOTAL_RAW_SAMPLE_BYTES {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "total raw sample payload exceeds the protocol cap".to_owned(),
+            ));
+        }
+        if let Some(position) = &sample.position {
+            validate_text(&position.coordinate_space, MAX_ID_BYTES, "position coordinate space")?;
+            validate_text(&position.units, MAX_ID_BYTES, "position units")?;
+            if position.coordinate_space.is_empty() || position.units.is_empty() {
+                return Err(ProviderErrorKind::InvalidRequest(
+                    "raw position must retain nonempty coordinate space and units".to_owned(),
+                ));
+            }
+        }
+        if let Some(position) = &sample.effective_position {
+            validate_text(
+                &position.coordinate_space,
+                MAX_ID_BYTES,
+                "effective position coordinate space",
+            )?;
+            validate_text(&position.units, MAX_ID_BYTES, "effective position units")?;
+            if position.coordinate_space.is_empty() || position.units.is_empty() {
+                return Err(ProviderErrorKind::InvalidRequest(
+                    "effective position must retain nonempty coordinate space and units".to_owned(),
+                ));
+            }
+        }
+        if let Some(pressure) = &sample.pressure {
+            validate_text(&pressure.representation, MAX_ID_BYTES, "pressure representation")?;
+            validate_text(&pressure.units, MAX_ID_BYTES, "pressure units")?;
+            if pressure.representation.is_empty() || pressure.units.is_empty() {
+                return Err(ProviderErrorKind::InvalidRequest(
+                    "raw pressure must retain nonempty representation and units".to_owned(),
+                ));
+            }
+        }
+        if let Some(timestamp) = &sample.native_timestamp {
+            validate_text(&timestamp.clock_domain, MAX_ID_BYTES, "native clock domain")?;
+            validate_text(&timestamp.units, MAX_ID_BYTES, "native clock units")?;
+            if timestamp.clock_domain.is_empty() || timestamp.units.is_empty() {
+                return Err(ProviderErrorKind::InvalidRequest(
+                    "native timestamp must retain nonempty clock domain and units".to_owned(),
+                ));
+            }
+        }
+        if let Some(config_id) = &sample.config_id {
+            validate_text(config_id, MAX_ID_BYTES, "sample config ID")?;
+        }
+        if let Some(contact_state) = &sample.contact_range_state {
+            validate_text(contact_state, MAX_TEXT_BYTES, "contact/range state")?;
+        }
+    }
+    if first_occurrence_order
+        != request
+            .stroke_views
+            .iter()
+            .map(|view| view.stroke.clone())
+            .collect::<Vec<_>>()
+    {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "StrokeRefs must follow first occurrence in canonical journal sample order".to_owned(),
+        ));
+    }
+    if let Some(raster) = &request.raster {
+        let raw_bytes = raster.raw_payload_hex.len() / 2;
+        let pixel_count = u64::from(raster.width).checked_mul(u64::from(raster.height));
+        if raster.width == 0
+            || raster.height == 0
+            || pixel_count.is_none_or(|pixels| pixels > MAX_TOTAL_RAW_SAMPLE_BYTES as u64)
+            || raster.raw_payload_hex.len() % 2 != 0
+            || raw_bytes > MAX_TOTAL_RAW_SAMPLE_BYTES
+            || !raster.raw_payload_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "optional raster is empty or exceeds its byte/geometry limits".to_owned(),
+            ));
+        }
+        for (value, label) in [
+            (raster.pixel_format.as_str(), "raster pixel format"),
+            (raster.coordinate_space.as_str(), "raster coordinate space"),
+            (raster.units.as_str(), "raster units"),
+        ] {
+            validate_text(value, MAX_ID_BYTES, label)?;
+            if value.is_empty() {
+                return Err(ProviderErrorKind::InvalidRequest(format!(
+                    "{label} must not be empty"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_language_hints(hints: &[String]) -> Result<(), ProviderErrorKind> {
+    if hints.len() > MAX_LANGUAGE_HINTS {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "language hint count exceeds the protocol cap".to_owned(),
+        ));
+    }
+    for hint in hints {
+        validate_text(hint, MAX_LANGUAGE_TAG_BYTES, "language hint")?;
+        if hint.is_empty() {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "language hints must not be empty".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_text(value: &str, maximum: usize, label: &str) -> Result<(), ProviderErrorKind> {
+    if value.len() > maximum {
+        return Err(ProviderErrorKind::InvalidRequest(format!(
+            "{label} exceeds its {maximum}-byte cap"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderIdentityV1 {
+    pub provider_id: String,
+    pub provider_version: String,
+    pub model_version: Option<String>,
+    pub resource_version: Option<String>,
+}
+
+impl ProviderIdentityV1 {
+    fn validate(&self) -> Result<(), ProviderErrorKind> {
+        validate_text(&self.provider_id, MAX_ID_BYTES, "provider ID")?;
+        validate_text(&self.provider_version, MAX_ID_BYTES, "provider version")?;
+        if self.provider_id.is_empty() || self.provider_version.is_empty() {
+            return Err(ProviderErrorKind::InvalidResponse(
+                "provider ID and version must not be empty".to_owned(),
+            ));
+        }
+        if let Some(model) = &self.model_version {
+            validate_text(model, MAX_ID_BYTES, "provider model version")?;
+        }
+        if let Some(resource) = &self.resource_version {
+            validate_text(resource, MAX_ID_BYTES, "provider resource version")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderInputCapabilityV1 {
+    OnlineStrokes,
+    Raster,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderOutputCapabilityV1 {
+    Text,
+    Math,
+    Multiline,
+    Layout,
+    NBest,
+    NativeScore,
+    WordCandidates,
+    CharacterCandidates,
+    StrokeRanges,
+    OfflineOperation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderCapabilitiesV1 {
+    pub inputs: Vec<ProviderInputCapabilityV1>,
+    pub outputs: Vec<ProviderOutputCapabilityV1>,
+    pub languages: Vec<String>,
+}
+
+impl ProviderCapabilitiesV1 {
+    fn validate(&self) -> Result<(), ProviderErrorKind> {
+        if self.inputs.len() > 8 || self.outputs.len() > 32 || self.languages.len() > 128 {
+            return Err(ProviderErrorKind::InvalidResponse(
+                "provider capability list exceeds a fixed item cap".to_owned(),
+            ));
+        }
+        for language in &self.languages {
+            validate_text(language, MAX_LANGUAGE_TAG_BYTES, "provider language")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderStrokeRangeV1 {
+    pub stroke: ProviderStrokeRefV1,
+    pub first_journal_sequence: u64,
+    pub last_journal_sequence: u64,
+}
+
+fn deserialize_bounded_stroke_ranges<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ProviderStrokeRangeV1>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct RangesVisitor;
+    impl<'de> Visitor<'de> for RangesVisitor {
+        type Value = Vec<ProviderStrokeRangeV1>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a bounded list of provider stroke ranges")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut ranges = Vec::new();
+            while let Some(range) = sequence.next_element::<ProviderStrokeRangeV1>()? {
+                if ranges.len() >= MAX_PROVIDER_STROKE_RANGES {
+                    return Err(<A::Error as DeError>::custom(
+                        "provider stroke-range cap exceeded",
+                    ));
+                }
+                ranges
+                    .try_reserve(1)
+                    .map_err(|_| <A::Error as DeError>::custom("stroke-range allocation failed"))?;
+                ranges.push(range);
+            }
+            Ok(ranges)
+        }
+    }
+    deserializer.deserialize_seq(RangesVisitor)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderCandidateV1 {
+    pub recognized_text: String,
+    /// The provider's native numeric score. It is never interpreted as a
+    /// calibrated probability by this protocol.
+    pub native_score_raw: Option<serde_json::Number>,
+    #[serde(deserialize_with = "deserialize_bounded_stroke_ranges")]
+    pub stroke_ranges: Vec<ProviderStrokeRangeV1>,
+    /// Preserve the provider-specific candidate object, including unknown
+    /// fields, without turning it into a normalized core representation.
+    pub raw_candidate: Value,
+}
+
+fn deserialize_bounded_candidates<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ProviderCandidateV1>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct CandidatesVisitor;
+    impl<'de> Visitor<'de> for CandidatesVisitor {
+        type Value = Vec<ProviderCandidateV1>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a bounded list of provider candidates")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut candidates = Vec::new();
+            while let Some(candidate) = sequence.next_element::<ProviderCandidateV1>()? {
+                if candidates.len() >= MAX_PROVIDER_CANDIDATES {
+                    return Err(<A::Error as DeError>::custom(
+                        "provider candidate cap exceeded",
+                    ));
+                }
+                candidates
+                    .try_reserve(1)
+                    .map_err(|_| <A::Error as DeError>::custom("candidate allocation failed"))?;
+                candidates.push(candidate);
+            }
+            Ok(candidates)
+        }
+    }
+    deserializer.deserialize_seq(CandidatesVisitor)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecognitionResultV1 {
+    pub request_id: String,
+    pub input_view_id: String,
+    pub source_revision: ProviderSourceRevisionV1,
+    pub region_id: String,
+    pub line_id: String,
+    pub provider_configuration_id: String,
+    pub provider_configuration_fingerprint: String,
+    pub provider: ProviderIdentityV1,
+    pub provider_provenance: String,
+    #[serde(deserialize_with = "deserialize_bounded_candidates")]
+    pub candidates: Vec<ProviderCandidateV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum WorkerRequestFrameV1 {
+    Handshake {
+        protocol_version: u32,
+        provider_id: String,
+        configuration_id: String,
+        configuration_fingerprint: String,
+    },
+    Recognize {
+        protocol_version: u32,
+        request: RecognitionRequestV1,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum WorkerResponseFrameV1 {
+    Handshake {
+        protocol_version: u32,
+        provider: ProviderIdentityV1,
+        configuration_id: String,
+        configuration_fingerprint: String,
+        capabilities: ProviderCapabilitiesV1,
+    },
+    Recognition {
+        protocol_version: u32,
+        result: RecognitionResultV1,
+    },
+    Failure {
+        protocol_version: u32,
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderPhase {
+    Handshake,
+    Recognition,
+    Shutdown,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ProviderErrorKind {
+    InvalidConfiguration(String),
+    InvalidRequest(String),
+    InvalidResponse(String),
+    ProtocolVersion { expected: u32, actual: u32 },
+    OversizedFrame { actual: usize, maximum: usize },
+    TimedOut(ProviderPhase),
+    Cancelled,
+    SpawnFailed(String),
+    IoFailed { phase: ProviderPhase, message: String },
+    WorkerExited { exit_code: Option<i32> },
+    UnexpectedFrame(String),
+    UnsupportedCapability(String),
+    ProviderFailure { code: String, message: String },
+    StaleSourceRevision,
+    ProviderRequestMismatch,
+    ProviderConfigurationMismatch,
+    WorkerThreadPanicked,
+    AllocationFailed,
+}
+
+impl fmt::Display for ProviderErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for ProviderErrorKind {}
+
+#[derive(Debug)]
+pub(crate) struct ProviderExecutionError {
+    pub kind: ProviderErrorKind,
+    pub stderr_bytes: Vec<u8>,
+    pub stderr_truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProviderExecution {
+    pub provider: ProviderIdentityV1,
+    pub capabilities: ProviderCapabilitiesV1,
+    pub result: RecognitionResultV1,
+    pub stderr_bytes: Vec<u8>,
+    pub stderr_truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderCallTimeouts {
+    pub handshake: Duration,
+    pub recognition: Duration,
+    pub shutdown: Duration,
+}
+
+impl Default for ProviderCallTimeouts {
+    fn default() -> Self {
+        Self {
+            handshake: Duration::from_secs(5),
+            recognition: Duration::from_secs(30),
+            shutdown: Duration::from_secs(2),
+        }
+    }
+}
+
+impl ProviderCallTimeouts {
+    fn validate(self) -> Result<Self, ProviderErrorKind> {
+        let minimum = Duration::from_millis(1);
+        let maximum = Duration::from_secs(120);
+        if self.handshake < minimum
+            || self.recognition < minimum
+            || self.shutdown < minimum
+            || self.handshake > maximum
+            || self.recognition > maximum
+            || self.shutdown > maximum
+        {
+            return Err(ProviderErrorKind::InvalidConfiguration(
+                "provider deadlines must be between 1 ms and 120 s".to_owned(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ProviderJobOutcome {
+    pub request_id: String,
+    pub outcome: Result<ProviderExecution, ProviderExecutionError>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ProviderSubmitError {
+    Backpressure(RecognitionRequestV1),
+    Stopped(RecognitionRequestV1),
+    Invalid(ProviderErrorKind),
+}
+
+#[derive(Debug)]
+pub(crate) enum ProviderWorkerPoll {
+    Pending,
+    Outcome(ProviderJobOutcome),
+    Stopped,
+}
+
+enum ProviderWorkerCommand {
+    Recognize(RecognitionRequestV1),
+}
+
+/// Asynchronous, single-worker interface for the UI/core. Submitting and
+/// polling are nonblocking. Its command and result queues each hold one item;
+/// provider work and child I/O deadlines run only on the dedicated worker.
+/// The handle is intentionally UI-thread-bound so submit/cancel state changes
+/// cannot race across callers.
+pub(crate) struct ProviderWorkerHandle {
+    commands: SyncSender<ProviderWorkerCommand>,
+    results: Receiver<ProviderJobOutcome>,
+    cancelled: Arc<AtomicBool>,
+    pending: AtomicBool,
+    _owner_thread: PhantomData<Rc<()>>,
+}
+
+impl ProviderWorkerHandle {
+    pub(crate) fn start(
+        approved: OperatorApprovedProviderConfig,
+        timeouts: ProviderCallTimeouts,
+    ) -> Result<Self, ProviderErrorKind> {
+        let timeouts = timeouts.validate()?;
+        let (command_sender, command_receiver) = mpsc::sync_channel(1);
+        let (result_sender, results) = mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let _provider_thread = thread::Builder::new()
+            .name("lassoink-provider-worker".to_owned())
+            .spawn(move || {
+                loop {
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        match command_receiver.try_recv() {
+                            Ok(ProviderWorkerCommand::Recognize(request)) => {
+                                let cancelled_result = ProviderJobOutcome {
+                                    request_id: request.request_id,
+                                    outcome: Err(ProviderExecutionError {
+                                        kind: ProviderErrorKind::Cancelled,
+                                        stderr_bytes: Vec::new(),
+                                        stderr_truncated: false,
+                                    }),
+                                };
+                                let _ = result_sender.send(cancelled_result);
+                            }
+                            Err(_) => {}
+                        }
+                        break;
+                    }
+                    let command = match command_receiver.recv_timeout(IO_POLL_INTERVAL) {
+                        Ok(command) => command,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    match command {
+                        ProviderWorkerCommand::Recognize(request) => {
+                            let request_id = request.request_id.clone();
+                            let runner = ProviderProcessRunner {
+                                approved: &approved,
+                                timeouts,
+                            };
+                            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                runner.run(request, &worker_cancelled)
+                            }))
+                            .unwrap_or_else(|_| {
+                                Err(ProviderExecutionError {
+                                    kind: ProviderErrorKind::WorkerThreadPanicked,
+                                    stderr_bytes: Vec::new(),
+                                    stderr_truncated: false,
+                                })
+                            });
+                            if result_sender
+                                .send(ProviderJobOutcome {
+                                    request_id,
+                                    outcome,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?;
+        Ok(Self {
+            commands: command_sender,
+            results,
+            cancelled,
+            pending: AtomicBool::new(false),
+            _owner_thread: PhantomData,
+        })
+    }
+
+    pub(crate) fn try_submit(
+        &self,
+        request: RecognitionRequestV1,
+    ) -> Result<(), ProviderSubmitError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(ProviderSubmitError::Stopped(request));
+        }
+        validate_request_admission(&request).map_err(ProviderSubmitError::Invalid)?;
+        if self
+            .pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(ProviderSubmitError::Backpressure(request));
+        }
+        match self
+            .commands
+            .try_send(ProviderWorkerCommand::Recognize(request))
+        {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(ProviderWorkerCommand::Recognize(request))) => {
+                self.pending.store(false, Ordering::Release);
+                Err(ProviderSubmitError::Backpressure(request))
+            }
+            Err(TrySendError::Disconnected(ProviderWorkerCommand::Recognize(request))) => {
+                self.pending.store(false, Ordering::Release);
+                Err(ProviderSubmitError::Stopped(request))
+            }
+        }
+    }
+
+    pub(crate) fn try_receive(&self) -> ProviderWorkerPoll {
+        match self.results.try_recv() {
+            Ok(outcome) => {
+                self.pending.store(false, Ordering::Release);
+                ProviderWorkerPoll::Outcome(outcome)
+            }
+            Err(TryRecvError::Empty) => ProviderWorkerPoll::Pending,
+            Err(TryRecvError::Disconnected) => {
+                self.pending.store(false, Ordering::Release);
+                ProviderWorkerPoll::Stopped
+            }
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for ProviderWorkerHandle {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+struct ProviderProcessRunner<'a> {
+    approved: &'a OperatorApprovedProviderConfig,
+    timeouts: ProviderCallTimeouts,
+}
+
+impl ProviderProcessRunner<'_> {
+    fn run(
+        &self,
+        request: RecognitionRequestV1,
+        cancelled: &AtomicBool,
+    ) -> Result<ProviderExecution, ProviderExecutionError> {
+        let stderr_capture = Arc::new(Mutex::new(BoundedStderr::default()));
+        let result = self.run_inner(request, cancelled, Arc::clone(&stderr_capture));
+        let (stderr_bytes, stderr_truncated) = stderr_snapshot(&stderr_capture);
+        result.map_err(|kind| ProviderExecutionError {
+            kind,
+            stderr_bytes,
+            stderr_truncated,
+        })
+    }
+
+    fn run_inner(
+        &self,
+        request: RecognitionRequestV1,
+        cancelled: &AtomicBool,
+        stderr_capture: Arc<Mutex<BoundedStderr>>,
+    ) -> Result<ProviderExecution, ProviderErrorKind> {
+        validate_request(&request)?;
+        if request.provider_configuration != self.approved.protocol_configuration
+            || request.provider_configuration_fingerprint
+                != self.approved.protocol_configuration.fingerprint()?
+        {
+            return Err(ProviderErrorKind::ProviderConfigurationMismatch);
+        }
+        if request
+            .samples
+            .iter()
+            .any(|sample| sample.stroke.journal_id != request.source_revision.journal_id)
+        {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "request contains a StrokeRef from another journal".to_owned(),
+            ));
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ProviderErrorKind::Cancelled);
+        }
+
+        let handshake_request = WorkerRequestFrameV1::Handshake {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            provider_id: self.approved.provider_id.clone(),
+            configuration_id: self.approved.protocol_configuration.configuration_id.clone(),
+            configuration_fingerprint: self.approved.protocol_configuration.fingerprint()?,
+        };
+        let recognition_request = WorkerRequestFrameV1::Recognize {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            request: request.clone(),
+        };
+        let handshake_frame = encode_frame(&handshake_request, MAX_HANDSHAKE_FRAME_BYTES)?;
+        let recognition_frame = encode_frame(&recognition_request, MAX_REQUEST_FRAME_BYTES)?;
+
+        let mut command = Command::new(&self.approved.executable);
+        command
+            .args(&self.approved.arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = ChildGuard::new(
+            command
+                .spawn()
+                .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?,
+        );
+        let stdin = child
+            .child_mut()
+            .stdin
+            .take()
+            .ok_or_else(|| ProviderErrorKind::IoFailed {
+                phase: ProviderPhase::Handshake,
+                message: "provider stdin pipe was not created".to_owned(),
+            })?;
+        let stdout = child
+            .child_mut()
+            .stdout
+            .take()
+            .ok_or_else(|| ProviderErrorKind::IoFailed {
+                phase: ProviderPhase::Handshake,
+                message: "provider stdout pipe was not created".to_owned(),
+            })?;
+        let stderr = child
+            .child_mut()
+            .stderr
+            .take()
+            .ok_or_else(|| ProviderErrorKind::IoFailed {
+                phase: ProviderPhase::Handshake,
+                message: "provider stderr pipe was not created".to_owned(),
+            })?;
+
+        let stderr_thread_capture = Arc::clone(&stderr_capture);
+        let _stderr_thread = thread::Builder::new()
+            .name("lassoink-provider-stderr".to_owned())
+            .spawn(move || drain_stderr(stderr, stderr_thread_capture))
+            .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?;
+
+        let (response_sender, response_receiver) = mpsc::sync_channel(2);
+        let (reader_done_sender, reader_done_receiver) = mpsc::sync_channel(1);
+        let _stdout_thread = thread::Builder::new()
+            .name("lassoink-provider-stdout".to_owned())
+            .spawn(move || {
+                read_worker_responses(stdout, response_sender, reader_done_sender)
+            })
+            .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?;
+
+        let (write_sender, write_receiver) = mpsc::sync_channel(1);
+        let _stdin_thread = thread::Builder::new()
+            .name("lassoink-provider-stdin".to_owned())
+            .spawn(move || write_worker_frames(stdin, write_receiver))
+            .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?;
+
+        let handshake_deadline = Instant::now() + self.timeouts.handshake;
+        send_frame_to_worker(
+            &write_sender,
+            handshake_frame,
+            handshake_deadline,
+            cancelled,
+            ProviderPhase::Handshake,
+        )?;
+        let handshake = receive_worker_response(
+            &response_receiver,
+            handshake_deadline,
+            cancelled,
+            ProviderPhase::Handshake,
+        )?;
+        let (provider, capabilities) = match handshake {
+            WorkerResponseFrameV1::Handshake {
+                protocol_version,
+                provider,
+                configuration_id,
+                configuration_fingerprint,
+                capabilities,
+            } => {
+                verify_protocol_version(protocol_version)?;
+                provider.validate()?;
+                capabilities.validate()?;
+                if provider.provider_id != self.approved.provider_id {
+                    return Err(ProviderErrorKind::InvalidResponse(
+                        "provider handshake ID does not match the approved configuration"
+                            .to_owned(),
+                    ));
+                }
+                if configuration_id != self.approved.protocol_configuration.configuration_id
+                    || configuration_fingerprint
+                        != self.approved.protocol_configuration.fingerprint()?
+                {
+                    return Err(ProviderErrorKind::ProviderConfigurationMismatch);
+                }
+                validate_capabilities_for_request(&capabilities, &request)?;
+                (provider, capabilities)
+            }
+            WorkerResponseFrameV1::Failure {
+                protocol_version,
+                code,
+                message,
+            } => {
+                verify_protocol_version(protocol_version)?;
+                validate_text(&code, MAX_ID_BYTES, "provider failure code")?;
+                validate_text(&message, MAX_TEXT_BYTES, "provider failure message")?;
+                return Err(ProviderErrorKind::ProviderFailure { code, message });
+            }
+            other => {
+                return Err(ProviderErrorKind::UnexpectedFrame(format!(
+                    "expected handshake response, received {other:?}"
+                )));
+            }
+        };
+
+        let recognition_deadline = Instant::now() + self.timeouts.recognition;
+        send_frame_to_worker(
+            &write_sender,
+            recognition_frame,
+            recognition_deadline,
+            cancelled,
+            ProviderPhase::Recognition,
+        )?;
+        drop(write_sender);
+        let response = receive_worker_response(
+            &response_receiver,
+            recognition_deadline,
+            cancelled,
+            ProviderPhase::Recognition,
+        )?;
+        let result = match response {
+            WorkerResponseFrameV1::Recognition {
+                protocol_version,
+                result,
+            } => {
+                verify_protocol_version(protocol_version)?;
+                validate_recognition_result(&result, &request, &provider, &capabilities)?;
+                result
+            }
+            WorkerResponseFrameV1::Failure {
+                protocol_version,
+                code,
+                message,
+            } => {
+                verify_protocol_version(protocol_version)?;
+                validate_text(&code, MAX_ID_BYTES, "provider failure code")?;
+                validate_text(&message, MAX_TEXT_BYTES, "provider failure message")?;
+                return Err(ProviderErrorKind::ProviderFailure { code, message });
+            }
+            other => {
+                return Err(ProviderErrorKind::UnexpectedFrame(format!(
+                    "expected recognition response, received {other:?}"
+                )));
+            }
+        };
+        let shutdown_deadline = Instant::now() + self.timeouts.shutdown;
+        receive_reader_completion(
+            &reader_done_receiver,
+            shutdown_deadline,
+            cancelled,
+        )?;
+        drop(response_receiver);
+        drop(reader_done_receiver);
+
+        let status = child.wait_until(shutdown_deadline, cancelled)?;
+        if !status.success() {
+            return Err(ProviderErrorKind::WorkerExited {
+                exit_code: status.code(),
+            });
+        }
+        let (stderr_bytes, stderr_truncated) = stderr_snapshot(&stderr_capture);
+        Ok(ProviderExecution {
+            provider,
+            capabilities,
+            result,
+            stderr_bytes,
+            stderr_truncated,
+        })
+    }
+}
+
+fn verify_protocol_version(actual: u32) -> Result<(), ProviderErrorKind> {
+    if actual == PROVIDER_PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(ProviderErrorKind::ProtocolVersion {
+            expected: PROVIDER_PROTOCOL_VERSION,
+            actual,
+        })
+    }
+}
+
+fn validate_recognition_result(
+    result: &RecognitionResultV1,
+    request: &RecognitionRequestV1,
+    provider: &ProviderIdentityV1,
+    capabilities: &ProviderCapabilitiesV1,
+) -> Result<(), ProviderErrorKind> {
+    result.source_revision.validate()?;
+    result.provider.validate()?;
+    if result.source_revision != request.source_revision {
+        return Err(ProviderErrorKind::StaleSourceRevision);
+    }
+    if result.request_id != request.request_id
+        || result.input_view_id != request.input_view_id
+        || result.region_id != request.region_id
+        || result.line_id != request.line_id
+    {
+        return Err(ProviderErrorKind::ProviderRequestMismatch);
+    }
+    if result.provider_configuration_id != request.provider_configuration.configuration_id
+        || result.provider_configuration_fingerprint
+            != request.provider_configuration_fingerprint
+    {
+        return Err(ProviderErrorKind::ProviderConfigurationMismatch);
+    }
+    if result.provider != *provider {
+        return Err(ProviderErrorKind::InvalidResponse(
+            "result provider provenance differs from handshake".to_owned(),
+        ));
+    }
+    validate_text(
+        &result.provider_provenance,
+        MAX_TEXT_BYTES,
+        "provider provenance",
+    )?;
+    if result.provider_provenance.is_empty() {
+        return Err(ProviderErrorKind::InvalidResponse(
+            "provider provenance must not be empty".to_owned(),
+        ));
+    }
+    let mut valid_strokes = HashSet::new();
+    valid_strokes
+        .try_reserve(request.stroke_views.len())
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    for view in &request.stroke_views {
+        valid_strokes.insert(view.stroke.clone());
+    }
+    let mut sequences_by_stroke = HashMap::<ProviderStrokeRefV1, HashSet<u64>>::new();
+    sequences_by_stroke
+        .try_reserve(request.stroke_views.len())
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    for sample in &request.samples {
+        let sequences = sequences_by_stroke
+            .entry(sample.stroke.clone())
+            .or_default();
+        sequences
+            .try_reserve(1)
+            .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+        sequences.insert(sample.journal_sequence);
+    }
+    if result.candidates.len() > 1
+        && !capabilities
+            .outputs
+            .contains(&ProviderOutputCapabilityV1::NBest)
+    {
+        return Err(ProviderErrorKind::InvalidResponse(
+            "provider returned multiple candidates without advertising N-best output".to_owned(),
+        ));
+    }
+    for candidate in &result.candidates {
+        validate_text(&candidate.recognized_text, MAX_TEXT_BYTES, "candidate text")?;
+        if candidate.native_score_raw.is_some()
+            && !capabilities
+                .outputs
+                .contains(&ProviderOutputCapabilityV1::NativeScore)
+        {
+            return Err(ProviderErrorKind::InvalidResponse(
+                "provider returned a native score it did not advertise".to_owned(),
+            ));
+        }
+        if candidate
+            .native_score_raw
+            .as_ref()
+            .is_some_and(|number| number.as_f64().is_none_or(|score| !score.is_finite()))
+        {
+            return Err(ProviderErrorKind::InvalidResponse(
+                "provider native score is not finite".to_owned(),
+            ));
+        }
+        if !candidate.stroke_ranges.is_empty()
+            && !capabilities
+                .outputs
+                .contains(&ProviderOutputCapabilityV1::StrokeRanges)
+        {
+            return Err(ProviderErrorKind::InvalidResponse(
+                "provider returned stroke ranges it did not advertise".to_owned(),
+            ));
+        }
+        for range in &candidate.stroke_ranges {
+            range.stroke.validate()?;
+            let sample_sequences = sequences_by_stroke.get(&range.stroke);
+            if range.first_journal_sequence > range.last_journal_sequence
+                || !valid_strokes.contains(&range.stroke)
+                || sample_sequences.is_none_or(|sequences| {
+                    !sequences.contains(&range.first_journal_sequence)
+                        || !sequences.contains(&range.last_journal_sequence)
+                })
+            {
+                return Err(ProviderErrorKind::InvalidResponse(
+                    "candidate stroke range is reversed or references an unknown StrokeRef"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_capabilities_for_request(
+    capabilities: &ProviderCapabilitiesV1,
+    request: &RecognitionRequestV1,
+) -> Result<(), ProviderErrorKind> {
+    if !capabilities
+        .inputs
+        .contains(&ProviderInputCapabilityV1::OnlineStrokes)
+    {
+        return Err(ProviderErrorKind::UnsupportedCapability(
+            "provider did not advertise online stroke input".to_owned(),
+        ));
+    }
+    if request.raster.is_some()
+        && !capabilities
+            .inputs
+            .contains(&ProviderInputCapabilityV1::Raster)
+    {
+        return Err(ProviderErrorKind::UnsupportedCapability(
+            "provider did not advertise raster input".to_owned(),
+        ));
+    }
+    if !capabilities
+        .outputs
+        .contains(&ProviderOutputCapabilityV1::Text)
+    {
+        return Err(ProviderErrorKind::UnsupportedCapability(
+            "provider did not advertise text output".to_owned(),
+        ));
+    }
+    if request
+        .language_hints
+        .iter()
+        .any(|hint| !capabilities.languages.contains(hint))
+    {
+        return Err(ProviderErrorKind::UnsupportedCapability(
+            "provider did not advertise every requested language hint".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_result_for_current_view(
+    request: &RecognitionRequestV1,
+    result: &RecognitionResultV1,
+    current_source_revision: &ProviderSourceRevisionV1,
+    current_input_view_id: &str,
+) -> Result<(), ProviderErrorKind> {
+    if request.source_revision != *current_source_revision
+        || result.source_revision != *current_source_revision
+    {
+        return Err(ProviderErrorKind::StaleSourceRevision);
+    }
+    if request.input_view_id != current_input_view_id
+        || result.input_view_id != current_input_view_id
+        || result.request_id != request.request_id
+    {
+        return Err(ProviderErrorKind::ProviderRequestMismatch);
+    }
+    if result.provider_configuration_id != request.provider_configuration.configuration_id
+        || result.provider_configuration_fingerprint != request.provider_configuration_fingerprint
+    {
+        return Err(ProviderErrorKind::ProviderConfigurationMismatch);
+    }
+    Ok(())
+}
+
+struct BoundedBuffer {
+    bytes: Vec<u8>,
+    maximum: usize,
+    overflowed: bool,
+}
+
+impl BoundedBuffer {
+    fn new(maximum: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            maximum,
+            overflowed: false,
+        }
+    }
+}
+
+impl Write for BoundedBuffer {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(new_length) = self.bytes.len().checked_add(buffer.len()) else {
+            self.overflowed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "bounded JSON buffer length overflow",
+            ));
+        };
+        if new_length > self.maximum {
+            self.overflowed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "bounded JSON buffer limit reached",
+            ));
+        }
+        self.bytes
+            .try_reserve(buffer.len())
+            .map_err(|_| io::Error::other("bounded JSON buffer allocation failed"))?;
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_json_bytes<T: Serialize>(value: &T, maximum: usize) -> Result<Vec<u8>, ProviderErrorKind> {
+    let mut buffer = BoundedBuffer::new(maximum);
+    if let Err(error) = serde_json::to_writer(&mut buffer, value) {
+        if buffer.overflowed {
+            return Err(ProviderErrorKind::OversizedFrame {
+                actual: buffer.bytes.len().saturating_add(1),
+                maximum,
+            });
+        }
+        return Err(ProviderErrorKind::InvalidRequest(format!(
+            "JSON serialization failed: {error}"
+        )));
+    }
+    Ok(buffer.bytes)
+}
+
+fn encode_frame<T: Serialize>(value: &T, maximum: usize) -> Result<Vec<u8>, ProviderErrorKind> {
+    let payload = bounded_json_bytes(value, maximum)?;
+    let length = u32::try_from(payload.len()).map_err(|_| ProviderErrorKind::OversizedFrame {
+        actual: payload.len(),
+        maximum,
+    })?;
+    let frame_length = payload
+        .len()
+        .checked_add(4)
+        .ok_or(ProviderErrorKind::AllocationFailed)?;
+    let mut frame = Vec::new();
+    frame
+        .try_reserve_exact(frame_length)
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+fn read_frame<R: Read>(reader: &mut R, maximum: usize) -> Result<Option<Vec<u8>>, String> {
+    let mut prefix = [0u8; 4];
+    loop {
+        match reader.read(&mut prefix[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(1) => break,
+            Ok(_) => unreachable!("one-byte read cannot return more than one byte"),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("could not read frame prefix: {error}")),
+        }
+    }
+    reader
+        .read_exact(&mut prefix[1..])
+        .map_err(|error| format!("truncated frame prefix: {error}"))?;
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length == 0 || length > maximum {
+        return Err(format!(
+            "worker frame length {length} is outside 1..={maximum} bytes"
+        ));
+    }
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(length)
+        .map_err(|_| "worker frame allocation failed".to_owned())?;
+    payload.resize(length, 0);
+    reader
+        .read_exact(&mut payload)
+        .map_err(|error| format!("truncated worker frame: {error}"))?;
+    Ok(Some(payload))
+}
+
+fn read_worker_responses(
+    mut stdout: impl Read,
+    sender: SyncSender<Result<WorkerResponseFrameV1, String>>,
+    completion: SyncSender<Result<(), String>>,
+) {
+    for maximum in [MAX_HANDSHAKE_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES] {
+        let frame = match read_frame(&mut stdout, maximum) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                let message = "worker closed stdout before protocol response".to_owned();
+                let _ = sender.send(Err(message.clone()));
+                let _ = completion.send(Err(message));
+                return;
+            }
+            Err(message) => {
+                let _ = sender.send(Err(message.clone()));
+                let _ = completion.send(Err(message));
+                return;
+            }
+        };
+        let parsed = serde_json::from_slice::<WorkerResponseFrameV1>(&frame)
+            .map_err(|error| format!("invalid worker response JSON: {error}"));
+        match parsed {
+            Ok(response) => {
+                if sender.send(Ok(response)).is_err() {
+                    let _ = completion.send(Err("protocol response receiver closed".to_owned()));
+                    return;
+                }
+            }
+            Err(message) => {
+                let _ = sender.send(Err(message.clone()));
+                let _ = completion.send(Err(message));
+                return;
+            }
+        }
+    }
+
+    let completion_status = match read_frame(&mut stdout, MAX_RESPONSE_FRAME_BYTES) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err("worker emitted an unexpected third protocol frame".to_owned()),
+        Err(message) => Err(message),
+    };
+    let _ = completion.send(completion_status);
+}
+
+struct WorkerWriteCommand {
+    frame: Vec<u8>,
+    acknowledgement: SyncSender<Result<(), String>>,
+}
+
+fn write_worker_frames(
+    mut stdin: impl Write,
+    receiver: Receiver<WorkerWriteCommand>,
+) {
+    while let Ok(command) = receiver.recv() {
+        let result = stdin
+            .write_all(&command.frame)
+            .and_then(|()| stdin.flush())
+            .map_err(|error| error.to_string());
+        let should_stop = result.is_err();
+        let _ = command.acknowledgement.send(result);
+        if should_stop {
+            return;
+        }
+    }
+}
+
+fn send_frame_to_worker(
+    sender: &SyncSender<WorkerWriteCommand>,
+    frame: Vec<u8>,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+    phase: ProviderPhase,
+) -> Result<(), ProviderErrorKind> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ProviderErrorKind::Cancelled);
+    }
+    let (acknowledgement_sender, acknowledgement_receiver) = mpsc::sync_channel(1);
+    let command = WorkerWriteCommand {
+        frame,
+        acknowledgement: acknowledgement_sender,
+    };
+    match sender.try_send(command) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            return Err(ProviderErrorKind::IoFailed {
+                phase,
+                message: "bounded provider stdin queue is full".to_owned(),
+            });
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            return Err(ProviderErrorKind::IoFailed {
+                phase,
+                message: "provider stdin writer stopped".to_owned(),
+            });
+        }
+    }
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ProviderErrorKind::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ProviderErrorKind::TimedOut(phase));
+        }
+        match acknowledgement_receiver.recv_timeout(remaining.min(IO_POLL_INTERVAL)) {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(message)) => {
+                return Err(ProviderErrorKind::IoFailed { phase, message });
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ProviderErrorKind::IoFailed {
+                    phase,
+                    message: "provider stdin writer acknowledgement was lost".to_owned(),
+                });
+            }
+        }
+    }
+}
+
+fn receive_worker_response(
+    receiver: &Receiver<Result<WorkerResponseFrameV1, String>>,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+    phase: ProviderPhase,
+) -> Result<WorkerResponseFrameV1, ProviderErrorKind> {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ProviderErrorKind::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ProviderErrorKind::TimedOut(phase));
+        }
+        match receiver.recv_timeout(remaining.min(IO_POLL_INTERVAL)) {
+            Ok(Ok(response)) => return Ok(response),
+            Ok(Err(message)) => {
+                return Err(ProviderErrorKind::InvalidResponse(message));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ProviderErrorKind::UnexpectedFrame(
+                    "provider response channel closed before a frame arrived".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+fn receive_reader_completion(
+    receiver: &Receiver<Result<(), String>>,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<(), ProviderErrorKind> {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ProviderErrorKind::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ProviderErrorKind::TimedOut(ProviderPhase::Shutdown));
+        }
+        match receiver.recv_timeout(remaining.min(IO_POLL_INTERVAL)) {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(message)) => return Err(ProviderErrorKind::InvalidResponse(message)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ProviderErrorKind::InvalidResponse(
+                    "provider stdout reader closed without clean EOF".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct BoundedStderr {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn drain_stderr(mut stderr: impl Read, capture: Arc<Mutex<BoundedStderr>>) {
+    let mut buffer = [0u8; 4096];
+    loop {
+        match stderr.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(read) => {
+                let Ok(mut stored) = capture.lock() else {
+                    return;
+                };
+                let remaining = MAX_STDERR_BYTES.saturating_sub(stored.bytes.len());
+                let keep = remaining.min(read);
+                if keep > 0 {
+                    if stored.bytes.try_reserve(keep).is_ok() {
+                        stored.bytes.extend_from_slice(&buffer[..keep]);
+                    } else {
+                        stored.truncated = true;
+                    }
+                }
+                if keep < read || stored.bytes.len() >= MAX_STDERR_BYTES {
+                    stored.truncated = true;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+fn stderr_snapshot(capture: &Arc<Mutex<BoundedStderr>>) -> (Vec<u8>, bool) {
+    match capture.lock() {
+        Ok(stored) => (stored.bytes.clone(), stored.truncated),
+        Err(_) => (Vec::new(), true),
+    }
+}
+
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("child is present until exit status")
+    }
+
+    fn wait_until(
+        &mut self,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> Result<ExitStatus, ProviderErrorKind> {
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(ProviderErrorKind::Cancelled);
+            }
+            if let Some(status) = self
+                .child_mut()
+                .try_wait()
+                .map_err(|error| ProviderErrorKind::IoFailed {
+                    phase: ProviderPhase::Shutdown,
+                    message: error.to_string(),
+                })?
+            {
+                self.0 = None;
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(ProviderErrorKind::TimedOut(ProviderPhase::Shutdown));
+            }
+            thread::sleep(IO_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+                let cleanup_deadline = Instant::now() + CHILD_CLEANUP_GRACE;
+                while Instant::now() < cleanup_deadline {
+                    if child.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    thread::sleep(
+                        IO_POLL_INTERVAL.min(cleanup_deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::{EditCommand, StoredEditAction, StoredPhysicalSample, StoredStrokeStart};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        process,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static NEXT_MOCK_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn stroke_ref(stroke_id: &str, device_id: &str) -> StrokeRef {
+        StrokeRef {
+            journal_id: "provider-test-journal".to_owned(),
+            session_id: "provider-test-session".to_owned(),
+            source_api: "direct-wm-pointer-pen-history".to_owned(),
+            device_id: Some(device_id.to_owned()),
+            pointer_id: Some(17),
+            stroke_id: stroke_id.to_owned(),
+        }
+    }
+
+    fn physical_sample(target: &StrokeRef, source_sequence: u64, x: i64) -> PhysicalSample {
+        PhysicalSample {
+            session_id: target.session_id.clone(),
+            source_api: target.source_api.clone(),
+            source_device_id: target.device_id.clone(),
+            pointer_id: target.pointer_id,
+            stroke_id: Some(target.stroke_id.clone()),
+            source_sequence,
+            config_id: Some("provider-test-config".to_owned()),
+            app_arrival_elapsed_ns: 18_446_744_073_709_551_617,
+            position: Some(RawPosition {
+                coordinate_space: "windows-screen-coordinates".to_owned(),
+                units: "screen-pixel".to_owned(),
+                x_raw: x,
+                y_raw: 220,
+            }),
+            pressure: Some(RawPressure {
+                representation: "raw-pen-mask-pressure".to_owned(),
+                units: "device-range-unknown".to_owned(),
+                value_raw: 513,
+                mask_raw: Some(1),
+                minimum_raw: Some(0),
+                maximum_raw: Some(1024),
+            }),
+            native_timestamp: Some(NativeTimestamp {
+                clock_domain: "POINTER_INFO.PerformanceCount/QPC".to_owned(),
+                units: "ticks".to_owned(),
+                count_raw: source_sequence * 10_000,
+                frequency_hz: Some(10_000_000),
+            }),
+            contact_range_state: Some("InRange+Contact".to_owned()),
+            button_state_raw: None,
+            tilt_x_raw: None,
+            tilt_y_raw: None,
+            rotation_raw: None,
+            raw_payload: vec![0xd0, (source_sequence & 0xff) as u8, 1],
+        }
+    }
+
+    fn fixture_state_and_selection() -> (JournalReplayState, Vec<StrokeRef>) {
+        // The first sample has a lexically later StrokeRef, deliberately
+        // differing from both selection order and CanvasScene's identity sort.
+        let z_stroke = stroke_ref("z-stroke", "opaque-device-z");
+        let a_stroke = stroke_ref("a-stroke", "opaque-device-a");
+        let mut state = JournalReplayState {
+            journal_id: "provider-test-journal".to_owned(),
+            current_session_id: "provider-test-session".to_owned(),
+            last_sequence: 30,
+            logical_revision: 4,
+            ..JournalReplayState::default()
+        };
+        state.physical_samples.push(StoredPhysicalSample {
+            sequence: 20,
+            sample: physical_sample(&z_stroke, 501, 110),
+        });
+        state.physical_samples.push(StoredPhysicalSample {
+            sequence: 22,
+            sample: physical_sample(&z_stroke, 502, 114),
+        });
+        state.physical_samples.push(StoredPhysicalSample {
+            sequence: 25,
+            sample: physical_sample(&a_stroke, 301, 310),
+        });
+        state.stroke_starts.push(StoredStrokeStart {
+            sequence: 12,
+            app_epoch_id: z_stroke.session_id.clone(),
+            app_arrival_elapsed_ns: 4,
+            target: z_stroke.clone(),
+            view_frame: StrokeViewFrame::default(),
+        });
+        state.stroke_starts.push(StoredStrokeStart {
+            sequence: 15,
+            app_epoch_id: a_stroke.session_id.clone(),
+            app_arrival_elapsed_ns: 5,
+            target: a_stroke.clone(),
+            view_frame: StrokeViewFrame {
+                screen_origin_x_px: 1234,
+                screen_origin_y_px: 5678,
+                dpi_scale_factor_bits: 1.5_f64.to_bits(),
+                canvas_zoom_bits: 2.0_f64.to_bits(),
+                canvas_pan_x_bits: 7.0_f64.to_bits(),
+                canvas_pan_y_bits: 9.0_f64.to_bits(),
+                toolbar_height_px: 42,
+            },
+        });
+        state.edit_actions.push(StoredEditAction {
+            sequence: 27,
+            action_id: 27,
+            revision_id: 4,
+            app_epoch_id: z_stroke.session_id.clone(),
+            app_arrival_elapsed_ns: 8,
+            command: EditCommand::Move {
+                target: z_stroke.clone(),
+                delta_x_raw: 11,
+                delta_y_raw: -7,
+                coordinate_space: "windows-screen-coordinates".to_owned(),
+                units: "screen-pixel".to_owned(),
+            },
+            active: true,
+        });
+        (state, vec![a_stroke, z_stroke])
+    }
+
+    fn fixture_configuration() -> ProviderConfigurationV1 {
+        ProviderConfigurationV1 {
+            configuration_id: "operator-approved-config".to_owned(),
+            values: BTreeMap::from([("language-mode".to_owned(), "recognize".to_owned())]),
+        }
+    }
+
+    fn fixture_request_for_state(
+        state: &JournalReplayState,
+        selected: &[StrokeRef],
+        provider_configuration: ProviderConfigurationV1,
+    ) -> RecognitionRequestV1 {
+        build_recognition_request(
+            state,
+            "request-1".to_owned(),
+            "region-1".to_owned(),
+            "line-2".to_owned(),
+            "windows-screen-coordinates".to_owned(),
+            "screen-pixel".to_owned(),
+            vec!["vi-VN".to_owned(), "en-US".to_owned()],
+            provider_configuration,
+            selected,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn fixture_request() -> (JournalReplayState, RecognitionRequestV1) {
+        let (state, selected) = fixture_state_and_selection();
+        let request = fixture_request_for_state(&state, &selected, fixture_configuration());
+        (state, request)
+    }
+
+    fn fixture_provider() -> ProviderIdentityV1 {
+        ProviderIdentityV1 {
+            provider_id: "mock-provider".to_owned(),
+            provider_version: "0.0.0-ci-fixture".to_owned(),
+            model_version: Some("fixture-model".to_owned()),
+            resource_version: Some("fixture-resource".to_owned()),
+        }
+    }
+
+    fn fixture_capabilities() -> ProviderCapabilitiesV1 {
+        ProviderCapabilitiesV1 {
+            inputs: vec![ProviderInputCapabilityV1::OnlineStrokes],
+            outputs: vec![
+                ProviderOutputCapabilityV1::Text,
+                ProviderOutputCapabilityV1::NativeScore,
+                ProviderOutputCapabilityV1::StrokeRanges,
+            ],
+            languages: vec!["vi-VN".to_owned(), "en-US".to_owned()],
+        }
+    }
+
+    fn fixture_result(
+        request: &RecognitionRequestV1,
+        source_revision: ProviderSourceRevisionV1,
+    ) -> RecognitionResultV1 {
+        let score = serde_json::Number::from_f64(0.75).unwrap();
+        RecognitionResultV1 {
+            request_id: request.request_id.clone(),
+            input_view_id: request.input_view_id.clone(),
+            source_revision,
+            region_id: request.region_id.clone(),
+            line_id: request.line_id.clone(),
+            provider_configuration_id: request.provider_configuration.configuration_id.clone(),
+            provider_configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
+            provider: fixture_provider(),
+            provider_provenance: "CI-only mock fixture; not recognition evidence".to_owned(),
+            candidates: vec![ProviderCandidateV1 {
+                recognized_text: "fixture text".to_owned(),
+                native_score_raw: Some(score),
+                stroke_ranges: vec![ProviderStrokeRangeV1 {
+                    stroke: request.stroke_views[0].stroke.clone(),
+                    first_journal_sequence: request.samples[0].journal_sequence,
+                    last_journal_sequence: request.samples[0].journal_sequence,
+                }],
+                raw_candidate: serde_json::json!({
+                    "text": "fixture text",
+                    "native_score": 0.75,
+                    "source": "test-only"
+                }),
+            }],
+        }
+    }
+
+    #[test]
+    fn request_keeps_journal_order_raw_provenance_and_per_stroke_view() {
+        let (state, request) = fixture_request();
+        assert_eq!(request.protocol_version, PROVIDER_PROTOCOL_VERSION);
+        assert_eq!(request.source_revision.journal_id, state.journal_id);
+        assert_eq!(request.source_revision.logical_revision, 4);
+        assert_eq!(request.source_revision.last_sequence, 30);
+        assert_eq!(request.region_id, "region-1");
+        assert_eq!(request.line_id, "line-2");
+        assert_eq!(
+            request.language_hints,
+            vec!["vi-VN".to_owned(), "en-US".to_owned()]
+        );
+        assert_eq!(
+            request.provider_configuration.configuration_id,
+            "operator-approved-config"
+        );
+        assert_eq!(
+            request
+                .samples
+                .iter()
+                .map(|sample| sample.journal_sequence)
+                .collect::<Vec<_>>(),
+            vec![20, 22, 25]
+        );
+        assert_eq!(request.samples[0].source_sequence_raw, 501);
+        assert_eq!(request.samples[1].source_sequence_raw, 502);
+        assert_eq!(request.samples[2].source_sequence_raw, 301);
+        assert_eq!(request.samples[0].stroke.stroke_id, "z-stroke");
+        assert_eq!(request.samples[1].stroke.stroke_id, "z-stroke");
+        assert_eq!(request.samples[2].stroke.stroke_id, "a-stroke");
+        assert_eq!(request.samples[0].position.as_ref().unwrap().x_raw, 110);
+        let moved = request.samples[0].effective_position.as_ref().unwrap();
+        assert_eq!((moved.x_raw, moved.y_raw), (121, 213));
+        assert_eq!(
+            state.physical_samples[0]
+                .sample
+                .position
+                .as_ref()
+                .unwrap()
+                .x_raw,
+            110,
+            "provider effective geometry never rewrites journal raw coordinates"
+        );
+        assert_eq!(request.samples[0].raw_payload_hex, "d0f501");
+        assert_eq!(
+            request.samples[0].position.as_ref().unwrap().units,
+            "screen-pixel"
+        );
+        assert_eq!(
+            request.samples[0].app_arrival_elapsed_ns_decimal,
+            "18446744073709551617"
+        );
+        assert_eq!(request.stroke_views[0].stroke.stroke_id, "z-stroke");
+        assert_eq!(request.stroke_views[1].stroke.stroke_id, "a-stroke");
+        assert_eq!(
+            request.stroke_views[1]
+                .view_frame
+                .unwrap()
+                .screen_origin_x_px,
+            1234
+        );
+        let (_, repeated) = fixture_request();
+        assert_eq!(request.input_view_id, repeated.input_view_id);
+
+        let (_, selected) = fixture_state_and_selection();
+        let mut no_move_state = state.clone();
+        no_move_state.edit_actions.clear();
+        let no_move_request =
+            fixture_request_for_state(&no_move_state, &selected, fixture_configuration());
+        assert_eq!(request.source_revision, no_move_request.source_revision);
+        assert_ne!(request.input_view_id, no_move_request.input_view_id);
+
+        let mut later_revision = state.clone();
+        later_revision.logical_revision += 1;
+        later_revision.last_sequence += 1;
+        let later_request =
+            fixture_request_for_state(&later_revision, &selected, fixture_configuration());
+        assert_ne!(request.source_revision, later_request.source_revision);
+        assert_ne!(request.input_view_id, later_request.input_view_id);
+    }
+
+    #[test]
+    fn approval_requires_an_absolute_executable_and_nonempty_provider_identity() {
+        let relative = OperatorApprovedProviderConfig::from_explicit_selection(
+            "mock-provider".to_owned(),
+            PathBuf::from("relative-provider.exe"),
+            Vec::new(),
+            fixture_configuration(),
+        );
+        assert!(matches!(
+            relative,
+            Err(ProviderErrorKind::InvalidConfiguration(_))
+        ));
+        let empty_id = OperatorApprovedProviderConfig::from_explicit_selection(
+            String::new(),
+            std::env::current_exe().unwrap(),
+            Vec::new(),
+            fixture_configuration(),
+        );
+        assert!(matches!(
+            empty_id,
+            Err(ProviderErrorKind::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn stale_source_revision_or_input_view_is_rejected_before_acceptance() {
+        let (state, request) = fixture_request();
+        let result = fixture_result(&request, request.source_revision.clone());
+        assert!(validate_result_for_current_view(
+            &request,
+            &result,
+            &request.source_revision,
+            &request.input_view_id
+        )
+        .is_ok());
+
+        let mut advanced = ProviderSourceRevisionV1::from_journal(&state);
+        advanced.last_sequence += 1;
+        assert_eq!(
+            validate_result_for_current_view(
+                &request,
+                &result,
+                &advanced,
+                &request.input_view_id
+            ),
+            Err(ProviderErrorKind::StaleSourceRevision)
+        );
+        assert_eq!(
+            validate_result_for_current_view(
+                &request,
+                &result,
+                &request.source_revision,
+                "another-input-view"
+            ),
+            Err(ProviderErrorKind::StaleSourceRevision)
+        );
+    }
+
+    #[test]
+    fn input_view_is_provider_independent_but_result_binding_is_not() {
+        let (state, selected) = fixture_state_and_selection();
+        let provider_a = fixture_configuration();
+        let provider_b = ProviderConfigurationV1 {
+            configuration_id: "operator-approved-config-b".to_owned(),
+            values: BTreeMap::from([("language-mode".to_owned(), "dictation".to_owned())]),
+        };
+        let request_a = fixture_request_for_state(&state, &selected, provider_a);
+        let request_b = fixture_request_for_state(&state, &selected, provider_b);
+        assert_eq!(request_a.source_revision, request_b.source_revision);
+        assert_eq!(request_a.input_view_id, request_b.input_view_id);
+        assert_ne!(
+            request_a.provider_configuration_fingerprint,
+            request_b.provider_configuration_fingerprint
+        );
+
+        let result_a = fixture_result(&request_a, request_a.source_revision.clone());
+        assert_eq!(result_a.input_view_id, request_b.input_view_id);
+        assert_eq!(
+            validate_recognition_result(
+                &result_a,
+                &request_b,
+                &fixture_provider(),
+                &fixture_capabilities()
+            ),
+            Err(ProviderErrorKind::ProviderConfigurationMismatch)
+        );
+        assert_eq!(
+            validate_result_for_current_view(
+                &request_b,
+                &result_a,
+                &request_b.source_revision,
+                &request_b.input_view_id
+            ),
+            Err(ProviderErrorKind::ProviderConfigurationMismatch)
+        );
+
+        let mut wrong_request_result = fixture_result(&request_b, request_b.source_revision.clone());
+        wrong_request_result.request_id = "another-request".to_owned();
+        assert_eq!(
+            validate_recognition_result(
+                &wrong_request_result,
+                &request_b,
+                &fixture_provider(),
+                &fixture_capabilities()
+            ),
+            Err(ProviderErrorKind::ProviderRequestMismatch)
+        );
+
+        let mut wrong_provider_result = fixture_result(&request_b, request_b.source_revision.clone());
+        wrong_provider_result.provider.provider_id = "another-provider".to_owned();
+        assert!(matches!(
+            validate_recognition_result(
+                &wrong_provider_result,
+                &request_b,
+                &fixture_provider(),
+                &fixture_capabilities()
+            ),
+            Err(ProviderErrorKind::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn provider_stroke_ranges_must_end_on_submitted_samples() {
+        let (_, request) = fixture_request();
+        let provider = fixture_provider();
+        let capabilities = fixture_capabilities();
+        let mut valid = fixture_result(&request, request.source_revision.clone());
+        valid.candidates[0].stroke_ranges[0].last_journal_sequence = 22;
+        assert!(validate_recognition_result(&valid, &request, &provider, &capabilities).is_ok());
+
+        let mut missing_end = valid.clone();
+        missing_end.candidates[0].stroke_ranges[0].last_journal_sequence = 21;
+        assert!(matches!(
+            validate_recognition_result(&missing_end, &request, &provider, &capabilities),
+            Err(ProviderErrorKind::InvalidResponse(_))
+        ));
+        let mut missing_start = valid;
+        missing_start.candidates[0].stroke_ranges[0].first_journal_sequence = 21;
+        assert!(matches!(
+            validate_recognition_result(&missing_start, &request, &provider, &capabilities),
+            Err(ProviderErrorKind::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn multiple_candidates_require_negotiated_nbest_capability() {
+        let (_, request) = fixture_request();
+        let provider = fixture_provider();
+        let mut result = fixture_result(&request, request.source_revision.clone());
+        result.candidates.push(result.candidates[0].clone());
+        let mut capabilities = fixture_capabilities();
+        assert!(matches!(
+            validate_recognition_result(&result, &request, &provider, &capabilities),
+            Err(ProviderErrorKind::InvalidResponse(_))
+        ));
+        capabilities.outputs.push(ProviderOutputCapabilityV1::NBest);
+        assert!(validate_recognition_result(&result, &request, &provider, &capabilities).is_ok());
+    }
+
+    #[test]
+    fn capability_negotiation_rejects_unsupported_inputs_without_fallback() {
+        let (_, request) = fixture_request();
+        let capabilities = ProviderCapabilitiesV1 {
+            inputs: vec![ProviderInputCapabilityV1::OnlineStrokes],
+            outputs: vec![ProviderOutputCapabilityV1::Text],
+            languages: vec!["en-US".to_owned()],
+        };
+        assert!(matches!(
+            validate_capabilities_for_request(&capabilities, &request),
+            Err(ProviderErrorKind::UnsupportedCapability(_))
+        ));
+
+        let mut raster_request = request;
+        raster_request.raster = Some(ProviderRasterInputV1 {
+            width: 1,
+            height: 1,
+            pixel_format: "gray8".to_owned(),
+            coordinate_space: "windows-screen-coordinates".to_owned(),
+            units: "screen-pixel".to_owned(),
+            raw_payload_hex: "00".to_owned(),
+        });
+        raster_request.input_view_id = input_view_id(&raster_request).unwrap();
+        let capabilities = ProviderCapabilitiesV1 {
+            inputs: vec![ProviderInputCapabilityV1::OnlineStrokes],
+            outputs: vec![ProviderOutputCapabilityV1::Text],
+            languages: vec!["vi-VN".to_owned(), "en-US".to_owned()],
+        };
+        assert!(matches!(
+            validate_capabilities_for_request(&capabilities, &raster_request),
+            Err(ProviderErrorKind::UnsupportedCapability(_))
+        ));
+    }
+
+    #[test]
+    fn bounded_json_writer_and_candidate_parser_reject_caps() {
+        assert!(matches!(
+            bounded_json_bytes(&"large string", 4),
+            Err(ProviderErrorKind::OversizedFrame { .. })
+        ));
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct CandidateList {
+            #[serde(deserialize_with = "deserialize_bounded_candidates")]
+            candidates: Vec<ProviderCandidateV1>,
+        }
+        let candidate =
+            r#"{"recognized_text":"x","native_score_raw":null,"stroke_ranges":[],"raw_candidate":{}}"#;
+        let mut json = String::from("{\"candidates\":[");
+        for index in 0..=MAX_PROVIDER_CANDIDATES {
+            if index > 0 {
+                json.push(',');
+            }
+            json.push_str(candidate);
+        }
+        json.push_str("]}");
+        assert!(serde_json::from_str::<CandidateList>(&json).is_err());
+    }
+
+    #[test]
+    fn versioned_json_frames_round_trip_typed_handshake_and_request() {
+        let (_, request) = fixture_request();
+        let frames = [
+            WorkerRequestFrameV1::Handshake {
+                protocol_version: PROVIDER_PROTOCOL_VERSION,
+                provider_id: "mock-provider".to_owned(),
+                configuration_id: request.provider_configuration.configuration_id.clone(),
+                configuration_fingerprint: request
+                    .provider_configuration_fingerprint
+                    .clone(),
+            },
+            WorkerRequestFrameV1::Recognize {
+                protocol_version: PROVIDER_PROTOCOL_VERSION,
+                request,
+            },
+        ];
+        for frame in frames {
+            let encoded = encode_frame(&frame, MAX_REQUEST_FRAME_BYTES).unwrap();
+            let length = u32::from_be_bytes(encoded[..4].try_into().unwrap()) as usize;
+            assert_eq!(length, encoded.len() - 4);
+            let decoded = serde_json::from_slice::<WorkerRequestFrameV1>(&encoded[4..]).unwrap();
+            assert_eq!(decoded, frame);
+        }
+    }
+
+    #[test]
+    fn response_frame_length_is_checked_before_body_allocation() {
+        let oversized_length = (MAX_RESPONSE_FRAME_BYTES as u32 + 1).to_be_bytes();
+        let mut input = io::Cursor::new(oversized_length);
+        assert!(read_frame(&mut input, MAX_RESPONSE_FRAME_BYTES).is_err());
+    }
+
+    #[test]
+    fn stderr_is_drained_while_retention_stays_byte_capped() {
+        let capture = Arc::new(Mutex::new(BoundedStderr::default()));
+        let bytes = vec![b'x'; MAX_STDERR_BYTES + 32];
+        drain_stderr(io::Cursor::new(bytes), Arc::clone(&capture));
+        let (retained, truncated) = stderr_snapshot(&capture);
+        assert_eq!(retained.len(), MAX_STDERR_BYTES);
+        assert!(truncated);
+    }
+
+    fn require_provider_mock_test_opt_in() {
+        fn env_is(key: &str, expected: &str) -> bool {
+            std::env::var(key).is_ok_and(|actual| actual == expected)
+        }
+        let github_event =
+            env_is("GITHUB_EVENT_NAME", "push") || env_is("GITHUB_EVENT_NAME", "pull_request");
+        assert!(
+            cfg!(target_os = "windows")
+                && env_is("LASSOINK_RUN_PROVIDER_MOCK_TESTS", "1")
+                && env_is("CI", "true")
+                && env_is("GITHUB_ACTIONS", "true")
+                && env_is("RUNNER_ENVIRONMENT", "github-hosted")
+                && env_is("RUNNER_OS", "Windows")
+                && env_is("GITHUB_REPOSITORY", "Herzchens/LassoInk")
+                && github_event,
+            "provider subprocess tests require the guarded GitHub-hosted Windows CI job"
+        );
+    }
+
+    struct MockWorkerBinary {
+        directory: PathBuf,
+        executable: PathBuf,
+    }
+
+    impl Drop for MockWorkerBinary {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn compile_mock_worker() -> MockWorkerBinary {
+        require_provider_mock_test_opt_in();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sequence = NEXT_MOCK_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "lassoink-provider-mock-{}-{nonce}-{sequence}",
+            process::id()
+        ));
+        fs::create_dir(&directory).expect("create unique provider mock temp directory");
+        let source_path = directory.join("provider_mock_worker.rs");
+        let executable = directory.join("provider_mock_worker.exe");
+        fs::write(
+            &source_path,
+            include_str!("../tests/fixtures/provider_mock_worker.rs"),
+        )
+        .expect("write test-only provider mock source");
+        let mock = MockWorkerBinary {
+            directory,
+            executable,
+        };
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let output = Command::new(rustc)
+            .arg("--edition=2024")
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&mock.executable)
+            .output()
+            .expect("compile the test-only provider mock in the CI temp directory");
+        assert!(
+            output.status.success(),
+            "test-only mock compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        mock
+    }
+
+    fn run_mock_worker(
+        executable: &std::path::Path,
+        mode: &str,
+        response: String,
+        request: RecognitionRequestV1,
+        recognition_timeout: Duration,
+    ) -> Result<ProviderExecution, ProviderExecutionError> {
+        let configuration = request.provider_configuration.clone();
+        let handshake_response = serde_json::to_string(&WorkerResponseFrameV1::Handshake {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            provider: fixture_provider(),
+            configuration_id: configuration.configuration_id.clone(),
+            configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
+            capabilities: fixture_capabilities(),
+        })
+        .unwrap();
+        let approved = OperatorApprovedProviderConfig::from_explicit_selection(
+            "mock-provider".to_owned(),
+            executable.to_path_buf(),
+            vec![mode.to_owned(), handshake_response, response],
+            configuration,
+        )
+        .unwrap();
+        let worker = ProviderWorkerHandle::start(
+            approved,
+            ProviderCallTimeouts {
+                handshake: Duration::from_secs(5),
+                recognition: recognition_timeout,
+                shutdown: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        worker.try_submit(request).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match worker.try_receive() {
+                ProviderWorkerPoll::Outcome(outcome) => return outcome.outcome,
+                ProviderWorkerPoll::Stopped => panic!("provider worker exited before returning a result"),
+                ProviderWorkerPoll::Pending => {}
+            }
+            assert!(Instant::now() < deadline, "provider worker result timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "CI-only subprocess integration test; see guarded hosted provider test job"]
+    fn provider_mock_crash_timeout_and_stale_revision_are_isolated() {
+        require_provider_mock_test_opt_in();
+        let mock = compile_mock_worker();
+        let (_state, request) = fixture_request();
+
+        let crash = run_mock_worker(
+            &mock.executable,
+            "crash",
+            String::new(),
+            request.clone(),
+            Duration::from_secs(2),
+        );
+        assert!(crash.is_err(), "worker process crash returns an error to core");
+
+        let timeout = run_mock_worker(
+            &mock.executable,
+            "hang",
+            String::new(),
+            request.clone(),
+            Duration::from_millis(150),
+        );
+        assert!(matches!(
+            timeout,
+            Err(ProviderExecutionError {
+                kind: ProviderErrorKind::TimedOut(ProviderPhase::Recognition),
+                ..
+            })
+        ));
+
+        let stale_result = fixture_result(
+            &request,
+            ProviderSourceRevisionV1 {
+                logical_revision: request.source_revision.logical_revision + 1,
+                ..request.source_revision.clone()
+            },
+        );
+        let stale_response = serde_json::to_string(&WorkerResponseFrameV1::Recognition {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            result: stale_result,
+        })
+        .unwrap();
+        let stale = run_mock_worker(
+            &mock.executable,
+            "stale",
+            stale_response,
+            request.clone(),
+            Duration::from_secs(2),
+        );
+        assert!(matches!(
+            stale,
+            Err(ProviderExecutionError {
+                kind: ProviderErrorKind::StaleSourceRevision,
+                ..
+            })
+        ));
+
+        let valid_result = fixture_result(&request, request.source_revision.clone());
+        let valid_response = serde_json::to_string(&WorkerResponseFrameV1::Recognition {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            result: valid_result.clone(),
+        })
+        .unwrap();
+        let extra_response = run_mock_worker(
+            &mock.executable,
+            "extra",
+            serde_json::to_string(&WorkerResponseFrameV1::Recognition {
+                protocol_version: PROVIDER_PROTOCOL_VERSION,
+                result: valid_result.clone(),
+            })
+            .unwrap(),
+            request.clone(),
+            Duration::from_secs(2),
+        );
+        assert!(matches!(
+            extra_response,
+            Err(ProviderExecutionError {
+                kind: ProviderErrorKind::InvalidResponse(message),
+                ..
+            }) if message.contains("third protocol frame")
+        ));
+
+        let valid = run_mock_worker(
+            &mock.executable,
+            "ok",
+            valid_response,
+            request,
+            Duration::from_secs(2),
+        )
+        .expect("the worker remains usable after earlier provider failures");
+        assert_eq!(valid.provider.provider_id, "mock-provider");
+        assert!(valid
+            .capabilities
+            .inputs
+            .contains(&ProviderInputCapabilityV1::OnlineStrokes));
+        assert_eq!(valid.result.candidates[0].recognized_text, "fixture text");
+        assert!(!valid.stderr_truncated);
+    }
+}

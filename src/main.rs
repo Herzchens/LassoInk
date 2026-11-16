@@ -6,6 +6,8 @@ mod canvas;
 mod journal;
 mod process_cpu;
 mod project_runtime;
+#[allow(dead_code)]
+mod provider_protocol;
 mod session;
 mod win32_pointer;
 mod wintab;
