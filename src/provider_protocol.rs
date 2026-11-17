@@ -4742,9 +4742,14 @@ mod tests {
             success_a["source_revision"]["journal_id"],
             target.journal_id
         );
-        assert!(success_a["input_view_id"].as_str().is_some_and(|value| {
-            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }));
+        let input_view_id = success_a["input_view_id"].as_str().unwrap();
+        let input_view_hash = input_view_id.strip_prefix("input-view-v1-").unwrap();
+        assert_eq!(input_view_hash.len(), 16);
+        assert!(
+            input_view_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
         assert_eq!(success_a["input_view_id"], success_b["input_view_id"]);
         assert_eq!(
             success_a["source_sample_sequences"],
