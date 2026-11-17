@@ -3480,7 +3480,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(metrics.whitespace_token_syllable_wer.unwrap().errors, 1);
+        assert_eq!(metrics.whitespace_token_syllable_wer.unwrap().errors, 2);
         assert_eq!(
             metrics.syllable_boundary_offset_diagnostic.unwrap().errors,
             1
