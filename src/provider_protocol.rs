@@ -48,7 +48,7 @@ const MAX_PROVIDER_SAMPLES: usize = 4096;
 const MAX_PROVIDER_CANDIDATES: usize = 128;
 const MAX_PROVIDER_STROKE_RANGES: usize = 256;
 const MAX_RAW_SAMPLE_BYTES: usize = 8192;
-const MAX_TOTAL_RAW_SAMPLE_BYTES: usize = 1 * 1024 * 1024;
+const MAX_TOTAL_RAW_SAMPLE_BYTES: usize = 1024 * 1024;
 const MAX_ID_BYTES: usize = 256;
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_LANGUAGE_HINTS: usize = 16;
@@ -297,10 +297,9 @@ fn reap_process_cleanup_registry_locked(registry: &mut ProcessCleanupRegistry) {
                     .child
                     .as_mut()
                     .is_none_or(|child| child.close_job().is_ok())
+                && let Some(child) = session.child.as_mut()
             {
-                if let Some(child) = session.child.as_mut() {
-                    child.clear_quarantined_fault_after_reap();
-                }
+                child.clear_quarantined_fault_after_reap();
             }
         }
         if quarantine_can_release(
@@ -702,22 +701,40 @@ struct RequestFingerprintV1<'a> {
     raster: &'a Option<ProviderRasterInputV1>,
 }
 
+/// Explicit inputs for building a bounded recognition request from one journal view.
+pub(crate) struct RecognitionRequestBuildInput<'a> {
+    pub(crate) state: &'a JournalReplayState,
+    pub(crate) request_id: String,
+    pub(crate) region_id: String,
+    pub(crate) line_id: String,
+    pub(crate) coordinate_space: String,
+    pub(crate) coordinate_units: String,
+    pub(crate) language_hints: Vec<String>,
+    pub(crate) requested_input_modalities: Vec<ProviderInputCapabilityV1>,
+    pub(crate) provider_configuration: ProviderConfigurationV1,
+    pub(crate) selected_strokes: &'a [StrokeRef],
+    pub(crate) raster: Option<ProviderRasterInputV1>,
+}
+
 /// Snapshot and hash the journal-selected view for provider work. This bounded
 /// projection is O(selected samples); callers should schedule it on the
 /// provider preparation worker rather than the redraw/event loop.
 pub(crate) fn build_recognition_request(
-    state: &JournalReplayState,
-    request_id: String,
-    region_id: String,
-    line_id: String,
-    coordinate_space: String,
-    coordinate_units: String,
-    language_hints: Vec<String>,
-    requested_input_modalities: Vec<ProviderInputCapabilityV1>,
-    provider_configuration: ProviderConfigurationV1,
-    selected_strokes: &[StrokeRef],
-    raster: Option<ProviderRasterInputV1>,
+    input: RecognitionRequestBuildInput<'_>,
 ) -> Result<RecognitionRequestV1, ProviderErrorKind> {
+    let RecognitionRequestBuildInput {
+        state,
+        request_id,
+        region_id,
+        line_id,
+        coordinate_space,
+        coordinate_units,
+        language_hints,
+        requested_input_modalities,
+        provider_configuration,
+        selected_strokes,
+        raster,
+    } = input;
     validate_text(&state.journal_id, MAX_ID_BYTES, "journal ID")?;
     if state.journal_id.is_empty() {
         return Err(ProviderErrorKind::InvalidRequest(
@@ -824,7 +841,7 @@ pub(crate) fn build_recognition_request(
                 "selected raw sample payload exceeds the protocol byte cap".to_owned(),
             ));
         }
-        validate_source_sample(&projected_sample.sample)?;
+        validate_source_sample(projected_sample.sample)?;
         samples.push(provider_sample(
             projected_sample.sequence,
             projected_sample.sample,
@@ -1587,7 +1604,7 @@ fn validate_raster_bounds(raster: &ProviderRasterInputV1) -> Result<(), Provider
         || raster.height == 0
         || declared_area.is_none_or(|area| area > MAX_TOTAL_RAW_SAMPLE_BYTES as u64)
         || raster.raw_payload_hex.is_empty()
-        || raster.raw_payload_hex.len() % 2 != 0
+        || !raster.raw_payload_hex.len().is_multiple_of(2)
         || raw_bytes == 0
         || raw_bytes > MAX_TOTAL_RAW_SAMPLE_BYTES
     {
@@ -1769,7 +1786,7 @@ pub(crate) enum WorkerRequestFrameV1 {
     },
     Recognize {
         protocol_version: u32,
-        request: RecognitionRequestV1,
+        request: Box<RecognitionRequestV1>,
     },
 }
 
@@ -1909,15 +1926,15 @@ pub(crate) struct ProviderJobOutcome {
 
 #[derive(Debug)]
 pub(crate) enum ProviderSubmitError {
-    Backpressure(RecognitionRequestV1),
-    Stopped(RecognitionRequestV1),
+    Backpressure(Box<RecognitionRequestV1>),
+    Stopped(Box<RecognitionRequestV1>),
     Invalid(ProviderErrorKind),
 }
 
 #[derive(Debug)]
 pub(crate) enum ProviderWorkerPoll {
     Pending,
-    Outcome(ProviderJobOutcome),
+    Outcome(Box<ProviderJobOutcome>),
     Stopped,
 }
 
@@ -1932,7 +1949,7 @@ enum ProviderWorkerCommand {
 /// cannot race across callers.
 pub(crate) struct ProviderWorkerHandle {
     commands: SyncSender<ProviderWorkerCommand>,
-    results: Receiver<ProviderJobOutcome>,
+    results: Receiver<Box<ProviderJobOutcome>>,
     cancelled: Arc<AtomicBool>,
     pending: AtomicBool,
     _owner_thread: PhantomData<Rc<()>>,
@@ -1946,7 +1963,7 @@ impl ProviderWorkerHandle {
         let timeouts = timeouts.validate()?;
         let worker_slot = reserve_provider_worker_thread()?;
         let (command_sender, command_receiver) = mpsc::sync_channel(1);
-        let (result_sender, results) = mpsc::sync_channel(1);
+        let (result_sender, results) = mpsc::sync_channel::<Box<ProviderJobOutcome>>(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
         let provider_thread = thread::Builder::new()
@@ -1956,14 +1973,14 @@ impl ProviderWorkerHandle {
                     if worker_cancelled.load(Ordering::Acquire) {
                         match command_receiver.try_recv() {
                             Ok(ProviderWorkerCommand::Recognize(request)) => {
-                                let cancelled_result = ProviderJobOutcome {
+                                let cancelled_result = Box::new(ProviderJobOutcome {
                                     request_id: request.request_id,
                                     outcome: Err(ProviderExecutionError {
                                         kind: ProviderErrorKind::Cancelled,
                                         stderr_bytes: Vec::new(),
                                         stderr_truncated: false,
                                     }),
-                                };
+                                });
                                 let _ = result_sender.send(cancelled_result);
                             }
                             Err(_) => {}
@@ -1993,10 +2010,10 @@ impl ProviderWorkerHandle {
                                 })
                             });
                             if result_sender
-                                .send(ProviderJobOutcome {
+                                .send(Box::new(ProviderJobOutcome {
                                     request_id,
                                     outcome,
-                                })
+                                }))
                                 .is_err()
                             {
                                 break;
@@ -2021,7 +2038,7 @@ impl ProviderWorkerHandle {
         request: RecognitionRequestV1,
     ) -> Result<(), ProviderSubmitError> {
         if self.cancelled.load(Ordering::Acquire) {
-            return Err(ProviderSubmitError::Stopped(request));
+            return Err(ProviderSubmitError::Stopped(Box::new(request)));
         }
         validate_request_admission(&request).map_err(ProviderSubmitError::Invalid)?;
         if self
@@ -2029,7 +2046,7 @@ impl ProviderWorkerHandle {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return Err(ProviderSubmitError::Backpressure(request));
+            return Err(ProviderSubmitError::Backpressure(Box::new(request)));
         }
         match self
             .commands
@@ -2038,11 +2055,11 @@ impl ProviderWorkerHandle {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(ProviderWorkerCommand::Recognize(request))) => {
                 self.pending.store(false, Ordering::Release);
-                Err(ProviderSubmitError::Backpressure(request))
+                Err(ProviderSubmitError::Backpressure(Box::new(request)))
             }
             Err(TrySendError::Disconnected(ProviderWorkerCommand::Recognize(request))) => {
                 self.pending.store(false, Ordering::Release);
-                Err(ProviderSubmitError::Stopped(request))
+                Err(ProviderSubmitError::Stopped(Box::new(request)))
             }
         }
     }
@@ -2135,7 +2152,7 @@ impl ProviderProcessRunner<'_> {
         };
         let recognition_request = WorkerRequestFrameV1::Recognize {
             protocol_version: PROVIDER_PROTOCOL_VERSION,
-            request: request.clone(),
+            request: Box::new(request.clone()),
         };
         let handshake_frame = encode_frame(&handshake_request, MAX_HANDSHAKE_FRAME_BYTES)?;
         let recognition_frame = encode_frame(&recognition_request, MAX_REQUEST_FRAME_BYTES)?;
@@ -3159,13 +3176,11 @@ mod tests {
         // differing from both selection order and CanvasScene's identity sort.
         let z_stroke = stroke_ref("z-stroke", "opaque-device-z");
         let a_stroke = stroke_ref("a-stroke", "opaque-device-a");
-        let mut state = JournalReplayState {
-            journal_id: "provider-test-journal".to_owned(),
-            current_session_id: "provider-test-session".to_owned(),
-            last_sequence: 30,
-            logical_revision: 4,
-            ..JournalReplayState::default()
-        };
+        let mut state = JournalReplayState::default();
+        state.journal_id = "provider-test-journal".to_owned();
+        state.current_session_id = "provider-test-session".to_owned();
+        state.last_sequence = 30;
+        state.logical_revision = 4;
         state.physical_samples.push(StoredPhysicalSample {
             sequence: 20,
             sample: physical_sample(&z_stroke, 501, 110),
@@ -3246,19 +3261,19 @@ mod tests {
         requested_input_modalities: Vec<ProviderInputCapabilityV1>,
         raster: Option<ProviderRasterInputV1>,
     ) -> RecognitionRequestV1 {
-        build_recognition_request(
+        build_recognition_request(RecognitionRequestBuildInput {
             state,
-            "request-1".to_owned(),
-            "region-1".to_owned(),
-            "line-2".to_owned(),
-            "windows-screen-coordinates".to_owned(),
-            "screen-pixel".to_owned(),
-            vec!["vi-VN".to_owned(), "en-US".to_owned()],
+            request_id: "request-1".to_owned(),
+            region_id: "region-1".to_owned(),
+            line_id: "line-2".to_owned(),
+            coordinate_space: "windows-screen-coordinates".to_owned(),
+            coordinate_units: "screen-pixel".to_owned(),
+            language_hints: vec!["vi-VN".to_owned(), "en-US".to_owned()],
             requested_input_modalities,
             provider_configuration,
-            selected,
+            selected_strokes: selected,
             raster,
-        )
+        })
         .unwrap()
     }
 
@@ -3819,7 +3834,7 @@ mod tests {
             },
             WorkerRequestFrameV1::Recognize {
                 protocol_version: PROVIDER_PROTOCOL_VERSION,
-                request,
+                request: Box::new(request),
             },
         ];
         for frame in frames {

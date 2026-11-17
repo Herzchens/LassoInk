@@ -250,13 +250,13 @@ impl NativeChild {
     }
 
     fn close_retained_setup_handles(&mut self) -> io::Result<()> {
-        let mut index = 0;
-        while index < self.retained_setup_handles.len() {
+        while !self.retained_setup_handles.is_empty() {
+            let index = self.retained_setup_handles.len() - 1;
             if let Err(error) = self.retained_setup_handles[index].close_checked() {
                 self.cleanup_faulted = true;
                 return Err(error);
             }
-            self.retained_setup_handles.swap_remove(index);
+            let _ = self.retained_setup_handles.pop();
         }
         Ok(())
     }
@@ -438,7 +438,7 @@ pub(super) fn spawn_provider(
         drop(process_owner);
         None
     };
-    let mut primary_thread = OwnedHandle::from_raw(process_info.hThread);
+    let primary_thread = OwnedHandle::from_raw(process_info.hThread);
     let thread_valid = primary_thread.is_valid();
     let native_child = NativeChild {
         process,
@@ -453,16 +453,16 @@ pub(super) fn spawn_provider(
     // any further fallible handle closing or stdio conversion happens.
     child_guard.attach_child(native_child);
     let mut setup_error = None;
-    if thread_valid {
-        if let Err(error) = close_setup_handle(primary_thread, child_guard) {
-            setup_error = Some(error);
-        }
+    if thread_valid
+        && let Err(error) = close_setup_handle(primary_thread, child_guard)
+    {
+        setup_error = Some(error);
     }
     for handle in [child_stdin, child_stdout, child_stderr] {
-        if let Err(error) = close_setup_handle(handle, child_guard) {
-            if setup_error.is_none() {
-                setup_error = Some(error);
-            }
+        if let Err(error) = close_setup_handle(handle, child_guard)
+            && setup_error.is_none()
+        {
+            setup_error = Some(error);
         }
     }
     if let Some(error) = setup_error {
@@ -501,7 +501,7 @@ pub(super) fn cancel_synchronous_io(thread: &JoinHandle<()>) {
 fn create_kill_on_close_job() -> io::Result<OwnedHandle> {
     // SAFETY: null security attributes create a private, non-inheritable job.
     let raw = unsafe { CreateJobObjectW(null(), null()) };
-    let mut job = OwnedHandle::new(raw)?;
+    let job = OwnedHandle::new(raw)?;
     // Defense-in-depth: keep the Job Object out of all child handle tables.
     clear_inheritance(job.raw())?;
 
@@ -525,7 +525,7 @@ fn create_kill_on_close_job() -> io::Result<OwnedHandle> {
 }
 
 fn create_pipe_pair() -> io::Result<(OwnedHandle, OwnedHandle)> {
-    let mut security = SECURITY_ATTRIBUTES {
+    let security = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: null_mut(),
         bInheritHandle: 1,
@@ -535,7 +535,7 @@ fn create_pipe_pair() -> io::Result<(OwnedHandle, OwnedHandle)> {
     let mut write: HANDLE = 0;
     // SAFETY: outputs are writable HANDLE slots and security describes an
     // inheritable anonymous pipe. The HANDLE_LIST later limits inheritance.
-    if unsafe { CreatePipe(&mut read, &mut write, &mut security, 0) } == 0 {
+    if unsafe { CreatePipe(&mut read, &mut write, &security, 0) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let read = OwnedHandle::from_raw(read);
