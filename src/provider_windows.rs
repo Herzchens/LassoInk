@@ -28,20 +28,19 @@ use windows_sys::Win32::{
     },
     Security::SECURITY_ATTRIBUTES,
     System::{
+        IO::CancelSynchronousIo,
         JobObjects::{
             CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
             QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
         },
-        IO::CancelSynchronousIo,
         Pipes::CreatePipe,
         Threading::{
             CREATE_NO_WINDOW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-            InitializeProcThreadAttributeList, PROCESS_INFORMATION,
-            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-            STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
-            WaitForSingleObject,
+            InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+            STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
         },
     },
 };
@@ -113,12 +112,10 @@ impl NativeChild {
             || !self.active_processes_zero_observed
             || !self.retained_setup_handles.is_empty()
         {
-            return Err(io::Error::other(
-                concat!(
-                    "refusing to release provider Job Object before parent exit, zero active ",
-                    "processes, and setup-handle release are observed"
-                ),
-            ));
+            return Err(io::Error::other(concat!(
+                "refusing to release provider Job Object before parent exit, zero active ",
+                "processes, and setup-handle release are observed"
+            )));
         }
         let Some(job) = self.job.as_mut() else {
             return Ok(());
@@ -197,12 +194,10 @@ impl NativeChild {
     fn observe_job_active_processes_once(&mut self) -> io::Result<bool> {
         if !self.process_exit_observed || self.process.is_some() {
             self.cleanup_faulted = true;
-            return Err(io::Error::other(
-                concat!(
-                    "cannot query provider tree completion before observing and releasing ",
-                    "the parent process handle"
-                ),
-            ));
+            return Err(io::Error::other(concat!(
+                "cannot query provider tree completion before observing and releasing ",
+                "the parent process handle"
+            )));
         }
         self.close_retained_setup_handles()?;
         if self.active_processes_zero_observed {
@@ -210,12 +205,10 @@ impl NativeChild {
         }
         let Some(job) = self.job.as_ref().map(OwnedHandle::raw) else {
             self.cleanup_faulted = true;
-            return Err(io::Error::other(
-                concat!(
-                    "provider Job Object handle was released before active-process ",
-                    "completion was observed"
-                ),
-            ));
+            return Err(io::Error::other(concat!(
+                "provider Job Object handle was released before active-process ",
+                "completion was observed"
+            )));
         };
 
         let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
@@ -403,7 +396,9 @@ pub(super) fn spawn_provider(
     retained_setup_handles
         .try_reserve_exact(MAX_RETAINED_SETUP_HANDLES)
         .map_err(|error| {
-            io::Error::other(format!("setup-handle quarantine allocation failed: {error}"))
+            io::Error::other(format!(
+                "setup-handle quarantine allocation failed: {error}"
+            ))
         })?;
 
     let mut process_info: PROCESS_INFORMATION = zeroed_value();
@@ -427,40 +422,9 @@ pub(super) fn spawn_provider(
     };
     if created == 0 {
         let error = io::Error::last_os_error();
-        let process_owner = OwnedHandle::from_raw(process_info.hProcess);
-        let process_valid = process_owner.is_valid();
-        let process = if process_valid {
-            Some(process_owner)
-        } else {
-            drop(process_owner);
-            None
-        };
-        let mut primary_thread = OwnedHandle::from_raw(process_info.hThread);
-        let thread_valid = primary_thread.is_valid();
-        if process_valid || thread_valid {
-            child_guard.attach_child(NativeChild {
-                process,
-                job: Some(job),
-                process_exit_observed: false,
-                process_exit_code: None,
-                active_processes_zero_observed: false,
-                cleanup_faulted: false,
-                retained_setup_handles,
-            });
-            if thread_valid {
-                let _ = close_setup_handle(primary_thread, child_guard);
-            }
-            let _ = close_setup_handle(child_stdin, child_guard);
-            let _ = close_setup_handle(child_stdout, child_guard);
-            let _ = close_setup_handle(child_stderr, child_guard);
-            let _ = close_setup_handle(parent_stdin, child_guard);
-            let _ = close_setup_handle(parent_stdout, child_guard);
-            let _ = close_setup_handle(parent_stderr, child_guard);
-        } else {
-            // Failed CreateProcessW with no returned process/thread handle did
-            // not transfer child ownership; local job/pipe RAII closes setup.
-            let _ = primary_thread.close_checked();
-        }
+        // Microsoft documents only the return status on failure; it does not
+        // promise valid PROCESS_INFORMATION outputs. Do not inspect or wrap
+        // either handle slot. The local job and pipe owners unwind normally.
         return Err(error);
     }
 
@@ -566,21 +530,13 @@ fn create_pipe_pair() -> io::Result<(OwnedHandle, OwnedHandle)> {
         lpSecurityDescriptor: null_mut(),
         bInheritHandle: 1,
     };
-    let mut read = null_mut();
-    let mut write = null_mut();
+    // windows-sys 0.52 aliases HANDLE to isize, with 0 as the null handle.
+    let mut read: HANDLE = 0;
+    let mut write: HANDLE = 0;
     // SAFETY: outputs are writable HANDLE slots and security describes an
     // inheritable anonymous pipe. The HANDLE_LIST later limits inheritance.
     if unsafe { CreatePipe(&mut read, &mut write, &mut security, 0) } == 0 {
-        let error = io::Error::last_os_error();
-        if !read.is_null() && read as isize != -1 {
-            let mut read_owner = OwnedHandle::from_raw(read);
-            let _ = read_owner.close_checked();
-        }
-        if !write.is_null() && write as isize != -1 {
-            let mut write_owner = OwnedHandle::from_raw(write);
-            let _ = write_owner.close_checked();
-        }
-        return Err(error);
+        return Err(io::Error::last_os_error());
     }
     let read = OwnedHandle::from_raw(read);
     let write = OwnedHandle::from_raw(write);
@@ -650,22 +606,14 @@ impl ProcessAttributeList {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "attribute size overflow"))?
             / word;
         let mut storage = Vec::<usize>::new();
-        storage
-            .try_reserve_exact(word_count)
-            .map_err(|error| {
-                io::Error::other(format!("attribute-list allocation failed: {error}"))
-            })?;
+        storage.try_reserve_exact(word_count).map_err(|error| {
+            io::Error::other(format!("attribute-list allocation failed: {error}"))
+        })?;
         storage.resize(word_count, 0);
         let list = storage.as_mut_ptr().cast::<c_void>();
         // SAFETY: storage has sufficient byte size and natural usize alignment.
-        if unsafe {
-            InitializeProcThreadAttributeList(
-                list,
-                attribute_count,
-                0,
-                &mut required_bytes,
-            )
-        } == 0
+        if unsafe { InitializeProcThreadAttributeList(list, attribute_count, 0, &mut required_bytes) }
+            == 0
         {
             return Err(io::Error::last_os_error());
         }
@@ -683,17 +631,8 @@ impl ProcessAttributeList {
         // SAFETY: `list` was initialized and the caller keeps `value` stable
         // through the subsequent CreateProcessW and attribute-list deletion.
         let list = self.storage.as_mut_ptr().cast::<c_void>();
-        if unsafe {
-            UpdateProcThreadAttribute(
-                list,
-                0,
-                attribute,
-                value,
-                size,
-                null_mut(),
-                null(),
-            )
-        } == 0
+        if unsafe { UpdateProcThreadAttribute(list, 0, attribute, value, size, null_mut(), null()) }
+            == 0
         {
             return Err(io::Error::last_os_error());
         }
@@ -737,20 +676,19 @@ impl OwnedHandle {
     }
 
     fn is_valid(&self) -> bool {
-        self.handle
-            .is_some_and(|handle| !handle.is_null() && handle as isize != -1)
+        self.handle.is_some_and(|handle| handle != 0 && handle != -1)
     }
 
     fn raw(&self) -> HANDLE {
         self.handle
-            .filter(|handle| !handle.is_null() && *handle as isize != -1)
+            .filter(|handle| *handle != 0 && *handle != -1)
             .expect("owned handle remains open and valid")
     }
 
     fn into_raw(mut self) -> HANDLE {
         self.handle
             .take()
-            .filter(|handle| !handle.is_null() && *handle as isize != -1)
+            .filter(|handle| *handle != 0 && *handle != -1)
             .expect("owned handle remains open and valid")
     }
 
@@ -758,9 +696,12 @@ impl OwnedHandle {
         let Some(handle) = self.handle else {
             return Ok(());
         };
-        if handle.is_null() || handle as isize == -1 {
+        if handle == 0 || handle == -1 {
             self.handle = None;
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid handle"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid handle",
+            ));
         }
         // SAFETY: this owner is the unique Rust owner of `handle`.
         if unsafe { CloseHandle(handle) } == 0 {
@@ -870,7 +811,7 @@ fn zeroed_value<T>() -> T {
 
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_complete, process_wait_confirms_exit, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use super::{WAIT_OBJECT_0, WAIT_TIMEOUT, cleanup_complete, process_wait_confirms_exit};
 
     #[test]
     fn cleanup_requires_parent_exit_zero_count_and_closed_handles() {

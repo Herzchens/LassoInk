@@ -80,7 +80,9 @@ fn provider_worker_thread_registry() -> &'static Mutex<ProviderWorkerThreadRegis
 
 fn reserve_provider_worker_thread() -> Result<ProviderWorkerThreadPermit, ProviderErrorKind> {
     let registry = provider_worker_thread_registry();
-    let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     reap_provider_worker_threads_locked(&mut registry);
     if registry.handles.len().saturating_add(registry.reserved) >= MAX_PROVIDER_WORKER_THREADS {
         return Err(ProviderErrorKind::WorkerCapacityReached);
@@ -97,7 +99,9 @@ fn reserve_provider_worker_thread() -> Result<ProviderWorkerThreadPermit, Provid
 impl ProviderWorkerThreadPermit {
     fn register(mut self, handle: thread::JoinHandle<()>) {
         let registry = provider_worker_thread_registry();
-        let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         registry.reserved = registry.reserved.saturating_sub(1);
         registry.handles.push(handle);
         self.active = false;
@@ -108,7 +112,9 @@ impl Drop for ProviderWorkerThreadPermit {
     fn drop(&mut self) {
         if self.active {
             let registry = provider_worker_thread_registry();
-            let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut registry = registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             registry.reserved = registry.reserved.saturating_sub(1);
         }
     }
@@ -116,7 +122,9 @@ impl Drop for ProviderWorkerThreadPermit {
 
 fn reap_provider_worker_threads() {
     let registry = provider_worker_thread_registry();
-    let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     reap_provider_worker_threads_locked(&mut registry);
 }
 
@@ -180,7 +188,9 @@ fn process_cleanup_registry() -> &'static Mutex<ProcessCleanupRegistry> {
 #[cfg(windows)]
 fn reserve_process_cleanup_slot() -> Result<ProcessCleanupPermit, ProviderErrorKind> {
     let registry = process_cleanup_registry();
-    let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     reap_process_cleanup_registry_locked(&mut registry);
     ensure_no_quarantined_provider_sessions(registry.sessions.len())?;
     if registry.sessions.len().saturating_add(registry.reserved)
@@ -220,7 +230,9 @@ impl ProcessCleanupPermit {
     fn release(&mut self) {
         if self.active {
             let registry = process_cleanup_registry();
-            let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut registry = registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             registry.reserved = registry.reserved.saturating_sub(1);
             self.active = false;
         }
@@ -232,7 +244,9 @@ impl ProcessCleanupPermit {
         helpers: Vec<thread::JoinHandle<()>>,
     ) {
         let registry = process_cleanup_registry();
-        let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         registry.reserved = registry.reserved.saturating_sub(1);
         registry
             .sessions
@@ -246,7 +260,9 @@ impl Drop for ProcessCleanupPermit {
     fn drop(&mut self) {
         if self.active {
             let registry = process_cleanup_registry();
-            let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut registry = registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             registry.reserved = registry.reserved.saturating_sub(1);
         }
     }
@@ -832,9 +848,7 @@ pub(crate) fn build_recognition_request(
         coordinate_space,
         coordinate_units,
         language_hints,
-        requested_input_modalities: canonicalize_input_modalities(
-            &requested_input_modalities,
-        )?,
+        requested_input_modalities: canonicalize_input_modalities(&requested_input_modalities)?,
         provider_configuration,
         provider_configuration_fingerprint,
         stroke_views,
@@ -1519,9 +1533,7 @@ fn validate_requested_input_modalities(
             _ => {}
         }
     }
-    if request.raster.is_some()
-        != requested.contains(&ProviderInputCapabilityV1::Raster)
-    {
+    if request.raster.is_some() != requested.contains(&ProviderInputCapabilityV1::Raster) {
         return Err(ProviderErrorKind::InvalidRequest(
             "raster payload presence must match the requested raster modality".to_owned(),
         ));
@@ -2922,9 +2934,9 @@ impl ChildGuard {
             .wait_for_job_tree_until(deadline, cancelled)
             .map_err(|error| match error.kind() {
                 std::io::ErrorKind::Interrupted => ProviderErrorKind::Cancelled,
-                std::io::ErrorKind::TimedOut => ProviderErrorKind::ProcessCleanupFailed(
-                    format!("provider process tree did not drain: {error}"),
-                ),
+                std::io::ErrorKind::TimedOut => ProviderErrorKind::ProcessCleanupFailed(format!(
+                    "provider process tree did not drain: {error}"
+                )),
                 _ => ProviderErrorKind::ProcessCleanupFailed(format!(
                     "provider process-tree accounting/termination failed: {error}"
                 )),
@@ -2951,7 +2963,11 @@ impl ChildGuard {
                 "provider Job Object could not be released after helpers joined: {error}"
             ))
         })?;
-        if !self.child.as_ref().is_some_and(windows_process::NativeChild::is_closed) {
+        if !self
+            .child
+            .as_ref()
+            .is_some_and(windows_process::NativeChild::is_closed)
+        {
             return Err(ProviderErrorKind::ProcessCleanupFailed(
                 concat!(
                     "provider process tree, Job Object, or setup handle remained open ",
@@ -3075,13 +3091,14 @@ mod tests {
     };
     use std::{
         collections::BTreeMap,
-        fs, process::{self, Command},
+        fs,
+        process::{self, Command},
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
     #[cfg(windows)]
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, WAIT_OBJECT_0},
         System::Threading::{OpenProcess, WaitForSingleObject},
     };
 
@@ -3456,13 +3473,15 @@ mod tests {
             latest_unrelated.source_revision.last_sequence
         );
         assert_eq!(request.input_view_id, latest_unrelated.input_view_id);
-        assert!(validate_result_for_current_view(
-            &request,
-            &result,
-            &latest_unrelated.source_revision,
-            &latest_unrelated.input_view_id
-        )
-        .is_ok());
+        assert!(
+            validate_result_for_current_view(
+                &request,
+                &result,
+                &latest_unrelated.source_revision,
+                &latest_unrelated.input_view_id
+            )
+            .is_ok()
+        );
 
         let mut edited = state.clone();
         edited.logical_revision += 1;
@@ -3598,8 +3617,7 @@ mod tests {
     #[test]
     fn requested_modalities_require_available_and_advertised_inputs() {
         let (state, selected) = fixture_state_and_selection();
-        let online_request =
-            fixture_request_for_state(&state, &selected, fixture_configuration());
+        let online_request = fixture_request_for_state(&state, &selected, fixture_configuration());
         let online_capabilities = ProviderCapabilitiesV1 {
             inputs: vec![ProviderInputCapabilityV1::OnlineStrokes],
             outputs: vec![ProviderOutputCapabilityV1::Text],
@@ -3636,13 +3654,15 @@ mod tests {
         };
         assert!(validate_capabilities_for_request(&raster_capabilities, &raster_request).is_ok());
         let raster_result = fixture_result(&raster_request, raster_request.source_revision.clone());
-        assert!(validate_recognition_result(
-            &raster_result,
-            &raster_request,
-            &fixture_provider(),
-            &raster_capabilities
-        )
-        .is_ok());
+        assert!(
+            validate_recognition_result(
+                &raster_result,
+                &raster_request,
+                &fixture_provider(),
+                &raster_capabilities
+            )
+            .is_ok()
+        );
 
         let both_request = fixture_request_with_inputs(
             &state,
@@ -3677,7 +3697,10 @@ mod tests {
             both_request.requested_input_modalities,
             reversed_both_request.requested_input_modalities
         );
-        assert_eq!(both_request.input_view_id, reversed_both_request.input_view_id);
+        assert_eq!(
+            both_request.input_view_id,
+            reversed_both_request.input_view_id
+        );
         let mut reversed_wire_request = both_request.clone();
         reversed_wire_request.requested_input_modalities = vec![
             ProviderInputCapabilityV1::Raster,
@@ -3718,7 +3741,12 @@ mod tests {
         ));
 
         let mut empty_payload = raster_request;
-        empty_payload.raster.as_mut().unwrap().raw_payload_hex.clear();
+        empty_payload
+            .raster
+            .as_mut()
+            .unwrap()
+            .raw_payload_hex
+            .clear();
         assert!(matches!(
             input_view_id(&empty_payload),
             Err(ProviderErrorKind::InvalidRequest(_))
@@ -3757,10 +3785,7 @@ mod tests {
     #[test]
     fn incomplete_process_cleanup_is_reported_and_quarantine_blocks_launches() {
         assert_eq!(
-            cleanup_failure_or_original(
-                ProviderErrorKind::Cancelled,
-                Ok(())
-            ),
+            cleanup_failure_or_original(ProviderErrorKind::Cancelled, Ok(())),
             ProviderErrorKind::Cancelled
         );
         assert!(matches!(
@@ -3790,9 +3815,7 @@ mod tests {
                 protocol_version: PROVIDER_PROTOCOL_VERSION,
                 provider_id: "mock-provider".to_owned(),
                 configuration_id: request.provider_configuration.configuration_id.clone(),
-                configuration_fingerprint: request
-                    .provider_configuration_fingerprint
-                    .clone(),
+                configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
             },
             WorkerRequestFrameV1::Recognize {
                 protocol_version: PROVIDER_PROTOCOL_VERSION,
@@ -3970,9 +3993,9 @@ mod tests {
         // CI fixture process; avoid query/termination rights in the assertion.
         const SYNCHRONIZE: u32 = 0x0010_0000;
         // SAFETY: OpenProcess returns an owned synchronization-only process
-        // handle for the fixture's recorded PID, or null with a thread error.
+        // handle for the fixture's recorded PID, or an invalid integer sentinel.
         let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
-        if handle.is_null() {
+        if handle == 0 || handle == -1 {
             // A process object may already be gone after the Job Object reached
             // ActiveProcesses == 0. ERROR_INVALID_PARAMETER means no such PID.
             return unsafe { GetLastError() } == ERROR_INVALID_PARAMETER;
@@ -4212,10 +4235,12 @@ mod tests {
         )
         .expect("a successful one-shot result closes descendants holding its stdout pipe");
         assert_eq!(valid.provider.provider_id, "mock-provider");
-        assert!(valid
-            .capabilities
-            .inputs
-            .contains(&ProviderInputCapabilityV1::OnlineStrokes));
+        assert!(
+            valid
+                .capabilities
+                .inputs
+                .contains(&ProviderInputCapabilityV1::OnlineStrokes)
+        );
         assert_eq!(valid.result.candidates[0].recognized_text, "fixture text");
         assert!(!valid.stderr_truncated);
 
@@ -4229,7 +4254,10 @@ mod tests {
             &[silent_holder_marker.to_string_lossy().into_owned()],
         )
         .expect("success waits for the silent descendant to leave its Job Object");
-        assert_eq!(silent_holder.result.candidates[0].recognized_text, "fixture text");
+        assert_eq!(
+            silent_holder.result.candidates[0].recognized_text,
+            "fixture text"
+        );
         let silent_holder_pid = fs::read_to_string(&silent_holder_marker)
             .expect("silent descendant startup marker")
             .parse::<u32>()
@@ -4283,6 +4311,9 @@ mod tests {
             Duration::from_secs(2),
         )
         .expect("another provider call is admitted after verified tree and helper cleanup");
-        assert_eq!(after_cleanup.result.candidates[0].recognized_text, "fixture text");
+        assert_eq!(
+            after_cleanup.result.candidates[0].recognized_text,
+            "fixture text"
+        );
     }
 }
