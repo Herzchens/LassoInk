@@ -3314,9 +3314,16 @@ impl Drop for ChildGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::benchmark::{
+        self, ApprovedBenchmarkProviderV1, BenchmarkAnnotationCaseV1, BenchmarkCaseManifestV1,
+        BenchmarkCaseProvenanceV1, BenchmarkCaseSpecV1, BenchmarkClusterKeyV1,
+        BenchmarkCorpusManifestV1, BenchmarkProviderManifestV1, BenchmarkSplitKeyV1,
+        BenchmarkSplitV1, BenchmarkStrokeRefV1, BenchmarkTimeoutsV1,
+        BenchmarkTokenizationPolicyV1, ProviderArtifactPathV1, ProviderArtifactRoleV1,
+    };
     use crate::journal::{
-        EditCommand, JournalMetadata, MetadataScope, StoredEditAction, StoredMetadata,
-        StoredPhysicalSample, StoredStrokeStart,
+        EditCommand, JournalHeader, JournalMetadata, JournalWriter, MetadataScope,
+        StoredEditAction, StoredMetadata, StoredPhysicalSample, StoredStrokeStart,
     };
     use std::{
         collections::BTreeMap,
@@ -4451,6 +4458,361 @@ mod tests {
                 "timed-out worker did not finish cleanup"
             );
             thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "CI-only end-to-end benchmark/provider test; see guarded hosted provider test job"]
+    fn benchmark_cli_journal_mock_provider_pipeline_writes_private_complete_artifact() {
+        require_provider_mock_test_opt_in();
+        let mock = compile_mock_worker();
+        let target = stroke_ref("cli-e2e-stroke", "cli-e2e-device");
+        let journal_path = mock.directory.join("frozen-cli-e2e.journal");
+        let mut journal_writer = JournalWriter::create(
+            journal_path.clone(),
+            JournalHeader {
+                journal_id: target.journal_id.clone(),
+                session_id: target.session_id.clone(),
+                config_id: Some("provider-test-config".to_owned()),
+                device_model_declared: Some("synthetic fixture device".to_owned()),
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        journal_writer
+            .start_stroke(target.clone(), StrokeViewFrame::default(), 10)
+            .unwrap();
+        let mut first_sample = physical_sample(&target, 501, 110);
+        first_sample.app_arrival_elapsed_ns = 11;
+        let first_sample_sequence = journal_writer.append_sample(first_sample).unwrap();
+        let mut second_sample = physical_sample(&target, 502, 114);
+        second_sample.app_arrival_elapsed_ns = 12;
+        let second_sample_sequence = journal_writer.append_sample(second_sample).unwrap();
+        journal_writer.commit_stroke(target.clone(), 13).unwrap();
+        journal_writer.flush().unwrap();
+        drop(journal_writer);
+
+        let journal = crate::journal::read_journal(&journal_path).unwrap();
+        assert!(!journal.recovery.truncated_final_record);
+        assert_eq!(journal.state.physical_samples.len(), 2);
+        assert_eq!(first_sample_sequence, 2);
+        assert_eq!(second_sample_sequence, 3);
+        let source_revision = ProviderSourceRevisionV1::from_journal(&journal.state);
+        let selected_strokes = vec![target.clone()];
+        let selected_stroke_refs = vec![BenchmarkStrokeRefV1::from(&target)];
+        let batch_id = format!(
+            "provider-cli-e2e-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let case_id = "cli-e2e-case".to_owned();
+        let corpus_id = "cli-e2e-corpus".to_owned();
+        let annotation_id = "cli-e2e-annotation".to_owned();
+        let case = BenchmarkCaseSpecV1 {
+            case_id: case_id.clone(),
+            journal_path: journal_path.clone(),
+            expected_source_revision: source_revision.clone(),
+            region_id: "region-e2e".to_owned(),
+            line_id: "line-e2e".to_owned(),
+            coordinate_space: "windows-screen-coordinates".to_owned(),
+            coordinate_units: "screen-pixel".to_owned(),
+            language_hints: vec!["vi-VN".to_owned(), "en-US".to_owned()],
+            requested_input_modalities: vec![ProviderInputCapabilityV1::OnlineStrokes],
+            selected_strokes: selected_stroke_refs,
+            provenance: BenchmarkCaseProvenanceV1 {
+                corpus_id: Some(corpus_id.clone()),
+                annotation_id: Some(annotation_id.clone()),
+                writer_key: "synthetic-writer-e2e".to_owned(),
+                session_key: target.session_id.clone(),
+                session_start_unix_ns: Some(1_700_000_000_000_000_000),
+                configuration_key: "provider-test-config".to_owned(),
+                split: Some(BenchmarkSplitV1::Evaluation),
+                capture_api: Some("synthetic-fixture".to_owned()),
+                capture_api_version: Some("fixture-api-v1".to_owned()),
+                tablet_model: None,
+                driver_version: None,
+                windows_build: None,
+                windows_ink_state: None,
+                active_area: None,
+                display_mapping: None,
+                pressure_curve: None,
+            },
+            raster: None,
+        };
+        let case_manifest = BenchmarkCaseManifestV1 {
+            schema_version: 1,
+            batch_id: batch_id.clone(),
+            cases: vec![case.clone()],
+        };
+        let corpus_manifest = BenchmarkCorpusManifestV1 {
+            schema_version: 1,
+            corpus_id: corpus_id.clone(),
+            split_key: BenchmarkSplitKeyV1::Session,
+            bootstrap_cluster: BenchmarkClusterKeyV1::Session,
+            bootstrap_seed: 17,
+            bootstrap_replicates: 10,
+            tokenization_policy: BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+            cases: vec![BenchmarkAnnotationCaseV1 {
+                case_id: case_id.clone(),
+                annotation_id: annotation_id.clone(),
+                reference_text: "PRIVATE_REFERENCE_TEXT_SENTINEL".to_owned(),
+                reference_language_scope:
+                    crate::benchmark::BenchmarkReferenceLanguageScopeV1::MixedOrUnknown,
+                reference_lexical_tokens: None,
+                delayed_marks: Vec::new(),
+            }],
+        };
+
+        let provider_configurations = [
+            ("cfg-success-a", "success-a", "ok"),
+            ("cfg-success-b", "success-b", "ok"),
+            ("cfg-visible-failure", "failure", "crash"),
+        ];
+        let mut expected_frames = BTreeMap::<String, (Vec<u8>, Vec<u8>)>::new();
+        let mut providers = Vec::new();
+        for (provider_index, (configuration_id, mode_label, behavior)) in
+            provider_configurations.iter().enumerate()
+        {
+            let configuration = ProviderConfigurationV1 {
+                configuration_id: (*configuration_id).to_owned(),
+                values: BTreeMap::from([
+                    (
+                        "credential".to_owned(),
+                        "PRIVATE_PROVIDER_SETTING_SENTINEL".to_owned(),
+                    ),
+                    ("mode".to_owned(), (*mode_label).to_owned()),
+                ]),
+            };
+            let request = build_recognition_request(RecognitionRequestBuildInput {
+                state: &journal.state,
+                request_id: format!("bench-{batch_id}-0-{provider_index}"),
+                region_id: case.region_id.clone(),
+                line_id: case.line_id.clone(),
+                coordinate_space: case.coordinate_space.clone(),
+                coordinate_units: case.coordinate_units.clone(),
+                language_hints: case.language_hints.clone(),
+                requested_input_modalities: case.requested_input_modalities.clone(),
+                provider_configuration: configuration.clone(),
+                selected_strokes: &selected_strokes,
+                raster: None,
+            })
+            .unwrap();
+            assert_eq!(request.source_revision, source_revision);
+            let handshake = serde_json::to_string(&WorkerResponseFrameV1::Handshake {
+                protocol_version: PROVIDER_PROTOCOL_VERSION,
+                provider: fixture_provider(),
+                configuration_id: configuration.configuration_id.clone(),
+                configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
+                capabilities: fixture_capabilities(),
+            })
+            .unwrap();
+            let recognition = serde_json::to_string(&WorkerResponseFrameV1::Recognition {
+                protocol_version: PROVIDER_PROTOCOL_VERSION,
+                result: fixture_result(&request, source_revision.clone()),
+            })
+            .unwrap();
+            expected_frames.insert(
+                configuration.configuration_id.clone(),
+                (handshake.as_bytes().to_vec(), recognition.as_bytes().to_vec()),
+            );
+            providers.push(ApprovedBenchmarkProviderV1 {
+                provider_id: "mock-provider".to_owned(),
+                executable_path: mock.executable.clone(),
+                arguments: vec![(*behavior).to_owned(), handshake, recognition],
+                protocol_configuration: configuration,
+                artifacts: vec![ProviderArtifactPathV1 {
+                    artifact_id: "mock-executable".to_owned(),
+                    role: ProviderArtifactRoleV1::Executable,
+                    path: mock.executable.clone(),
+                }],
+                timeouts: Some(BenchmarkTimeoutsV1 {
+                    handshake_ms: 10_000,
+                    recognition_ms: 10_000,
+                    shutdown_ms: 1_000,
+                }),
+            });
+        }
+        let provider_manifest = BenchmarkProviderManifestV1 {
+            schema_version: 1,
+            providers,
+        };
+
+        let case_manifest_path = mock.directory.join("cases.json");
+        let provider_manifest_path = mock.directory.join("providers.json");
+        let corpus_manifest_path = mock.directory.join("corpus.json");
+        fs::write(&case_manifest_path, serde_json::to_vec(&case_manifest).unwrap()).unwrap();
+        fs::write(
+            &provider_manifest_path,
+            serde_json::to_vec(&provider_manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &corpus_manifest_path,
+            serde_json::to_vec(&corpus_manifest).unwrap(),
+        )
+        .unwrap();
+        let output_directory = mock.directory.join("benchmark-output");
+        assert!(!output_directory.exists());
+        let completion = benchmark::run_batch_cli_to_directory(
+            &case_manifest_path,
+            &provider_manifest_path,
+            Some(&corpus_manifest_path),
+            &output_directory,
+        )
+        .unwrap();
+        assert_eq!(completion.run_count, 3);
+        assert_eq!(completion.failure_count, 1);
+        assert!(completion.artifact_path.starts_with(&output_directory));
+        let artifact_bytes = fs::read(&completion.artifact_path).unwrap();
+        let artifact_text = String::from_utf8(artifact_bytes).unwrap();
+        assert!(!artifact_text.contains("PRIVATE_PROVIDER_SETTING_SENTINEL"));
+        assert!(!artifact_text.contains("PRIVATE_REFERENCE_TEXT_SENTINEL"));
+        for private_path in [
+            &mock.executable,
+            &journal_path,
+            &case_manifest_path,
+            &provider_manifest_path,
+            &corpus_manifest_path,
+        ] {
+            let path_text = private_path.to_string_lossy();
+            assert!(!artifact_text.contains(path_text.as_ref()));
+        }
+
+        let rows = artifact_text
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        let header = &rows
+            .iter()
+            .find(|row| row["record_type"] == "header")
+            .unwrap()["record"];
+        assert_eq!(header["batch_id"], batch_id);
+        assert!(header["case_manifest_sha256"].as_str().is_some_and(|value| {
+            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }));
+        assert!(header["corpus_manifest_sha256"].as_str().is_some_and(|value| {
+            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }));
+        let run_rows = rows
+            .iter()
+            .filter(|row| row["record_type"] == "run")
+            .map(|row| &row["record"])
+            .collect::<Vec<_>>();
+        assert_eq!(run_rows.len(), 3);
+        let find_run = |configuration_id: &str| {
+            run_rows
+                .iter()
+                .find(|row| row["provider_configuration_id"] == configuration_id)
+                .copied()
+                .unwrap()
+        };
+        let success_a = find_run("cfg-success-a");
+        let success_b = find_run("cfg-success-b");
+        assert_eq!(success_a["status"], "completed");
+        assert_eq!(success_b["status"], "completed");
+        assert_eq!(success_a["case_id"], case_id);
+        assert_eq!(success_a["provider_id"], "mock-provider");
+        assert_eq!(success_a["source_revision"], success_b["source_revision"]);
+        assert_eq!(
+            success_a["source_revision"],
+            serde_json::to_value(&source_revision).unwrap()
+        );
+        assert_eq!(
+            success_a["source_revision"]["journal_id"],
+            target.journal_id
+        );
+        assert!(success_a["input_view_id"].as_str().is_some_and(|value| {
+            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }));
+        assert_eq!(success_a["input_view_id"], success_b["input_view_id"]);
+        assert_eq!(
+            success_a["source_sample_sequences"],
+            serde_json::json!([first_sample_sequence, second_sample_sequence])
+        );
+        assert_eq!(
+            success_a["source_sample_sequences"],
+            success_b["source_sample_sequences"]
+        );
+        assert_eq!(success_a["selected_strokes"], success_b["selected_strokes"]);
+
+        let bytes_hex = |bytes: &[u8]| {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+            for byte in bytes {
+                encoded.push(char::from(HEX[usize::from(*byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+            }
+            encoded
+        };
+        for configuration_id in ["cfg-success-a", "cfg-success-b"] {
+            let run = find_run(configuration_id);
+            assert!(run["raw_response_capture_complete"].as_bool().unwrap());
+            assert!(run["result"].is_object());
+            let frames = run["raw_response_frames"].as_array().unwrap();
+            let expected = expected_frames.get(configuration_id).unwrap();
+            assert_eq!(frames.len(), 2);
+            for (ordinal, bytes) in [&expected.0, &expected.1].into_iter().enumerate() {
+                let prefix = u32::try_from(bytes.len()).unwrap().to_be_bytes();
+                assert_eq!(frames[ordinal]["ordinal"].as_u64(), Some(ordinal as u64));
+                assert_eq!(frames[ordinal]["payload_hex"], bytes_hex(bytes));
+                assert_eq!(frames[ordinal]["length_prefix_be_hex"], bytes_hex(&prefix));
+            }
+            let executable_digest = run["artifact_digests"][0]["sha256_hex"]
+                .as_str()
+                .unwrap();
+            assert_eq!(executable_digest.len(), 64);
+            assert!(artifact_text.contains(executable_digest));
+        }
+
+        let failed = find_run("cfg-visible-failure");
+        assert_eq!(failed["status"], "failed");
+        assert!(failed["result"].is_null());
+        assert!(failed["provider_identity"].is_null());
+        assert_eq!(failed["source_revision"], success_a["source_revision"]);
+        assert_eq!(failed["input_view_id"], success_a["input_view_id"]);
+        assert_eq!(
+            failed["source_sample_sequences"],
+            success_a["source_sample_sequences"]
+        );
+        assert!(!failed["raw_response_capture_complete"].as_bool().unwrap());
+        let failed_frames = failed["raw_response_frames"].as_array().unwrap();
+        let expected_failure_handshake = &expected_frames
+            .get("cfg-visible-failure")
+            .unwrap()
+            .0;
+        assert_eq!(failed_frames.len(), 1);
+        assert_eq!(failed_frames[0]["ordinal"].as_u64(), Some(0));
+        assert_eq!(failed_frames[0]["payload_hex"], bytes_hex(expected_failure_handshake));
+
+        let footer = &rows
+            .iter()
+            .find(|row| row["record_type"] == "footer")
+            .unwrap()["record"];
+        assert_eq!(footer["planned_case_count"].as_u64(), Some(1));
+        assert_eq!(footer["planned_provider_count"].as_u64(), Some(3));
+        assert_eq!(footer["recorded_run_count"].as_u64(), Some(3));
+        assert_eq!(footer["failed_run_count"].as_u64(), Some(1));
+        assert_eq!(footer["complete"].as_bool(), Some(true));
+        let summaries = footer["provider_summaries"].as_array().unwrap();
+        assert_eq!(summaries.len(), 3);
+        for (configuration_id, completed, failed_count) in [
+            ("cfg-success-a", 1u64, 0u64),
+            ("cfg-success-b", 1u64, 0u64),
+            ("cfg-visible-failure", 0u64, 1u64),
+        ] {
+            let summary = summaries
+                .iter()
+                .find(|summary| summary["configuration_id"] == configuration_id)
+                .unwrap();
+            assert_eq!(summary["attempted_run_count"].as_u64(), Some(1));
+            assert_eq!(summary["completed_run_count"].as_u64(), Some(completed));
+            assert_eq!(summary["failed_run_count"].as_u64(), Some(failed_count));
         }
     }
 

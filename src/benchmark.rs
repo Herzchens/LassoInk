@@ -565,22 +565,6 @@ struct BenchmarkArtifactWriter {
 }
 
 impl BenchmarkArtifactWriter {
-    fn create(
-        batch_id: &str,
-        case_manifest_sha256: &str,
-        corpus_manifest_sha256: Option<String>,
-    ) -> io::Result<Self> {
-        validate_local_id(batch_id, "batch ID")?;
-        let output_directory = local_benchmark_directory()?;
-        fs::create_dir_all(&output_directory)?;
-        Self::create_at(
-            &output_directory,
-            batch_id,
-            case_manifest_sha256,
-            corpus_manifest_sha256,
-        )
-    }
-
     fn create_at(
         output_directory: &Path,
         batch_id: &str,
@@ -592,6 +576,7 @@ impl BenchmarkArtifactWriter {
         if let Some(sha256) = &corpus_manifest_sha256 {
             validate_sha256_hex(sha256, "corpus manifest digest")?;
         }
+        fs::create_dir_all(output_directory)?;
         let unique_suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1143,6 +1128,45 @@ pub(crate) fn run_batch_cli(
     provider_manifest_path: &Path,
     corpus_manifest_path: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
+    let output_directory = local_benchmark_directory()?;
+    let completion = run_batch_cli_inner(
+        case_manifest_path,
+        provider_manifest_path,
+        corpus_manifest_path,
+        &output_directory,
+    )?;
+    println!(
+        "Benchmark artifact saved locally: {} ({} run(s), {} failed)",
+        completion.artifact_path.display(),
+        completion.run_count,
+        completion.failure_count
+    );
+    Ok(())
+}
+
+/// Runs the same bounded manifest → journal → provider → artifact path as the
+/// CLI while allowing the guarded integration test to own its output folder.
+#[cfg(test)]
+pub(crate) fn run_batch_cli_to_directory(
+    case_manifest_path: &Path,
+    provider_manifest_path: &Path,
+    corpus_manifest_path: Option<&Path>,
+    output_directory: &Path,
+) -> Result<BenchmarkBatchCompletionV1, Box<dyn Error>> {
+    run_batch_cli_inner(
+        case_manifest_path,
+        provider_manifest_path,
+        corpus_manifest_path,
+        output_directory,
+    )
+}
+
+fn run_batch_cli_inner(
+    case_manifest_path: &Path,
+    provider_manifest_path: &Path,
+    corpus_manifest_path: Option<&Path>,
+    output_directory: &Path,
+) -> Result<BenchmarkBatchCompletionV1, Box<dyn Error>> {
     let (case_manifest, case_manifest_sha256): (BenchmarkCaseManifestV1, String) =
         read_json_file_with_sha(case_manifest_path, MAX_CASE_MANIFEST_BYTES)?;
     let provider_manifest: BenchmarkProviderManifestV1 =
@@ -1246,7 +1270,8 @@ pub(crate) fn run_batch_cli(
         );
     }
 
-    let mut writer = BenchmarkArtifactWriter::create(
+    let mut writer = BenchmarkArtifactWriter::create_at(
+        output_directory,
         &case_manifest.batch_id,
         &case_manifest_sha256,
         corpus_manifest_sha256,
@@ -1444,13 +1469,7 @@ pub(crate) fn run_batch_cli(
             return Err(error);
         }
     };
-    println!(
-        "Benchmark artifact saved locally: {} ({} run(s), {} failed)",
-        completion.artifact_path.display(),
-        completion.run_count,
-        completion.failure_count
-    );
-    Ok(())
+    Ok(completion)
 }
 
 impl PreparedBenchmarkProvider {
