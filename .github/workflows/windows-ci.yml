@@ -96,6 +96,7 @@ jobs:
           & git --no-pager diff --no-index --no-color --unified=3 -- (Join-Path $env:GITHUB_WORKSPACE "Cargo.lock") $resolvedLock
           $diffExit = $LASTEXITCODE
           if ($diffExit -gt 1) { throw "Could not compare resolved Cargo.lock against base (exit $diffExit)" }
+          $global:LASTEXITCODE = 0
           $artifactLock = Join-Path $env:RUNNER_TEMP "lassoink-m5-m6-Cargo.lock"
           if (Test-Path -LiteralPath $artifactLock) { throw "Lock artifact path unexpectedly already exists" }
           Copy-Item -LiteralPath $resolvedLock -Destination $artifactLock
