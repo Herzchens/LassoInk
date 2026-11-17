@@ -453,9 +453,7 @@ pub(super) fn spawn_provider(
     // any further fallible handle closing or stdio conversion happens.
     child_guard.attach_child(native_child);
     let mut setup_error = None;
-    if thread_valid
-        && let Err(error) = close_setup_handle(primary_thread, child_guard)
-    {
+    if thread_valid && let Err(error) = close_setup_handle(primary_thread, child_guard) {
         setup_error = Some(error);
     }
     for handle in [child_stdin, child_stdout, child_stderr] {
