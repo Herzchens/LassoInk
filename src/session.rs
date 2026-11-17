@@ -633,7 +633,7 @@ impl SessionWriter {
     }
 }
 
-fn publish_no_clobber(partial_path: &Path, final_path: &Path) -> io::Result<()> {
+pub(crate) fn publish_no_clobber(partial_path: &Path, final_path: &Path) -> io::Result<()> {
     let partial_wide = partial_path
         .as_os_str()
         .encode_wide()

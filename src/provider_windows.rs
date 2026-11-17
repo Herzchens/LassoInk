@@ -54,6 +54,7 @@ pub(super) struct SpawnedProvider {
     pub stdin: File,
     pub stdout: File,
     pub stderr: File,
+    pub create_process_call_started: Instant,
 }
 
 /// A uniquely owned process and non-inheritable job handle. The provider is
@@ -66,6 +67,7 @@ pub(super) struct NativeChild {
     process_exit_code: Option<u32>,
     active_processes_zero_observed: bool,
     cleanup_faulted: bool,
+    process_resources: Option<super::ProviderProcessResourcesV1>,
     retained_setup_handles: Vec<OwnedHandle>,
 }
 
@@ -237,6 +239,7 @@ impl NativeChild {
         }
         if accounting.ActiveProcesses == 0 {
             self.active_processes_zero_observed = true;
+            self.process_resources = Some(self.capture_job_resources(job, &accounting));
             return Ok(true);
         }
 
@@ -247,6 +250,61 @@ impl NativeChild {
             return Err(io::Error::last_os_error());
         }
         Ok(false)
+    }
+
+    fn capture_job_resources(
+        &self,
+        job: HANDLE,
+        accounting: &JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    ) -> super::ProviderProcessResourcesV1 {
+        // SAFETY: this C structure contains only integer/size fields and
+        // nested plain-data accounting structures; all-zero is valid
+        // initialized output storage before QueryInformationJobObject writes it.
+        let mut extended: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+        let mut returned = 0u32;
+        // SAFETY: `job` is still owned and the output buffer matches the
+        // requested Job Object information class and size.
+        let memory_error = if unsafe {
+            QueryInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&mut extended as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                &mut returned,
+            )
+        } == 0
+        {
+            Some(io::Error::last_os_error().to_string())
+        } else if returned < size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32 {
+            Some("QueryInformationJobObject returned a short extended-limit record".to_owned())
+        } else {
+            None
+        };
+        let (peak_job_memory, peak_process_memory) = if memory_error.is_none() {
+            (
+                u64::try_from(extended.PeakJobMemoryUsed).ok(),
+                u64::try_from(extended.PeakProcessMemoryUsed).ok(),
+            )
+        } else {
+            (None, None)
+        };
+        let memory_unavailable_reason = memory_error.or_else(|| {
+            if peak_job_memory.is_none() || peak_process_memory.is_none() {
+                Some("Windows memory counters did not fit the report's u64 fields".to_owned())
+            } else {
+                None
+            }
+        });
+        super::ProviderProcessResourcesV1 {
+            scope: super::ProviderResourceScopeV1::JobProcessTree,
+            total_user_time_100ns_raw: accounting.TotalUserTime,
+            total_kernel_time_100ns_raw: accounting.TotalKernelTime,
+            total_page_fault_count_raw: accounting.TotalPageFaultCount,
+            total_process_count_raw: accounting.TotalProcesses,
+            peak_job_memory_bytes_raw: peak_job_memory,
+            peak_process_memory_bytes_raw: peak_process_memory,
+            memory_unavailable_reason,
+        }
     }
 
     fn close_retained_setup_handles(&mut self) -> io::Result<()> {
@@ -343,6 +401,10 @@ impl NativeChild {
         self.cleanup_faulted
     }
 
+    pub(super) fn process_resources(&self) -> Option<super::ProviderProcessResourcesV1> {
+        self.process_resources.clone()
+    }
+
     fn retain_setup_handle(&mut self, handle: OwnedHandle) {
         self.retained_setup_handles.push(handle);
     }
@@ -406,6 +468,7 @@ pub(super) fn spawn_provider(
     // correctly sized storage kept alive until CreateProcessW returns. The
     // explicit HANDLE_LIST contains only the three child stdio pipe ends;
     // JOB_LIST atomically assigns the child before its initial thread runs.
+    let create_process_call_started = Instant::now();
     let created = unsafe {
         windows_sys::Win32::System::Threading::CreateProcessW(
             application_name.as_ptr(),
@@ -447,6 +510,7 @@ pub(super) fn spawn_provider(
         process_exit_code: None,
         active_processes_zero_observed: false,
         cleanup_faulted: false,
+        process_resources: None,
         retained_setup_handles,
     };
     // The parent-owned guard takes process/job lifetime responsibility before
@@ -484,6 +548,7 @@ pub(super) fn spawn_provider(
         stdin,
         stdout,
         stderr,
+        create_process_call_started,
     })
 }
 

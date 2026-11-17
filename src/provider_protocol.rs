@@ -49,6 +49,9 @@ const MAX_PROVIDER_CANDIDATES: usize = 128;
 const MAX_PROVIDER_STROKE_RANGES: usize = 256;
 const MAX_RAW_SAMPLE_BYTES: usize = 8192;
 const MAX_TOTAL_RAW_SAMPLE_BYTES: usize = 1024 * 1024;
+const MAX_RAW_PROVIDER_RESPONSE_FRAMES: usize = 3;
+const MAX_RAW_PROVIDER_RESPONSE_BYTES: usize =
+    MAX_HANDSHAKE_FRAME_BYTES + MAX_RESPONSE_FRAME_BYTES * 2;
 const MAX_ID_BYTES: usize = 256;
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_LANGUAGE_HINTS: usize = 16;
@@ -1871,6 +1874,7 @@ pub(crate) struct ProviderExecutionError {
     pub kind: ProviderErrorKind,
     pub stderr_bytes: Vec<u8>,
     pub stderr_truncated: bool,
+    pub raw_response_transcript: ProviderRawResponseTranscriptV1,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1880,6 +1884,102 @@ pub(crate) struct ProviderExecution {
     pub result: RecognitionResultV1,
     pub stderr_bytes: Vec<u8>,
     pub stderr_truncated: bool,
+    pub raw_response_transcript: ProviderRawResponseTranscriptV1,
+    pub process_resources: Option<ProviderProcessResourcesV1>,
+    pub timing: ProviderExecutionTimingV1,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderRawResponseFrameV1 {
+    pub ordinal: u8,
+    pub payload_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderRawResponseTranscriptV1 {
+    pub frames: Vec<ProviderRawResponseFrameV1>,
+    pub capture_complete: bool,
+    pub omitted_frame_count: u32,
+    pub omitted_payload_bytes: u64,
+}
+
+impl ProviderRawResponseTranscriptV1 {
+    fn capture_frame(&mut self, ordinal: u8, payload_bytes: Vec<u8>) {
+        let frame_size = payload_bytes.len();
+        let accumulated = self
+            .frames
+            .iter()
+            .map(|frame| frame.payload_bytes.len())
+            .sum::<usize>();
+        if self.frames.len() >= MAX_RAW_PROVIDER_RESPONSE_FRAMES
+            || accumulated.saturating_add(frame_size) > MAX_RAW_PROVIDER_RESPONSE_BYTES
+            || self.frames.try_reserve(1).is_err()
+        {
+            self.capture_complete = false;
+            self.omitted_frame_count = self.omitted_frame_count.saturating_add(1);
+            self.omitted_payload_bytes =
+                self.omitted_payload_bytes.saturating_add(frame_size as u64);
+            return;
+        }
+        self.frames.push(ProviderRawResponseFrameV1 {
+            ordinal,
+            payload_bytes,
+        });
+    }
+
+    fn mark_clean_eof(&mut self) {
+        self.capture_complete = self.frames.len() == 2 && self.omitted_frame_count == 0;
+    }
+
+    fn mark_incomplete(&mut self) {
+        self.capture_complete = false;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderResourceScopeV1 {
+    JobProcessTree,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderProcessResourcesV1 {
+    pub scope: ProviderResourceScopeV1,
+    /// Raw Job Object accumulated user CPU counter in 100-nanosecond units,
+    /// observed after the job reached ActiveProcesses == 0.
+    pub total_user_time_100ns_raw: i64,
+    /// Raw Job Object accumulated kernel CPU counter in 100-nanosecond units.
+    pub total_kernel_time_100ns_raw: i64,
+    pub total_page_fault_count_raw: u32,
+    pub total_process_count_raw: u32,
+    /// Raw `JOBOBJECT_EXTENDED_LIMIT_INFORMATION.PeakJobMemoryUsed` bytes:
+    /// peak memory usage of processes associated with the job as documented
+    /// by Windows. This is not a claim about RSS, VRAM, or a separate memory
+    /// accounting model.
+    pub peak_job_memory_bytes_raw: Option<u64>,
+    /// Raw `PeakProcessMemoryUsed` bytes: peak memory used by any process ever
+    /// associated with the job, per the Windows structure documentation.
+    pub peak_process_memory_bytes_raw: Option<u64>,
+    pub memory_unavailable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderExecutionTimingV1 {
+    /// All durations use `Instant` sampled immediately before the CreateProcessW
+    /// call. Job CPU starts after the job-list assignment inside that call; this
+    /// wall denominator is conservatively a little wider and may understate the
+    /// core-equivalent ratio. It is not physical latency.
+    pub process_create_call_to_handshake_ns: u64,
+    pub process_create_call_to_recognition_ns: u64,
+    pub process_create_call_to_parent_exit_ns: u64,
+    pub process_create_call_to_tree_drain_ns: u64,
+    /// No provider protocol frame separately measures model initialization.
+    pub model_cold_start_ns: Option<u64>,
+    pub model_cold_start_unavailable_reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1979,6 +2079,8 @@ impl ProviderWorkerHandle {
                                         kind: ProviderErrorKind::Cancelled,
                                         stderr_bytes: Vec::new(),
                                         stderr_truncated: false,
+                                        raw_response_transcript:
+                                            ProviderRawResponseTranscriptV1::default(),
                                     }),
                                 });
                                 let _ = result_sender.send(cancelled_result);
@@ -2007,6 +2109,8 @@ impl ProviderWorkerHandle {
                                     kind: ProviderErrorKind::WorkerThreadPanicked,
                                     stderr_bytes: Vec::new(),
                                     stderr_truncated: false,
+                                    raw_response_transcript:
+                                        ProviderRawResponseTranscriptV1::default(),
                                 })
                             });
                             if result_sender
@@ -2102,13 +2206,27 @@ impl ProviderProcessRunner<'_> {
         cancelled: &AtomicBool,
     ) -> Result<ProviderExecution, ProviderExecutionError> {
         let stderr_capture = Arc::new(Mutex::new(BoundedStderr::default()));
-        let result = self.run_inner(request, cancelled, Arc::clone(&stderr_capture));
+        let raw_response_capture = Arc::new(Mutex::new(ProviderRawResponseTranscriptV1::default()));
+        let result = self.run_inner(
+            request,
+            cancelled,
+            Arc::clone(&stderr_capture),
+            Arc::clone(&raw_response_capture),
+        );
         let (stderr_bytes, stderr_truncated) = stderr_snapshot(&stderr_capture);
-        result.map_err(|kind| ProviderExecutionError {
-            kind,
-            stderr_bytes,
-            stderr_truncated,
-        })
+        let raw_response_transcript = raw_response_snapshot(&raw_response_capture);
+        match result {
+            Ok(mut execution) => {
+                execution.raw_response_transcript = raw_response_transcript;
+                Ok(execution)
+            }
+            Err(kind) => Err(ProviderExecutionError {
+                kind,
+                stderr_bytes,
+                stderr_truncated,
+                raw_response_transcript,
+            }),
+        }
     }
 
     #[cfg(windows)]
@@ -2117,6 +2235,7 @@ impl ProviderProcessRunner<'_> {
         mut request: RecognitionRequestV1,
         cancelled: &AtomicBool,
         stderr_capture: Arc<Mutex<BoundedStderr>>,
+        raw_response_capture: Arc<Mutex<ProviderRawResponseTranscriptV1>>,
     ) -> Result<ProviderExecution, ProviderErrorKind> {
         request.requested_input_modalities =
             canonicalize_input_modalities(&request.requested_input_modalities)?;
@@ -2164,6 +2283,7 @@ impl ProviderProcessRunner<'_> {
                 stdin,
                 stdout,
                 stderr,
+                create_process_call_started,
             } = windows_process::spawn_provider(
                 &self.approved.executable,
                 &self.approved.arguments,
@@ -2188,7 +2308,14 @@ impl ProviderProcessRunner<'_> {
             child.reserve_helper_slot()?;
             let stdout_thread = thread::Builder::new()
                 .name("lassoink-provider-stdout".to_owned())
-                .spawn(move || read_worker_responses(stdout, response_sender, reader_done_sender))
+                .spawn(move || {
+                    read_worker_responses(
+                        stdout,
+                        response_sender,
+                        reader_done_sender,
+                        raw_response_capture,
+                    )
+                })
                 .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?;
             child.add_helper(stdout_thread);
 
@@ -2256,6 +2383,7 @@ impl ProviderProcessRunner<'_> {
                     )));
                 }
             };
+            let process_create_call_to_handshake_ns = elapsed_ns(create_process_call_started);
 
             let recognition_deadline = Instant::now() + self.timeouts.recognition;
             send_frame_to_worker(
@@ -2297,6 +2425,7 @@ impl ProviderProcessRunner<'_> {
                     )));
                 }
             };
+            let process_create_call_to_recognition_ns = elapsed_ns(create_process_call_started);
             let shutdown_deadline = Instant::now() + self.timeouts.shutdown;
             // Observe and release the direct process handle first. A descendant
             // may outlive its parent even when it closes all three stdio handles,
@@ -2304,7 +2433,10 @@ impl ProviderProcessRunner<'_> {
             // state until ActiveProcesses reaches zero before waiting for EOF.
             // The reader still rejects any third frame before success is accepted.
             let exit_code = child.wait_until(shutdown_deadline, cancelled)?;
+            let process_create_call_to_parent_exit_ns = elapsed_ns(create_process_call_started);
             child.wait_for_job_tree_until(shutdown_deadline, cancelled)?;
+            let process_create_call_to_tree_drain_ns = elapsed_ns(create_process_call_started);
+            let process_resources = child.process_resources();
             receive_reader_completion(&reader_done_receiver, shutdown_deadline, cancelled)?;
             drop(response_receiver);
             drop(reader_done_receiver);
@@ -2322,6 +2454,19 @@ impl ProviderProcessRunner<'_> {
                 result,
                 stderr_bytes,
                 stderr_truncated,
+                raw_response_transcript: ProviderRawResponseTranscriptV1::default(),
+                process_resources,
+                timing: ProviderExecutionTimingV1 {
+                    process_create_call_to_handshake_ns,
+                    process_create_call_to_recognition_ns,
+                    process_create_call_to_parent_exit_ns,
+                    process_create_call_to_tree_drain_ns,
+                    model_cold_start_ns: None,
+                    model_cold_start_unavailable_reason: Some(
+                        "the generic process protocol reports no separate model-load phase"
+                            .to_owned(),
+                    ),
+                },
             })
         }));
         let attempt = match attempt {
@@ -2344,6 +2489,7 @@ impl ProviderProcessRunner<'_> {
         request: RecognitionRequestV1,
         cancelled: &AtomicBool,
         _stderr_capture: Arc<Mutex<BoundedStderr>>,
+        _raw_response_capture: Arc<Mutex<ProviderRawResponseTranscriptV1>>,
     ) -> Result<ProviderExecution, ProviderErrorKind> {
         let _ = (request, cancelled);
         Err(ProviderErrorKind::UnsupportedPlatform)
@@ -2663,17 +2809,23 @@ fn read_worker_responses(
     mut stdout: impl Read,
     sender: SyncSender<Result<WorkerResponseFrameV1, String>>,
     completion: SyncSender<Result<(), String>>,
+    raw_response_capture: Arc<Mutex<ProviderRawResponseTranscriptV1>>,
 ) {
-    for maximum in [MAX_HANDSHAKE_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES] {
+    for (ordinal, maximum) in [MAX_HANDSHAKE_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES]
+        .into_iter()
+        .enumerate()
+    {
         let frame = match read_frame(&mut stdout, maximum) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 let message = "worker closed stdout before protocol response".to_owned();
+                mark_raw_response_capture_incomplete(&raw_response_capture);
                 let _ = sender.send(Err(message.clone()));
                 let _ = completion.send(Err(message));
                 return;
             }
             Err(message) => {
+                mark_raw_response_capture_incomplete(&raw_response_capture);
                 let _ = sender.send(Err(message.clone()));
                 let _ = completion.send(Err(message));
                 return;
@@ -2683,12 +2835,16 @@ fn read_worker_responses(
             .map_err(|error| format!("invalid worker response JSON: {error}"));
         match parsed {
             Ok(response) => {
+                capture_raw_response_frame(&raw_response_capture, ordinal as u8, frame);
                 if sender.send(Ok(response)).is_err() {
+                    mark_raw_response_capture_incomplete(&raw_response_capture);
                     let _ = completion.send(Err("protocol response receiver closed".to_owned()));
                     return;
                 }
             }
             Err(message) => {
+                capture_raw_response_frame(&raw_response_capture, ordinal as u8, frame);
+                mark_raw_response_capture_incomplete(&raw_response_capture);
                 let _ = sender.send(Err(message.clone()));
                 let _ = completion.send(Err(message));
                 return;
@@ -2697,9 +2853,19 @@ fn read_worker_responses(
     }
 
     let completion_status = match read_frame(&mut stdout, MAX_RESPONSE_FRAME_BYTES) {
-        Ok(None) => Ok(()),
-        Ok(Some(_)) => Err("worker emitted an unexpected third protocol frame".to_owned()),
-        Err(message) => Err(message),
+        Ok(None) => {
+            mark_raw_response_capture_clean_eof(&raw_response_capture);
+            Ok(())
+        }
+        Ok(Some(frame)) => {
+            capture_raw_response_frame(&raw_response_capture, 2, frame);
+            mark_raw_response_capture_incomplete(&raw_response_capture);
+            Err("worker emitted an unexpected third protocol frame".to_owned())
+        }
+        Err(message) => {
+            mark_raw_response_capture_incomplete(&raw_response_capture);
+            Err(message)
+        }
     };
     let _ = completion.send(completion_status);
 }
@@ -2873,6 +3039,46 @@ fn stderr_snapshot(capture: &Arc<Mutex<BoundedStderr>>) -> (Vec<u8>, bool) {
     }
 }
 
+fn raw_response_snapshot(
+    capture: &Arc<Mutex<ProviderRawResponseTranscriptV1>>,
+) -> ProviderRawResponseTranscriptV1 {
+    capture.lock().map_or_else(
+        |_| ProviderRawResponseTranscriptV1 {
+            frames: Vec::new(),
+            capture_complete: false,
+            omitted_frame_count: 1,
+            omitted_payload_bytes: 0,
+        },
+        |stored| stored.clone(),
+    )
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn capture_raw_response_frame(
+    capture: &Arc<Mutex<ProviderRawResponseTranscriptV1>>,
+    ordinal: u8,
+    payload_bytes: Vec<u8>,
+) {
+    if let Ok(mut stored) = capture.lock() {
+        stored.capture_frame(ordinal, payload_bytes);
+    }
+}
+
+fn mark_raw_response_capture_incomplete(capture: &Arc<Mutex<ProviderRawResponseTranscriptV1>>) {
+    if let Ok(mut stored) = capture.lock() {
+        stored.mark_incomplete();
+    }
+}
+
+fn mark_raw_response_capture_clean_eof(capture: &Arc<Mutex<ProviderRawResponseTranscriptV1>>) {
+    if let Ok(mut stored) = capture.lock() {
+        stored.mark_clean_eof();
+    }
+}
+
 #[cfg(windows)]
 struct ChildGuard {
     child: Option<windows_process::NativeChild>,
@@ -2914,6 +3120,12 @@ impl ChildGuard {
 
     fn child_mut(&mut self) -> &mut windows_process::NativeChild {
         self.child.as_mut().expect("child is owned until cleanup")
+    }
+
+    fn process_resources(&self) -> Option<ProviderProcessResourcesV1> {
+        self.child
+            .as_ref()
+            .and_then(windows_process::NativeChild::process_resources)
     }
 
     fn wait_until(
@@ -3102,9 +3314,16 @@ impl Drop for ChildGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::benchmark::{
+        self, ApprovedBenchmarkProviderV1, BenchmarkAnnotationCaseV1, BenchmarkCaseManifestV1,
+        BenchmarkCaseProvenanceV1, BenchmarkCaseSpecV1, BenchmarkClusterKeyV1,
+        BenchmarkCorpusManifestV1, BenchmarkProviderManifestV1, BenchmarkSplitKeyV1,
+        BenchmarkSplitV1, BenchmarkStrokeRefV1, BenchmarkTimeoutsV1, BenchmarkTokenizationPolicyV1,
+        ProviderArtifactPathV1, ProviderArtifactRoleV1,
+    };
     use crate::journal::{
-        EditCommand, JournalMetadata, MetadataScope, StoredEditAction, StoredMetadata,
-        StoredPhysicalSample, StoredStrokeStart,
+        EditCommand, JournalHeader, JournalMetadata, JournalWriter, MetadataScope,
+        StoredEditAction, StoredMetadata, StoredPhysicalSample, StoredStrokeStart,
     };
     use std::{
         collections::BTreeMap,
@@ -3120,6 +3339,19 @@ mod tests {
     };
 
     static NEXT_MOCK_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn json_value_contains_string(value: &serde_json::Value, needle: &str) -> bool {
+        match value {
+            serde_json::Value::String(value) => value.contains(needle),
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| json_value_contains_string(value, needle)),
+            serde_json::Value::Object(values) => values
+                .values()
+                .any(|value| json_value_contains_string(value, needle)),
+            _ => false,
+        }
+    }
 
     fn stroke_ref(stroke_id: &str, device_id: &str) -> StrokeRef {
         StrokeRef {
@@ -3854,6 +4086,96 @@ mod tests {
     }
 
     #[test]
+    fn raw_response_transcript_preserves_two_frames_clean_eof_and_incomplete_cases() {
+        let (_, request) = fixture_request();
+        let handshake = WorkerResponseFrameV1::Handshake {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            provider: fixture_provider(),
+            configuration_id: request.provider_configuration.configuration_id.clone(),
+            configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
+            capabilities: fixture_capabilities(),
+        };
+        let recognition = WorkerResponseFrameV1::Recognition {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            result: fixture_result(&request, request.source_revision.clone()),
+        };
+        let handshake_frame = encode_frame(&handshake, MAX_HANDSHAKE_FRAME_BYTES).unwrap();
+        let recognition_frame = encode_frame(&recognition, MAX_RESPONSE_FRAME_BYTES).unwrap();
+        let mut clean_stream = handshake_frame.clone();
+        clean_stream.extend_from_slice(&recognition_frame);
+        let (response_sender, responses) = mpsc::sync_channel(2);
+        let (completion_sender, completion) = mpsc::sync_channel(1);
+        let capture = Arc::new(Mutex::new(ProviderRawResponseTranscriptV1::default()));
+        read_worker_responses(
+            io::Cursor::new(clean_stream),
+            response_sender,
+            completion_sender,
+            Arc::clone(&capture),
+        );
+        assert!(completion.recv().unwrap().is_ok());
+        assert!(matches!(
+            responses.recv().unwrap(),
+            Ok(WorkerResponseFrameV1::Handshake { .. })
+        ));
+        assert!(matches!(
+            responses.recv().unwrap(),
+            Ok(WorkerResponseFrameV1::Recognition { .. })
+        ));
+        let transcript = capture.lock().unwrap().clone();
+        assert!(transcript.capture_complete);
+        assert_eq!(transcript.frames.len(), 2);
+        assert_eq!(transcript.frames[0].ordinal, 0);
+        assert_eq!(&transcript.frames[0].payload_bytes, &handshake_frame[4..]);
+        assert_eq!(transcript.frames[1].ordinal, 1);
+        assert_eq!(&transcript.frames[1].payload_bytes, &recognition_frame[4..]);
+
+        let third_frame = encode_frame(
+            &WorkerResponseFrameV1::Failure {
+                protocol_version: PROVIDER_PROTOCOL_VERSION,
+                code: "unexpected".to_owned(),
+                message: "third frame fixture".to_owned(),
+            },
+            MAX_RESPONSE_FRAME_BYTES,
+        )
+        .unwrap();
+        let mut extra_stream = handshake_frame.clone();
+        extra_stream.extend_from_slice(&recognition_frame);
+        extra_stream.extend_from_slice(&third_frame);
+        let (response_sender, responses) = mpsc::sync_channel(2);
+        let (completion_sender, completion) = mpsc::sync_channel(1);
+        let extra_capture = Arc::new(Mutex::new(ProviderRawResponseTranscriptV1::default()));
+        read_worker_responses(
+            io::Cursor::new(extra_stream),
+            response_sender,
+            completion_sender,
+            Arc::clone(&extra_capture),
+        );
+        assert!(responses.recv().unwrap().is_ok());
+        assert!(responses.recv().unwrap().is_ok());
+        let completion_error = completion.recv().unwrap().unwrap_err();
+        assert!(completion_error.contains("unexpected third"));
+        let transcript = extra_capture.lock().unwrap().clone();
+        assert!(!transcript.capture_complete);
+        assert_eq!(transcript.frames.len(), 3);
+        assert_eq!(&transcript.frames[2].payload_bytes, &third_frame[4..]);
+
+        let (response_sender, responses) = mpsc::sync_channel(2);
+        let (completion_sender, completion) = mpsc::sync_channel(1);
+        let partial_capture = Arc::new(Mutex::new(ProviderRawResponseTranscriptV1::default()));
+        read_worker_responses(
+            io::Cursor::new(handshake_frame),
+            response_sender,
+            completion_sender,
+            Arc::clone(&partial_capture),
+        );
+        assert!(responses.recv().unwrap().is_ok());
+        assert!(completion.recv().unwrap().is_err());
+        let transcript = partial_capture.lock().unwrap().clone();
+        assert!(!transcript.capture_complete);
+        assert_eq!(transcript.frames.len(), 1);
+    }
+
+    #[test]
     fn stderr_is_drained_while_retention_stays_byte_capped() {
         let capture = Arc::new(Mutex::new(BoundedStderr::default()));
         let bytes = vec![b'x'; MAX_STDERR_BYTES + 32];
@@ -4149,6 +4471,394 @@ mod tests {
                 "timed-out worker did not finish cleanup"
             );
             thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "CI-only end-to-end benchmark/provider test; see guarded hosted provider test job"]
+    fn benchmark_cli_journal_mock_provider_pipeline_writes_private_complete_artifact() {
+        require_provider_mock_test_opt_in();
+        let mock = compile_mock_worker();
+        let target = stroke_ref("cli-e2e-stroke", "cli-e2e-device");
+        let journal_path = mock.directory.join("frozen-cli-e2e.journal");
+        let mut journal_writer = JournalWriter::create(
+            journal_path.clone(),
+            JournalHeader {
+                journal_id: target.journal_id.clone(),
+                session_id: target.session_id.clone(),
+                config_id: Some("provider-test-config".to_owned()),
+                device_model_declared: Some("synthetic fixture device".to_owned()),
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        journal_writer
+            .start_stroke(target.clone(), StrokeViewFrame::default(), 10)
+            .unwrap();
+        let mut first_sample = physical_sample(&target, 501, 110);
+        first_sample.app_arrival_elapsed_ns = 11;
+        let first_sample_sequence = journal_writer.append_sample(first_sample).unwrap();
+        let mut second_sample = physical_sample(&target, 502, 114);
+        second_sample.app_arrival_elapsed_ns = 12;
+        let second_sample_sequence = journal_writer.append_sample(second_sample).unwrap();
+        journal_writer.commit_stroke(target.clone(), 13).unwrap();
+        journal_writer.flush().unwrap();
+        drop(journal_writer);
+
+        let journal = crate::journal::read_journal(&journal_path).unwrap();
+        assert!(!journal.recovery.truncated_final_record);
+        assert_eq!(journal.state.physical_samples.len(), 2);
+        assert_eq!(first_sample_sequence, 2);
+        assert_eq!(second_sample_sequence, 3);
+        let source_revision = ProviderSourceRevisionV1::from_journal(&journal.state);
+        let selected_strokes = vec![target.clone()];
+        let selected_stroke_refs = vec![BenchmarkStrokeRefV1::from(&target)];
+        let batch_id = format!(
+            "provider-cli-e2e-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let case_id = "cli-e2e-case".to_owned();
+        let corpus_id = "cli-e2e-corpus".to_owned();
+        let annotation_id = "cli-e2e-annotation".to_owned();
+        let case = BenchmarkCaseSpecV1 {
+            case_id: case_id.clone(),
+            journal_path: journal_path.clone(),
+            expected_source_revision: source_revision.clone(),
+            region_id: "region-e2e".to_owned(),
+            line_id: "line-e2e".to_owned(),
+            coordinate_space: "windows-screen-coordinates".to_owned(),
+            coordinate_units: "screen-pixel".to_owned(),
+            language_hints: vec!["vi-VN".to_owned(), "en-US".to_owned()],
+            requested_input_modalities: vec![ProviderInputCapabilityV1::OnlineStrokes],
+            selected_strokes: selected_stroke_refs,
+            provenance: BenchmarkCaseProvenanceV1 {
+                corpus_id: Some(corpus_id.clone()),
+                annotation_id: Some(annotation_id.clone()),
+                writer_key: "synthetic-writer-e2e".to_owned(),
+                session_key: target.session_id.clone(),
+                session_start_unix_ns: Some(1_700_000_000_000_000_000),
+                configuration_key: "provider-test-config".to_owned(),
+                split: Some(BenchmarkSplitV1::Evaluation),
+                capture_api: Some("synthetic-fixture".to_owned()),
+                capture_api_version: Some("fixture-api-v1".to_owned()),
+                tablet_model: None,
+                driver_version: None,
+                windows_build: None,
+                windows_ink_state: None,
+                active_area: None,
+                display_mapping: None,
+                pressure_curve: None,
+            },
+            raster: None,
+        };
+        let case_manifest = BenchmarkCaseManifestV1 {
+            schema_version: 1,
+            batch_id: batch_id.clone(),
+            cases: vec![case.clone()],
+        };
+        let corpus_manifest = BenchmarkCorpusManifestV1 {
+            schema_version: 1,
+            corpus_id: corpus_id.clone(),
+            split_key: BenchmarkSplitKeyV1::Session,
+            bootstrap_cluster: BenchmarkClusterKeyV1::Session,
+            bootstrap_seed: 17,
+            bootstrap_replicates: 10,
+            tokenization_policy: BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+            cases: vec![BenchmarkAnnotationCaseV1 {
+                case_id: case_id.clone(),
+                annotation_id: annotation_id.clone(),
+                reference_text: "PRIVATE_REFERENCE_TEXT_SENTINEL".to_owned(),
+                reference_language_scope:
+                    crate::benchmark::BenchmarkReferenceLanguageScopeV1::MixedOrUnknown,
+                reference_lexical_tokens: None,
+                delayed_marks: Vec::new(),
+            }],
+        };
+
+        let provider_configurations = [
+            ("cfg-success-a", "success-a", "ok"),
+            ("cfg-success-b", "success-b", "ok"),
+            ("cfg-visible-failure", "failure", "crash"),
+        ];
+        let mut expected_frames = BTreeMap::<String, (Vec<u8>, Vec<u8>)>::new();
+        let mut providers = Vec::new();
+        for (provider_index, (configuration_id, mode_label, behavior)) in
+            provider_configurations.iter().enumerate()
+        {
+            let configuration = ProviderConfigurationV1 {
+                configuration_id: (*configuration_id).to_owned(),
+                values: BTreeMap::from([
+                    (
+                        "credential".to_owned(),
+                        "PRIVATE_PROVIDER_SETTING_SENTINEL".to_owned(),
+                    ),
+                    ("mode".to_owned(), (*mode_label).to_owned()),
+                ]),
+            };
+            let request = build_recognition_request(RecognitionRequestBuildInput {
+                state: &journal.state,
+                request_id: format!("bench-{batch_id}-0-{provider_index}"),
+                region_id: case.region_id.clone(),
+                line_id: case.line_id.clone(),
+                coordinate_space: case.coordinate_space.clone(),
+                coordinate_units: case.coordinate_units.clone(),
+                language_hints: case.language_hints.clone(),
+                requested_input_modalities: case.requested_input_modalities.clone(),
+                provider_configuration: configuration.clone(),
+                selected_strokes: &selected_strokes,
+                raster: None,
+            })
+            .unwrap();
+            assert_eq!(request.source_revision, source_revision);
+            let handshake = serde_json::to_string(&WorkerResponseFrameV1::Handshake {
+                protocol_version: PROVIDER_PROTOCOL_VERSION,
+                provider: fixture_provider(),
+                configuration_id: configuration.configuration_id.clone(),
+                configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
+                capabilities: fixture_capabilities(),
+            })
+            .unwrap();
+            let recognition = serde_json::to_string(&WorkerResponseFrameV1::Recognition {
+                protocol_version: PROVIDER_PROTOCOL_VERSION,
+                result: fixture_result(&request, source_revision.clone()),
+            })
+            .unwrap();
+            expected_frames.insert(
+                configuration.configuration_id.clone(),
+                (
+                    handshake.as_bytes().to_vec(),
+                    recognition.as_bytes().to_vec(),
+                ),
+            );
+            providers.push(ApprovedBenchmarkProviderV1 {
+                provider_id: "mock-provider".to_owned(),
+                executable_path: mock.executable.clone(),
+                arguments: vec![(*behavior).to_owned(), handshake, recognition],
+                protocol_configuration: configuration,
+                artifacts: vec![ProviderArtifactPathV1 {
+                    artifact_id: "mock-executable".to_owned(),
+                    role: ProviderArtifactRoleV1::Executable,
+                    path: mock.executable.clone(),
+                }],
+                timeouts: Some(BenchmarkTimeoutsV1 {
+                    handshake_ms: 10_000,
+                    recognition_ms: 10_000,
+                    shutdown_ms: 1_000,
+                }),
+            });
+        }
+        let provider_manifest = BenchmarkProviderManifestV1 {
+            schema_version: 1,
+            providers,
+        };
+
+        let case_manifest_path = mock.directory.join("cases.json");
+        let provider_manifest_path = mock.directory.join("providers.json");
+        let corpus_manifest_path = mock.directory.join("corpus.json");
+        fs::write(
+            &case_manifest_path,
+            serde_json::to_vec(&case_manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &provider_manifest_path,
+            serde_json::to_vec(&provider_manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &corpus_manifest_path,
+            serde_json::to_vec(&corpus_manifest).unwrap(),
+        )
+        .unwrap();
+        let output_directory = mock.directory.join("benchmark-output");
+        assert!(!output_directory.exists());
+        let completion = benchmark::run_batch_cli_to_directory(
+            &case_manifest_path,
+            &provider_manifest_path,
+            Some(&corpus_manifest_path),
+            &output_directory,
+        )
+        .unwrap();
+        assert_eq!(completion.run_count, 3);
+        assert_eq!(completion.failure_count, 1);
+        assert!(completion.artifact_path.starts_with(&output_directory));
+        let artifact_bytes = fs::read(&completion.artifact_path).unwrap();
+        let artifact_text = String::from_utf8(artifact_bytes).unwrap();
+        assert!(!artifact_text.contains("PRIVATE_PROVIDER_SETTING_SENTINEL"));
+        assert!(!artifact_text.contains("PRIVATE_REFERENCE_TEXT_SENTINEL"));
+
+        let rows = artifact_text
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let path_sentinel = mock.executable.to_string_lossy().into_owned();
+        let injected_path_json = serde_json::to_string(&serde_json::json!({
+            "nested": {"path": path_sentinel.clone()}
+        }))
+        .unwrap();
+        let injected_path_row: serde_json::Value =
+            serde_json::from_str(&injected_path_json).unwrap();
+        assert!(json_value_contains_string(
+            &injected_path_row,
+            &path_sentinel
+        ));
+        for private_path in [
+            &mock.executable,
+            &journal_path,
+            &case_manifest_path,
+            &provider_manifest_path,
+            &corpus_manifest_path,
+        ] {
+            let path_text = private_path.to_string_lossy();
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| json_value_contains_string(row, path_text.as_ref()))
+            );
+        }
+        assert_eq!(rows.len(), 5);
+        let header = &rows
+            .iter()
+            .find(|row| row["record_type"] == "header")
+            .unwrap()["record"];
+        assert_eq!(header["batch_id"], batch_id);
+        assert!(
+            header["case_manifest_sha256"]
+                .as_str()
+                .is_some_and(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        );
+        assert!(
+            header["corpus_manifest_sha256"]
+                .as_str()
+                .is_some_and(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        );
+        let run_rows = rows
+            .iter()
+            .filter(|row| row["record_type"] == "run")
+            .map(|row| &row["record"])
+            .collect::<Vec<_>>();
+        assert_eq!(run_rows.len(), 3);
+        let find_run = |configuration_id: &str| {
+            run_rows
+                .iter()
+                .find(|row| row["provider_configuration_id"] == configuration_id)
+                .copied()
+                .unwrap()
+        };
+        let success_a = find_run("cfg-success-a");
+        let success_b = find_run("cfg-success-b");
+        assert_eq!(success_a["status"], "completed");
+        assert_eq!(success_b["status"], "completed");
+        assert_eq!(success_a["case_id"], case_id);
+        assert_eq!(success_a["provider_id"], "mock-provider");
+        assert_eq!(success_a["source_revision"], success_b["source_revision"]);
+        assert_eq!(
+            success_a["source_revision"],
+            serde_json::to_value(&source_revision).unwrap()
+        );
+        assert_eq!(
+            success_a["source_revision"]["journal_id"],
+            target.journal_id
+        );
+        let input_view_id = success_a["input_view_id"].as_str().unwrap();
+        let input_view_hash = input_view_id.strip_prefix("input-view-v1-").unwrap();
+        assert_eq!(input_view_hash.len(), 16);
+        assert!(
+            input_view_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(success_a["input_view_id"], success_b["input_view_id"]);
+        assert_eq!(
+            success_a["source_sample_sequences"],
+            serde_json::json!([first_sample_sequence, second_sample_sequence])
+        );
+        assert_eq!(
+            success_a["source_sample_sequences"],
+            success_b["source_sample_sequences"]
+        );
+        assert_eq!(success_a["selected_strokes"], success_b["selected_strokes"]);
+
+        let bytes_hex = |bytes: &[u8]| {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+            for byte in bytes {
+                encoded.push(char::from(HEX[usize::from(*byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+            }
+            encoded
+        };
+        for configuration_id in ["cfg-success-a", "cfg-success-b"] {
+            let run = find_run(configuration_id);
+            assert!(run["raw_response_capture_complete"].as_bool().unwrap());
+            assert!(run["result"].is_object());
+            let frames = run["raw_response_frames"].as_array().unwrap();
+            let expected = expected_frames.get(configuration_id).unwrap();
+            assert_eq!(frames.len(), 2);
+            for (ordinal, bytes) in [&expected.0, &expected.1].into_iter().enumerate() {
+                let prefix = u32::try_from(bytes.len()).unwrap().to_be_bytes();
+                assert_eq!(frames[ordinal]["ordinal"].as_u64(), Some(ordinal as u64));
+                assert_eq!(frames[ordinal]["payload_hex"], bytes_hex(bytes));
+                assert_eq!(frames[ordinal]["length_prefix_be_hex"], bytes_hex(&prefix));
+            }
+            let executable_digest = run["artifact_digests"][0]["sha256_hex"].as_str().unwrap();
+            assert_eq!(executable_digest.len(), 64);
+            assert!(artifact_text.contains(executable_digest));
+        }
+
+        let failed = find_run("cfg-visible-failure");
+        assert_eq!(failed["status"], "failed");
+        assert!(failed["result"].is_null());
+        assert!(failed["provider_identity"].is_null());
+        assert_eq!(failed["source_revision"], success_a["source_revision"]);
+        assert_eq!(failed["input_view_id"], success_a["input_view_id"]);
+        assert_eq!(
+            failed["source_sample_sequences"],
+            success_a["source_sample_sequences"]
+        );
+        assert!(!failed["raw_response_capture_complete"].as_bool().unwrap());
+        let failed_frames = failed["raw_response_frames"].as_array().unwrap();
+        let expected_failure_handshake = &expected_frames.get("cfg-visible-failure").unwrap().0;
+        assert_eq!(failed_frames.len(), 1);
+        assert_eq!(failed_frames[0]["ordinal"].as_u64(), Some(0));
+        assert_eq!(
+            failed_frames[0]["payload_hex"],
+            bytes_hex(expected_failure_handshake)
+        );
+
+        let footer = &rows
+            .iter()
+            .find(|row| row["record_type"] == "footer")
+            .unwrap()["record"];
+        assert_eq!(footer["planned_case_count"].as_u64(), Some(1));
+        assert_eq!(footer["planned_provider_count"].as_u64(), Some(3));
+        assert_eq!(footer["recorded_run_count"].as_u64(), Some(3));
+        assert_eq!(footer["failed_run_count"].as_u64(), Some(1));
+        assert_eq!(footer["complete"].as_bool(), Some(true));
+        let summaries = footer["provider_summaries"].as_array().unwrap();
+        assert_eq!(summaries.len(), 3);
+        for (configuration_id, completed, failed_count) in [
+            ("cfg-success-a", 1u64, 0u64),
+            ("cfg-success-b", 1u64, 0u64),
+            ("cfg-visible-failure", 0u64, 1u64),
+        ] {
+            let summary = summaries
+                .iter()
+                .find(|summary| summary["configuration_id"] == configuration_id)
+                .unwrap();
+            assert_eq!(summary["attempted_run_count"].as_u64(), Some(1));
+            assert_eq!(summary["completed_run_count"].as_u64(), Some(completed));
+            assert_eq!(summary["failed_run_count"].as_u64(), Some(failed_count));
         }
     }
 

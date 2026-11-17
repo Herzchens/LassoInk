@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   verify:
-    name: Verify M4 provider protocol and default tests on Windows x64
+    name: Verify M5/M6 benchmark harness and default tests on Windows x64
     runs-on: windows-2025
     steps:
       - name: Check out exact PR head or pushed commit
