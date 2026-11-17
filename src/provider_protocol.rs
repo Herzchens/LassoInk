@@ -3318,8 +3318,8 @@ mod tests {
         self, ApprovedBenchmarkProviderV1, BenchmarkAnnotationCaseV1, BenchmarkCaseManifestV1,
         BenchmarkCaseProvenanceV1, BenchmarkCaseSpecV1, BenchmarkClusterKeyV1,
         BenchmarkCorpusManifestV1, BenchmarkProviderManifestV1, BenchmarkSplitKeyV1,
-        BenchmarkSplitV1, BenchmarkStrokeRefV1, BenchmarkTimeoutsV1,
-        BenchmarkTokenizationPolicyV1, ProviderArtifactPathV1, ProviderArtifactRoleV1,
+        BenchmarkSplitV1, BenchmarkStrokeRefV1, BenchmarkTimeoutsV1, BenchmarkTokenizationPolicyV1,
+        ProviderArtifactPathV1, ProviderArtifactRoleV1,
     };
     use crate::journal::{
         EditCommand, JournalHeader, JournalMetadata, JournalWriter, MetadataScope,
@@ -4617,7 +4617,10 @@ mod tests {
             .unwrap();
             expected_frames.insert(
                 configuration.configuration_id.clone(),
-                (handshake.as_bytes().to_vec(), recognition.as_bytes().to_vec()),
+                (
+                    handshake.as_bytes().to_vec(),
+                    recognition.as_bytes().to_vec(),
+                ),
             );
             providers.push(ApprovedBenchmarkProviderV1 {
                 provider_id: "mock-provider".to_owned(),
@@ -4644,7 +4647,11 @@ mod tests {
         let case_manifest_path = mock.directory.join("cases.json");
         let provider_manifest_path = mock.directory.join("providers.json");
         let corpus_manifest_path = mock.directory.join("corpus.json");
-        fs::write(&case_manifest_path, serde_json::to_vec(&case_manifest).unwrap()).unwrap();
+        fs::write(
+            &case_manifest_path,
+            serde_json::to_vec(&case_manifest).unwrap(),
+        )
+        .unwrap();
         fs::write(
             &provider_manifest_path,
             serde_json::to_vec(&provider_manifest).unwrap(),
@@ -4693,12 +4700,20 @@ mod tests {
             .find(|row| row["record_type"] == "header")
             .unwrap()["record"];
         assert_eq!(header["batch_id"], batch_id);
-        assert!(header["case_manifest_sha256"].as_str().is_some_and(|value| {
-            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }));
-        assert!(header["corpus_manifest_sha256"].as_str().is_some_and(|value| {
-            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }));
+        assert!(
+            header["case_manifest_sha256"]
+                .as_str()
+                .is_some_and(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        );
+        assert!(
+            header["corpus_manifest_sha256"]
+                .as_str()
+                .is_some_and(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        );
         let run_rows = rows
             .iter()
             .filter(|row| row["record_type"] == "run")
@@ -4763,9 +4778,7 @@ mod tests {
                 assert_eq!(frames[ordinal]["payload_hex"], bytes_hex(bytes));
                 assert_eq!(frames[ordinal]["length_prefix_be_hex"], bytes_hex(&prefix));
             }
-            let executable_digest = run["artifact_digests"][0]["sha256_hex"]
-                .as_str()
-                .unwrap();
+            let executable_digest = run["artifact_digests"][0]["sha256_hex"].as_str().unwrap();
             assert_eq!(executable_digest.len(), 64);
             assert!(artifact_text.contains(executable_digest));
         }
@@ -4782,13 +4795,13 @@ mod tests {
         );
         assert!(!failed["raw_response_capture_complete"].as_bool().unwrap());
         let failed_frames = failed["raw_response_frames"].as_array().unwrap();
-        let expected_failure_handshake = &expected_frames
-            .get("cfg-visible-failure")
-            .unwrap()
-            .0;
+        let expected_failure_handshake = &expected_frames.get("cfg-visible-failure").unwrap().0;
         assert_eq!(failed_frames.len(), 1);
         assert_eq!(failed_frames[0]["ordinal"].as_u64(), Some(0));
-        assert_eq!(failed_frames[0]["payload_hex"], bytes_hex(expected_failure_handshake));
+        assert_eq!(
+            failed_frames[0]["payload_hex"],
+            bytes_hex(expected_failure_handshake)
+        );
 
         let footer = &rows
             .iter()
