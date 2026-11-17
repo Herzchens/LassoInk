@@ -11,22 +11,27 @@ use std::{
     error::Error,
     fmt,
     io::{self, Read, Write},
-    path::PathBuf,
-    process::{Child, Command, ExitStatus, Stdio},
     marker::PhantomData,
+    panic::AssertUnwindSafe,
+    path::PathBuf,
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
-    panic::AssertUnwindSafe,
     thread,
     time::{Duration, Instant},
 };
 
-use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError, de::SeqAccess, de::Visitor};
+use serde::{
+    Deserialize, Deserializer, Serialize, de::Error as DeError, de::SeqAccess, de::Visitor,
+};
 use serde_json::Value;
+
+#[cfg(windows)]
+#[path = "provider_windows.rs"]
+mod windows_process;
 
 use crate::journal::{
     JournalReplayState, NativeTimestamp, PhysicalSample, RawPosition, RawPressure, StrokeRef,
@@ -55,12 +60,255 @@ const MAX_ARGUMENTS: usize = 64;
 const MAX_ARGUMENT_BYTES: usize = 2048;
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CHILD_CLEANUP_GRACE: Duration = Duration::from_millis(500);
+const MAX_PROVIDER_WORKER_THREADS: usize = 8;
+
+#[derive(Default)]
+struct ProviderWorkerThreadRegistry {
+    handles: Vec<thread::JoinHandle<()>>,
+    reserved: usize,
+}
+
+static PROVIDER_WORKER_THREADS: OnceLock<Mutex<ProviderWorkerThreadRegistry>> = OnceLock::new();
+
+struct ProviderWorkerThreadPermit {
+    active: bool,
+}
+
+fn provider_worker_thread_registry() -> &'static Mutex<ProviderWorkerThreadRegistry> {
+    PROVIDER_WORKER_THREADS.get_or_init(|| Mutex::new(ProviderWorkerThreadRegistry::default()))
+}
+
+fn reserve_provider_worker_thread() -> Result<ProviderWorkerThreadPermit, ProviderErrorKind> {
+    let registry = provider_worker_thread_registry();
+    let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    reap_provider_worker_threads_locked(&mut registry);
+    if registry.handles.len().saturating_add(registry.reserved) >= MAX_PROVIDER_WORKER_THREADS {
+        return Err(ProviderErrorKind::WorkerCapacityReached);
+    }
+    let required_reservations = registry.reserved.saturating_add(1);
+    registry
+        .handles
+        .try_reserve(required_reservations)
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    registry.reserved += 1;
+    Ok(ProviderWorkerThreadPermit { active: true })
+}
+
+impl ProviderWorkerThreadPermit {
+    fn register(mut self, handle: thread::JoinHandle<()>) {
+        let registry = provider_worker_thread_registry();
+        let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.reserved = registry.reserved.saturating_sub(1);
+        registry.handles.push(handle);
+        self.active = false;
+    }
+}
+
+impl Drop for ProviderWorkerThreadPermit {
+    fn drop(&mut self) {
+        if self.active {
+            let registry = provider_worker_thread_registry();
+            let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.reserved = registry.reserved.saturating_sub(1);
+        }
+    }
+}
+
+fn reap_provider_worker_threads() {
+    let registry = provider_worker_thread_registry();
+    let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    reap_provider_worker_threads_locked(&mut registry);
+}
+
+fn reap_provider_worker_threads_locked(registry: &mut ProviderWorkerThreadRegistry) {
+    let mut index = 0;
+    while index < registry.handles.len() {
+        if registry.handles[index].is_finished() {
+            let handle = registry.handles.swap_remove(index);
+            let _ = handle.join();
+        } else {
+            index += 1;
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn cleanup_failure_or_original(
+    original: ProviderErrorKind,
+    cleanup: Result<(), String>,
+) -> ProviderErrorKind {
+    match cleanup {
+        Ok(()) => original,
+        Err(cleanup_error) => ProviderErrorKind::ProcessCleanupFailed(format!(
+            "original request failure: {original}; {cleanup_error}"
+        )),
+    }
+}
+
+#[cfg(windows)]
+const MAX_QUARANTINED_PROVIDER_SESSIONS: usize = 4;
+
+#[cfg(windows)]
+struct QuarantinedProviderSession {
+    child: Option<windows_process::NativeChild>,
+    helpers: Vec<thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+const MAX_PROVIDER_HELPER_THREADS: usize = 3;
+
+#[cfg(windows)]
+#[derive(Default)]
+struct ProcessCleanupRegistry {
+    sessions: Vec<QuarantinedProviderSession>,
+    reserved: usize,
+}
+
+#[cfg(windows)]
+static PROCESS_CLEANUP_REGISTRY: OnceLock<Mutex<ProcessCleanupRegistry>> = OnceLock::new();
+
+#[cfg(windows)]
+struct ProcessCleanupPermit {
+    active: bool,
+}
+
+#[cfg(windows)]
+fn process_cleanup_registry() -> &'static Mutex<ProcessCleanupRegistry> {
+    PROCESS_CLEANUP_REGISTRY.get_or_init(|| Mutex::new(ProcessCleanupRegistry::default()))
+}
+
+#[cfg(windows)]
+fn reserve_process_cleanup_slot() -> Result<ProcessCleanupPermit, ProviderErrorKind> {
+    let registry = process_cleanup_registry();
+    let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    reap_process_cleanup_registry_locked(&mut registry);
+    ensure_no_quarantined_provider_sessions(registry.sessions.len())?;
+    if registry.sessions.len().saturating_add(registry.reserved)
+        >= MAX_QUARANTINED_PROVIDER_SESSIONS
+    {
+        return Err(ProviderErrorKind::WorkerCapacityReached);
+    }
+    let required_reservations = registry.reserved.saturating_add(1);
+    registry
+        .sessions
+        .try_reserve(required_reservations)
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    registry.reserved += 1;
+    Ok(ProcessCleanupPermit { active: true })
+}
+
+#[cfg(any(windows, test))]
+fn ensure_no_quarantined_provider_sessions(count: usize) -> Result<(), ProviderErrorKind> {
+    if count == 0 {
+        Ok(())
+    } else {
+        Err(ProviderErrorKind::WorkerSubsystemPoisoned)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn quarantine_can_release(
+    tree_reaped: bool,
+    helpers_finished: bool,
+    child_handles_closed: bool,
+) -> bool {
+    tree_reaped && helpers_finished && child_handles_closed
+}
+
+#[cfg(windows)]
+impl ProcessCleanupPermit {
+    fn release(&mut self) {
+        if self.active {
+            let registry = process_cleanup_registry();
+            let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.reserved = registry.reserved.saturating_sub(1);
+            self.active = false;
+        }
+    }
+
+    fn quarantine(
+        &mut self,
+        child: Option<windows_process::NativeChild>,
+        helpers: Vec<thread::JoinHandle<()>>,
+    ) {
+        let registry = process_cleanup_registry();
+        let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.reserved = registry.reserved.saturating_sub(1);
+        registry
+            .sessions
+            .push(QuarantinedProviderSession { child, helpers });
+        self.active = false;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessCleanupPermit {
+    fn drop(&mut self) {
+        if self.active {
+            let registry = process_cleanup_registry();
+            let mut registry = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry.reserved = registry.reserved.saturating_sub(1);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn reap_process_cleanup_registry_locked(registry: &mut ProcessCleanupRegistry) {
+    let mut session_index = 0;
+    while session_index < registry.sessions.len() {
+        let session = &mut registry.sessions[session_index];
+        let tree_reaped = session
+            .child
+            .as_mut()
+            .is_none_or(|child| child.terminate_and_reap(Duration::ZERO));
+        if tree_reaped {
+            for helper in &session.helpers {
+                if !helper.is_finished() {
+                    windows_process::cancel_synchronous_io(helper);
+                }
+            }
+            let mut helper_index = 0;
+            while helper_index < session.helpers.len() {
+                if session.helpers[helper_index].is_finished() {
+                    let helper = session.helpers.swap_remove(helper_index);
+                    let _ = helper.join();
+                    continue;
+                }
+                helper_index += 1;
+            }
+            if session.helpers.is_empty()
+                && session
+                    .child
+                    .as_mut()
+                    .is_none_or(|child| child.close_job().is_ok())
+            {
+                if let Some(child) = session.child.as_mut() {
+                    child.clear_quarantined_fault_after_reap();
+                }
+            }
+        }
+        if quarantine_can_release(
+            tree_reaped,
+            session.helpers.is_empty(),
+            session
+                .child
+                .as_ref()
+                .is_none_or(windows_process::NativeChild::is_closed),
+        ) {
+            registry.sessions.swap_remove(session_index);
+        } else {
+            session_index += 1;
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProviderSourceRevisionV1 {
     pub journal_id: String,
     pub logical_revision: u64,
+    /// Exact submitted journal prefix; results must echo this value, but it is
+    /// not by itself a current-view freshness test.
     pub last_sequence: u64,
 }
 
@@ -166,7 +414,9 @@ impl OperatorApprovedProviderConfig {
             ));
         }
         if arguments.len() > MAX_ARGUMENTS
-            || arguments.iter().any(|argument| argument.len() > MAX_ARGUMENT_BYTES)
+            || arguments
+                .iter()
+                .any(|argument| argument.len() > MAX_ARGUMENT_BYTES)
             || arguments.iter().map(String::len).sum::<usize>() > 16 * 1024
         {
             return Err(ProviderErrorKind::InvalidConfiguration(
@@ -385,10 +635,17 @@ pub(crate) struct ProviderSampleV1 {
 pub(crate) struct ProviderRasterInputV1 {
     pub width: u32,
     pub height: u32,
-    pub pixel_format: String,
+    /// The protocol preserves this as opaque bytes and does not decode a pixel layout.
+    pub payload_contract: ProviderRasterPayloadContractV1,
     pub coordinate_space: String,
     pub units: String,
     pub raw_payload_hex: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderRasterPayloadContractV1 {
+    OpaqueBytes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -403,6 +660,8 @@ pub(crate) struct RecognitionRequestV1 {
     pub coordinate_space: String,
     pub coordinate_units: String,
     pub language_hints: Vec<String>,
+    /// Required provider inputs. Online samples remain canonical provenance for raster-only calls.
+    pub requested_input_modalities: Vec<ProviderInputCapabilityV1>,
     pub provider_configuration: ProviderConfigurationV1,
     pub provider_configuration_fingerprint: String,
     pub stroke_views: Vec<ProviderStrokeViewV1>,
@@ -414,12 +673,14 @@ pub(crate) struct RecognitionRequestV1 {
 #[derive(Serialize)]
 struct RequestFingerprintV1<'a> {
     protocol_version: u32,
-    source_revision: &'a ProviderSourceRevisionV1,
+    source_journal_id: &'a str,
+    logical_revision: u64,
     region_id: &'a str,
     line_id: &'a str,
     coordinate_space: &'a str,
     coordinate_units: &'a str,
     language_hints: &'a [String],
+    requested_input_modalities: &'a [ProviderInputCapabilityV1],
     stroke_views: &'a [ProviderStrokeViewV1],
     samples: &'a [ProviderSampleV1],
     raster: &'a Option<ProviderRasterInputV1>,
@@ -436,6 +697,7 @@ pub(crate) fn build_recognition_request(
     coordinate_space: String,
     coordinate_units: String,
     language_hints: Vec<String>,
+    requested_input_modalities: Vec<ProviderInputCapabilityV1>,
     provider_configuration: ProviderConfigurationV1,
     selected_strokes: &[StrokeRef],
     raster: Option<ProviderRasterInputV1>,
@@ -499,7 +761,12 @@ pub(crate) fn build_recognition_request(
     let mut samples = Vec::new();
     let sample_capacity = projected
         .iter()
-        .filter(|sample| sample.stroke_ref.as_ref().is_some_and(|stroke| selected.contains(stroke)))
+        .filter(|sample| {
+            sample
+                .stroke_ref
+                .as_ref()
+                .is_some_and(|stroke| selected.contains(stroke))
+        })
         .count();
     if sample_capacity == 0 || sample_capacity > MAX_PROVIDER_SAMPLES {
         return Err(ProviderErrorKind::InvalidRequest(
@@ -565,6 +832,9 @@ pub(crate) fn build_recognition_request(
         coordinate_space,
         coordinate_units,
         language_hints,
+        requested_input_modalities: canonicalize_input_modalities(
+            &requested_input_modalities,
+        )?,
         provider_configuration,
         provider_configuration_fingerprint,
         stroke_views,
@@ -670,11 +940,19 @@ fn validate_source_sample(sample: &PhysicalSample) -> Result<(), ProviderErrorKi
         }
     }
     if let Some(position) = &sample.position {
-        validate_text(&position.coordinate_space, MAX_ID_BYTES, "position coordinate space")?;
+        validate_text(
+            &position.coordinate_space,
+            MAX_ID_BYTES,
+            "position coordinate space",
+        )?;
         validate_text(&position.units, MAX_ID_BYTES, "position units")?;
     }
     if let Some(pressure) = &sample.pressure {
-        validate_text(&pressure.representation, MAX_ID_BYTES, "pressure representation")?;
+        validate_text(
+            &pressure.representation,
+            MAX_ID_BYTES,
+            "pressure representation",
+        )?;
         validate_text(&pressure.units, MAX_ID_BYTES, "pressure units")?;
     }
     if let Some(timestamp) = &sample.native_timestamp {
@@ -692,15 +970,26 @@ fn validate_source_sample(sample: &PhysicalSample) -> Result<(), ProviderErrorKi
     Ok(())
 }
 
+/// Hash selected, shared input and logical view state. The exact submitted
+/// `last_sequence` stays in the request/result provenance echo, but unrelated
+/// metadata or hover-only appends do not change this selected-view identity.
 fn input_view_id(request: &RecognitionRequestV1) -> Result<String, ProviderErrorKind> {
+    validate_requested_input_modalities(request)?;
+    let requested_input_modalities =
+        canonicalize_input_modalities(&request.requested_input_modalities)?;
+    if let Some(raster) = &request.raster {
+        validate_raster_input(raster)?;
+    }
     let fingerprint = RequestFingerprintV1 {
         protocol_version: request.protocol_version,
-        source_revision: &request.source_revision,
+        source_journal_id: &request.source_revision.journal_id,
+        logical_revision: request.source_revision.logical_revision,
         region_id: &request.region_id,
         line_id: &request.line_id,
         coordinate_space: &request.coordinate_space,
         coordinate_units: &request.coordinate_units,
         language_hints: &request.language_hints,
+        requested_input_modalities: &requested_input_modalities,
         stroke_views: &request.stroke_views,
         samples: &request.samples,
         raster: &request.raster,
@@ -727,30 +1016,22 @@ fn add_wire_estimate(estimate: &mut usize, amount: usize) -> Result<(), Provider
     Ok(())
 }
 
-fn estimate_json_string_bytes(value: &str) -> Option<usize> {
-    let escaped = value.chars().try_fold(0usize, |total, character| {
-        let width = match character {
-            '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
-            character if (character as u32) <= 0x1f => 6,
-            character if character.is_ascii() => 1,
-            _ => 6,
-        };
-        total.checked_add(width)
-    })?;
-    escaped.checked_add(2)
-}
-
 fn add_string_estimate(estimate: &mut usize, value: &str) -> Result<(), ProviderErrorKind> {
-    let bytes = estimate_json_string_bytes(value).ok_or(ProviderErrorKind::AllocationFailed)?;
+    // A constant-time upper bound: one UTF-8 byte can expand to at most six
+    // JSON bytes when escaped. Exact serialization and content validation run
+    // on the dedicated provider worker before any child is created.
+    let bytes = value
+        .len()
+        .checked_mul(6)
+        .and_then(|length| length.checked_add(2))
+        .ok_or(ProviderErrorKind::AllocationFailed)?;
     add_wire_estimate(estimate, bytes)
 }
 
 /// Cheap, allocation-free admission check for the UI-facing `try_submit`.
 /// Full hashing, canonical-order validation, and JSON encoding happen in the
 /// dedicated provider worker before it spawns any executable.
-fn validate_request_admission(
-    request: &RecognitionRequestV1,
-) -> Result<(), ProviderErrorKind> {
+fn validate_request_admission(request: &RecognitionRequestV1) -> Result<(), ProviderErrorKind> {
     if request.protocol_version != PROVIDER_PROTOCOL_VERSION {
         return Err(ProviderErrorKind::ProtocolVersion {
             expected: PROVIDER_PROTOCOL_VERSION,
@@ -779,6 +1060,10 @@ fn validate_request_admission(
         ));
     }
     validate_language_hints(&request.language_hints)?;
+    validate_requested_input_modalities(request)?;
+    if let Some(raster) = &request.raster {
+        validate_raster_bounds(raster)?;
+    }
     for (value, label) in [
         (request.request_id.as_str(), "request ID"),
         (request.input_view_id.as_str(), "input-view ID"),
@@ -812,6 +1097,9 @@ fn validate_request_admission(
     for hint in &request.language_hints {
         add_wire_estimate(&mut estimate, 32)?;
         add_string_estimate(&mut estimate, hint)?;
+    }
+    for _modality in &request.requested_input_modalities {
+        add_wire_estimate(&mut estimate, 32)?;
     }
     for (key, value) in &request.provider_configuration.values {
         add_wire_estimate(&mut estimate, 48)?;
@@ -861,7 +1149,6 @@ fn validate_request_admission(
         }
         if sample.raw_payload_hex.len() % 2 != 0
             || sample.raw_payload_hex.len() / 2 > MAX_RAW_SAMPLE_BYTES
-            || !sample.raw_payload_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(ProviderErrorKind::InvalidRequest(
                 "raw sample payload must be bounded hex".to_owned(),
@@ -881,7 +1168,10 @@ fn validate_request_admission(
         add_string_estimate(&mut estimate, &sample.stroke.source_api)?;
         add_string_estimate(&mut estimate, &sample.stroke.stroke_id)?;
         add_string_estimate(&mut estimate, &sample.app_arrival_elapsed_ns_decimal)?;
-        add_wire_estimate(&mut estimate, sample.raw_payload_hex.len().saturating_add(2))?;
+        add_wire_estimate(
+            &mut estimate,
+            sample.raw_payload_hex.len().saturating_add(2),
+        )?;
         if let Some(device_id) = &sample.stroke.device_id {
             add_string_estimate(&mut estimate, device_id)?;
         }
@@ -890,7 +1180,11 @@ fn validate_request_admission(
             add_string_estimate(&mut estimate, config_id)?;
         }
         if let Some(position) = &sample.position {
-            validate_text(&position.coordinate_space, MAX_ID_BYTES, "position coordinate space")?;
+            validate_text(
+                &position.coordinate_space,
+                MAX_ID_BYTES,
+                "position coordinate space",
+            )?;
             validate_text(&position.units, MAX_ID_BYTES, "position units")?;
             add_string_estimate(&mut estimate, &position.coordinate_space)?;
             add_string_estimate(&mut estimate, &position.units)?;
@@ -906,7 +1200,11 @@ fn validate_request_admission(
             add_string_estimate(&mut estimate, &position.units)?;
         }
         if let Some(pressure) = &sample.pressure {
-            validate_text(&pressure.representation, MAX_ID_BYTES, "pressure representation")?;
+            validate_text(
+                &pressure.representation,
+                MAX_ID_BYTES,
+                "pressure representation",
+            )?;
             validate_text(&pressure.units, MAX_ID_BYTES, "pressure units")?;
             add_string_estimate(&mut estimate, &pressure.representation)?;
             add_string_estimate(&mut estimate, &pressure.units)?;
@@ -924,7 +1222,6 @@ fn validate_request_admission(
     }
     if let Some(raster) = &request.raster {
         add_wire_estimate(&mut estimate, 512)?;
-        add_string_estimate(&mut estimate, &raster.pixel_format)?;
         add_string_estimate(&mut estimate, &raster.coordinate_space)?;
         add_string_estimate(&mut estimate, &raster.units)?;
         add_wire_estimate(&mut estimate, raster.raw_payload_hex.len())?;
@@ -951,6 +1248,7 @@ fn validate_request(request: &RecognitionRequestV1) -> Result<(), ProviderErrorK
         return Err(ProviderErrorKind::ProviderConfigurationMismatch);
     }
     validate_language_hints(&request.language_hints)?;
+    validate_requested_input_modalities(request)?;
     if request.request_id.is_empty()
         || request.input_view_id.is_empty()
         || request.region_id.is_empty()
@@ -1013,7 +1311,8 @@ fn validate_request(request: &RecognitionRequestV1) -> Result<(), ProviderErrorK
             || sample.journal_sequence > request.source_revision.last_sequence
         {
             return Err(ProviderErrorKind::InvalidRequest(
-                "samples must reference request StrokeRefs in increasing journal sequence".to_owned(),
+                "samples must reference request StrokeRefs in increasing journal sequence"
+                    .to_owned(),
             ));
         }
         previous_sequence = sample.journal_sequence;
@@ -1033,7 +1332,10 @@ fn validate_request(request: &RecognitionRequestV1) -> Result<(), ProviderErrorK
         }
         if sample.raw_payload_hex.len() % 2 != 0
             || sample.raw_payload_hex.len() / 2 > MAX_RAW_SAMPLE_BYTES
-            || !sample.raw_payload_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !sample
+                .raw_payload_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(ProviderErrorKind::InvalidRequest(
                 "raw sample payload must be bounded hex".to_owned(),
@@ -1050,7 +1352,11 @@ fn validate_request(request: &RecognitionRequestV1) -> Result<(), ProviderErrorK
             ));
         }
         if let Some(position) = &sample.position {
-            validate_text(&position.coordinate_space, MAX_ID_BYTES, "position coordinate space")?;
+            validate_text(
+                &position.coordinate_space,
+                MAX_ID_BYTES,
+                "position coordinate space",
+            )?;
             validate_text(&position.units, MAX_ID_BYTES, "position units")?;
             if position.coordinate_space.is_empty() || position.units.is_empty() {
                 return Err(ProviderErrorKind::InvalidRequest(
@@ -1072,7 +1378,11 @@ fn validate_request(request: &RecognitionRequestV1) -> Result<(), ProviderErrorK
             }
         }
         if let Some(pressure) = &sample.pressure {
-            validate_text(&pressure.representation, MAX_ID_BYTES, "pressure representation")?;
+            validate_text(
+                &pressure.representation,
+                MAX_ID_BYTES,
+                "pressure representation",
+            )?;
             validate_text(&pressure.units, MAX_ID_BYTES, "pressure units")?;
             if pressure.representation.is_empty() || pressure.units.is_empty() {
                 return Err(ProviderErrorKind::InvalidRequest(
@@ -1108,31 +1418,7 @@ fn validate_request(request: &RecognitionRequestV1) -> Result<(), ProviderErrorK
         ));
     }
     if let Some(raster) = &request.raster {
-        let raw_bytes = raster.raw_payload_hex.len() / 2;
-        let pixel_count = u64::from(raster.width).checked_mul(u64::from(raster.height));
-        if raster.width == 0
-            || raster.height == 0
-            || pixel_count.is_none_or(|pixels| pixels > MAX_TOTAL_RAW_SAMPLE_BYTES as u64)
-            || raster.raw_payload_hex.len() % 2 != 0
-            || raw_bytes > MAX_TOTAL_RAW_SAMPLE_BYTES
-            || !raster.raw_payload_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(ProviderErrorKind::InvalidRequest(
-                "optional raster is empty or exceeds its byte/geometry limits".to_owned(),
-            ));
-        }
-        for (value, label) in [
-            (raster.pixel_format.as_str(), "raster pixel format"),
-            (raster.coordinate_space.as_str(), "raster coordinate space"),
-            (raster.units.as_str(), "raster units"),
-        ] {
-            validate_text(value, MAX_ID_BYTES, label)?;
-            if value.is_empty() {
-                return Err(ProviderErrorKind::InvalidRequest(format!(
-                    "{label} must not be empty"
-                )));
-            }
-        }
+        validate_raster_input(raster)?;
     }
     Ok(())
 }
@@ -1191,11 +1477,124 @@ impl ProviderIdentityV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProviderInputCapabilityV1 {
     OnlineStrokes,
     Raster,
+}
+
+fn validate_requested_input_modalities(
+    request: &RecognitionRequestV1,
+) -> Result<(), ProviderErrorKind> {
+    let requested = &request.requested_input_modalities;
+    if requested.is_empty() || requested.len() > 2 {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "requested input modality set is empty or exceeds its fixed cap".to_owned(),
+        ));
+    }
+    for (index, modality) in requested.iter().enumerate() {
+        if requested[..index].contains(modality) {
+            return Err(ProviderErrorKind::InvalidRequest(
+                "requested input modalities must be unique".to_owned(),
+            ));
+        }
+        match modality {
+            ProviderInputCapabilityV1::OnlineStrokes
+                if request.stroke_views.is_empty() || request.samples.is_empty() =>
+            {
+                return Err(ProviderErrorKind::InvalidRequest(
+                    "online-stroke modality requires canonical stroke and sample provenance"
+                        .to_owned(),
+                ));
+            }
+            ProviderInputCapabilityV1::Raster => {
+                let raster = request.raster.as_ref().ok_or_else(|| {
+                    ProviderErrorKind::InvalidRequest(
+                        "requested raster modality has no raster payload".to_owned(),
+                    )
+                })?;
+                validate_raster_bounds(raster)?;
+            }
+            _ => {}
+        }
+    }
+    if request.raster.is_some()
+        != requested.contains(&ProviderInputCapabilityV1::Raster)
+    {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "raster payload presence must match the requested raster modality".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonicalize_input_modalities(
+    modalities: &[ProviderInputCapabilityV1],
+) -> Result<Vec<ProviderInputCapabilityV1>, ProviderErrorKind> {
+    if modalities.is_empty() || modalities.len() > 2 {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "requested input modality set is empty or exceeds its fixed cap".to_owned(),
+        ));
+    }
+    let mut canonical = Vec::new();
+    canonical
+        .try_reserve_exact(modalities.len())
+        .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+    canonical.extend_from_slice(modalities);
+    canonical.sort_by_key(|modality| match modality {
+        ProviderInputCapabilityV1::OnlineStrokes => 0u8,
+        ProviderInputCapabilityV1::Raster => 1u8,
+    });
+    if canonical.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "requested input modalities must be unique".to_owned(),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn validate_raster_input(raster: &ProviderRasterInputV1) -> Result<(), ProviderErrorKind> {
+    validate_raster_bounds(raster)?;
+    if !raster
+        .raw_payload_hex
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "opaque raster payload must use bounded hexadecimal bytes".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_raster_bounds(raster: &ProviderRasterInputV1) -> Result<(), ProviderErrorKind> {
+    let raw_bytes = raster.raw_payload_hex.len() / 2;
+    let declared_area = u64::from(raster.width).checked_mul(u64::from(raster.height));
+    if raster.width == 0
+        || raster.height == 0
+        || declared_area.is_none_or(|area| area > MAX_TOTAL_RAW_SAMPLE_BYTES as u64)
+        || raster.raw_payload_hex.is_empty()
+        || raster.raw_payload_hex.len() % 2 != 0
+        || raw_bytes == 0
+        || raw_bytes > MAX_TOTAL_RAW_SAMPLE_BYTES
+    {
+        return Err(ProviderErrorKind::InvalidRequest(
+            "opaque raster bytes are empty or exceed their geometry/byte limits".to_owned(),
+        ));
+    }
+    for (value, label) in [
+        (raster.coordinate_space.as_str(), "raster coordinate space"),
+        (raster.units.as_str(), "raster units"),
+    ] {
+        validate_text(value, MAX_ID_BYTES, label)?;
+        if value.is_empty() {
+            return Err(ProviderErrorKind::InvalidRequest(format!(
+                "{label} must not be empty"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1341,6 +1740,8 @@ pub(crate) struct RecognitionResultV1 {
     pub provider_configuration_fingerprint: String,
     pub provider: ProviderIdentityV1,
     pub provider_provenance: String,
+    /// Exact acknowledgement of the modalities requested for this response.
+    pub consumed_input_modalities: Vec<ProviderInputCapabilityV1>,
     #[serde(deserialize_with = "deserialize_bounded_candidates")]
     pub candidates: Vec<ProviderCandidateV1>,
 }
@@ -1393,20 +1794,38 @@ pub(crate) enum ProviderErrorKind {
     InvalidConfiguration(String),
     InvalidRequest(String),
     InvalidResponse(String),
-    ProtocolVersion { expected: u32, actual: u32 },
-    OversizedFrame { actual: usize, maximum: usize },
+    ProtocolVersion {
+        expected: u32,
+        actual: u32,
+    },
+    OversizedFrame {
+        actual: usize,
+        maximum: usize,
+    },
     TimedOut(ProviderPhase),
     Cancelled,
     SpawnFailed(String),
-    IoFailed { phase: ProviderPhase, message: String },
-    WorkerExited { exit_code: Option<i32> },
+    IoFailed {
+        phase: ProviderPhase,
+        message: String,
+    },
+    WorkerExited {
+        exit_code: Option<i32>,
+    },
     UnexpectedFrame(String),
     UnsupportedCapability(String),
-    ProviderFailure { code: String, message: String },
+    ProviderFailure {
+        code: String,
+        message: String,
+    },
     StaleSourceRevision,
     ProviderRequestMismatch,
     ProviderConfigurationMismatch,
     WorkerThreadPanicked,
+    UnsupportedPlatform,
+    WorkerCapacityReached,
+    WorkerSubsystemPoisoned,
+    ProcessCleanupFailed(String),
     AllocationFailed,
 }
 
@@ -1513,11 +1932,12 @@ impl ProviderWorkerHandle {
         timeouts: ProviderCallTimeouts,
     ) -> Result<Self, ProviderErrorKind> {
         let timeouts = timeouts.validate()?;
+        let worker_slot = reserve_provider_worker_thread()?;
         let (command_sender, command_receiver) = mpsc::sync_channel(1);
         let (result_sender, results) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
-        let _provider_thread = thread::Builder::new()
+        let provider_thread = thread::Builder::new()
             .name("lassoink-provider-worker".to_owned())
             .spawn(move || {
                 loop {
@@ -1574,6 +1994,7 @@ impl ProviderWorkerHandle {
                 }
             })
             .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?;
+        worker_slot.register(provider_thread);
         Ok(Self {
             commands: command_sender,
             results,
@@ -1615,6 +2036,7 @@ impl ProviderWorkerHandle {
     }
 
     pub(crate) fn try_receive(&self) -> ProviderWorkerPoll {
+        reap_provider_worker_threads();
         match self.results.try_recv() {
             Ok(outcome) => {
                 self.pending.store(false, Ordering::Release);
@@ -1660,12 +2082,15 @@ impl ProviderProcessRunner<'_> {
         })
     }
 
+    #[cfg(windows)]
     fn run_inner(
         &self,
-        request: RecognitionRequestV1,
+        mut request: RecognitionRequestV1,
         cancelled: &AtomicBool,
         stderr_capture: Arc<Mutex<BoundedStderr>>,
     ) -> Result<ProviderExecution, ProviderErrorKind> {
+        request.requested_input_modalities =
+            canonicalize_input_modalities(&request.requested_input_modalities)?;
         validate_request(&request)?;
         if request.provider_configuration != self.approved.protocol_configuration
             || request.provider_configuration_fingerprint
@@ -1689,7 +2114,11 @@ impl ProviderProcessRunner<'_> {
         let handshake_request = WorkerRequestFrameV1::Handshake {
             protocol_version: PROVIDER_PROTOCOL_VERSION,
             provider_id: self.approved.provider_id.clone(),
-            configuration_id: self.approved.protocol_configuration.configuration_id.clone(),
+            configuration_id: self
+                .approved
+                .protocol_configuration
+                .configuration_id
+                .clone(),
             configuration_fingerprint: self.approved.protocol_configuration.fingerprint()?,
         };
         let recognition_request = WorkerRequestFrameV1::Recognize {
@@ -1699,183 +2128,196 @@ impl ProviderProcessRunner<'_> {
         let handshake_frame = encode_frame(&handshake_request, MAX_HANDSHAKE_FRAME_BYTES)?;
         let recognition_frame = encode_frame(&recognition_request, MAX_REQUEST_FRAME_BYTES)?;
 
-        let mut command = Command::new(&self.approved.executable);
-        command
-            .args(&self.approved.arguments)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = ChildGuard::new(
-            command
-                .spawn()
-                .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?,
-        );
-        let stdin = child
-            .child_mut()
-            .stdin
-            .take()
-            .ok_or_else(|| ProviderErrorKind::IoFailed {
-                phase: ProviderPhase::Handshake,
-                message: "provider stdin pipe was not created".to_owned(),
+        let cleanup_permit = reserve_process_cleanup_slot()?;
+        let mut child = ChildGuard::new(cleanup_permit);
+        let attempt = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let windows_process::SpawnedProvider {
+                stdin,
+                stdout,
+                stderr,
+            } = windows_process::spawn_provider(
+                &self.approved.executable,
+                &self.approved.arguments,
+                &mut child,
+            )
+            .map_err(|error| {
+                ProviderErrorKind::SpawnFailed(format!(
+                    "contained Windows provider launch failed (Windows 10+ Job List required; \
+                     no uncontained fallback): {error}"
+                ))
             })?;
-        let stdout = child
-            .child_mut()
-            .stdout
-            .take()
-            .ok_or_else(|| ProviderErrorKind::IoFailed {
-                phase: ProviderPhase::Handshake,
-                message: "provider stdout pipe was not created".to_owned(),
-            })?;
-        let stderr = child
-            .child_mut()
-            .stderr
-            .take()
-            .ok_or_else(|| ProviderErrorKind::IoFailed {
-                phase: ProviderPhase::Handshake,
-                message: "provider stderr pipe was not created".to_owned(),
-            })?;
+            child.reserve_helper_slot()?;
+            let stderr_thread_capture = Arc::clone(&stderr_capture);
+            let stderr_thread = thread::Builder::new()
+                .name("lassoink-provider-stderr".to_owned())
+                .spawn(move || drain_stderr(stderr, stderr_thread_capture))
+                .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?;
+            child.add_helper(stderr_thread);
 
-        let stderr_thread_capture = Arc::clone(&stderr_capture);
-        let _stderr_thread = thread::Builder::new()
-            .name("lassoink-provider-stderr".to_owned())
-            .spawn(move || drain_stderr(stderr, stderr_thread_capture))
-            .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?;
+            let (response_sender, response_receiver) = mpsc::sync_channel(2);
+            let (reader_done_sender, reader_done_receiver) = mpsc::sync_channel(1);
+            child.reserve_helper_slot()?;
+            let stdout_thread = thread::Builder::new()
+                .name("lassoink-provider-stdout".to_owned())
+                .spawn(move || read_worker_responses(stdout, response_sender, reader_done_sender))
+                .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?;
+            child.add_helper(stdout_thread);
 
-        let (response_sender, response_receiver) = mpsc::sync_channel(2);
-        let (reader_done_sender, reader_done_receiver) = mpsc::sync_channel(1);
-        let _stdout_thread = thread::Builder::new()
-            .name("lassoink-provider-stdout".to_owned())
-            .spawn(move || {
-                read_worker_responses(stdout, response_sender, reader_done_sender)
-            })
-            .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?;
+            let (write_sender, write_receiver) = mpsc::sync_channel(1);
+            child.reserve_helper_slot()?;
+            let stdin_thread = thread::Builder::new()
+                .name("lassoink-provider-stdin".to_owned())
+                .spawn(move || write_worker_frames(stdin, write_receiver))
+                .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?;
+            child.add_helper(stdin_thread);
 
-        let (write_sender, write_receiver) = mpsc::sync_channel(1);
-        let _stdin_thread = thread::Builder::new()
-            .name("lassoink-provider-stdin".to_owned())
-            .spawn(move || write_worker_frames(stdin, write_receiver))
-            .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?;
+            let handshake_deadline = Instant::now() + self.timeouts.handshake;
+            send_frame_to_worker(
+                &write_sender,
+                handshake_frame,
+                handshake_deadline,
+                cancelled,
+                ProviderPhase::Handshake,
+            )?;
+            let handshake = receive_worker_response(
+                &response_receiver,
+                handshake_deadline,
+                cancelled,
+                ProviderPhase::Handshake,
+            )?;
+            let (provider, capabilities) = match handshake {
+                WorkerResponseFrameV1::Handshake {
+                    protocol_version,
+                    provider,
+                    configuration_id,
+                    configuration_fingerprint,
+                    capabilities,
+                } => {
+                    verify_protocol_version(protocol_version)?;
+                    provider.validate()?;
+                    capabilities.validate()?;
+                    if provider.provider_id != self.approved.provider_id {
+                        return Err(ProviderErrorKind::InvalidResponse(
+                            "provider handshake ID does not match the approved configuration"
+                                .to_owned(),
+                        ));
+                    }
+                    if configuration_id != self.approved.protocol_configuration.configuration_id
+                        || configuration_fingerprint
+                            != self.approved.protocol_configuration.fingerprint()?
+                    {
+                        return Err(ProviderErrorKind::ProviderConfigurationMismatch);
+                    }
+                    validate_capabilities_for_request(&capabilities, &request)?;
+                    (provider, capabilities)
+                }
+                WorkerResponseFrameV1::Failure {
+                    protocol_version,
+                    code,
+                    message,
+                } => {
+                    verify_protocol_version(protocol_version)?;
+                    validate_text(&code, MAX_ID_BYTES, "provider failure code")?;
+                    validate_text(&message, MAX_TEXT_BYTES, "provider failure message")?;
+                    return Err(ProviderErrorKind::ProviderFailure { code, message });
+                }
+                other => {
+                    return Err(ProviderErrorKind::UnexpectedFrame(format!(
+                        "expected handshake response, received {other:?}"
+                    )));
+                }
+            };
 
-        let handshake_deadline = Instant::now() + self.timeouts.handshake;
-        send_frame_to_worker(
-            &write_sender,
-            handshake_frame,
-            handshake_deadline,
-            cancelled,
-            ProviderPhase::Handshake,
-        )?;
-        let handshake = receive_worker_response(
-            &response_receiver,
-            handshake_deadline,
-            cancelled,
-            ProviderPhase::Handshake,
-        )?;
-        let (provider, capabilities) = match handshake {
-            WorkerResponseFrameV1::Handshake {
-                protocol_version,
+            let recognition_deadline = Instant::now() + self.timeouts.recognition;
+            send_frame_to_worker(
+                &write_sender,
+                recognition_frame,
+                recognition_deadline,
+                cancelled,
+                ProviderPhase::Recognition,
+            )?;
+            drop(write_sender);
+            let response = receive_worker_response(
+                &response_receiver,
+                recognition_deadline,
+                cancelled,
+                ProviderPhase::Recognition,
+            )?;
+            let result = match response {
+                WorkerResponseFrameV1::Recognition {
+                    protocol_version,
+                    result,
+                } => {
+                    verify_protocol_version(protocol_version)?;
+                    validate_recognition_result(&result, &request, &provider, &capabilities)?;
+                    result
+                }
+                WorkerResponseFrameV1::Failure {
+                    protocol_version,
+                    code,
+                    message,
+                } => {
+                    verify_protocol_version(protocol_version)?;
+                    validate_text(&code, MAX_ID_BYTES, "provider failure code")?;
+                    validate_text(&message, MAX_TEXT_BYTES, "provider failure message")?;
+                    return Err(ProviderErrorKind::ProviderFailure { code, message });
+                }
+                other => {
+                    return Err(ProviderErrorKind::UnexpectedFrame(format!(
+                        "expected recognition response, received {other:?}"
+                    )));
+                }
+            };
+            let shutdown_deadline = Instant::now() + self.timeouts.shutdown;
+            // Observe and release the direct process handle first. A descendant
+            // may outlive its parent even when it closes all three stdio handles,
+            // so keep the job open and repeatedly terminate/query its accounting
+            // state until ActiveProcesses reaches zero before waiting for EOF.
+            // The reader still rejects any third frame before success is accepted.
+            let exit_code = child.wait_until(shutdown_deadline, cancelled)?;
+            child.wait_for_job_tree_until(shutdown_deadline, cancelled)?;
+            receive_reader_completion(&reader_done_receiver, shutdown_deadline, cancelled)?;
+            drop(response_receiver);
+            drop(reader_done_receiver);
+            child.finish_success(shutdown_deadline)?;
+
+            if exit_code != 0 {
+                return Err(ProviderErrorKind::WorkerExited {
+                    exit_code: Some(exit_code as i32),
+                });
+            }
+            let (stderr_bytes, stderr_truncated) = stderr_snapshot(&stderr_capture);
+            Ok(ProviderExecution {
                 provider,
-                configuration_id,
-                configuration_fingerprint,
                 capabilities,
-            } => {
-                verify_protocol_version(protocol_version)?;
-                provider.validate()?;
-                capabilities.validate()?;
-                if provider.provider_id != self.approved.provider_id {
-                    return Err(ProviderErrorKind::InvalidResponse(
-                        "provider handshake ID does not match the approved configuration"
-                            .to_owned(),
-                    ));
-                }
-                if configuration_id != self.approved.protocol_configuration.configuration_id
-                    || configuration_fingerprint
-                        != self.approved.protocol_configuration.fingerprint()?
-                {
-                    return Err(ProviderErrorKind::ProviderConfigurationMismatch);
-                }
-                validate_capabilities_for_request(&capabilities, &request)?;
-                (provider, capabilities)
-            }
-            WorkerResponseFrameV1::Failure {
-                protocol_version,
-                code,
-                message,
-            } => {
-                verify_protocol_version(protocol_version)?;
-                validate_text(&code, MAX_ID_BYTES, "provider failure code")?;
-                validate_text(&message, MAX_TEXT_BYTES, "provider failure message")?;
-                return Err(ProviderErrorKind::ProviderFailure { code, message });
-            }
-            other => {
-                return Err(ProviderErrorKind::UnexpectedFrame(format!(
-                    "expected handshake response, received {other:?}"
-                )));
-            }
-        };
-
-        let recognition_deadline = Instant::now() + self.timeouts.recognition;
-        send_frame_to_worker(
-            &write_sender,
-            recognition_frame,
-            recognition_deadline,
-            cancelled,
-            ProviderPhase::Recognition,
-        )?;
-        drop(write_sender);
-        let response = receive_worker_response(
-            &response_receiver,
-            recognition_deadline,
-            cancelled,
-            ProviderPhase::Recognition,
-        )?;
-        let result = match response {
-            WorkerResponseFrameV1::Recognition {
-                protocol_version,
                 result,
-            } => {
-                verify_protocol_version(protocol_version)?;
-                validate_recognition_result(&result, &request, &provider, &capabilities)?;
-                result
-            }
-            WorkerResponseFrameV1::Failure {
-                protocol_version,
-                code,
-                message,
-            } => {
-                verify_protocol_version(protocol_version)?;
-                validate_text(&code, MAX_ID_BYTES, "provider failure code")?;
-                validate_text(&message, MAX_TEXT_BYTES, "provider failure message")?;
-                return Err(ProviderErrorKind::ProviderFailure { code, message });
-            }
-            other => {
-                return Err(ProviderErrorKind::UnexpectedFrame(format!(
-                    "expected recognition response, received {other:?}"
-                )));
-            }
+                stderr_bytes,
+                stderr_truncated,
+            })
+        }));
+        let attempt = match attempt {
+            Ok(attempt) => attempt,
+            Err(_) => Err(ProviderErrorKind::WorkerThreadPanicked),
         };
-        let shutdown_deadline = Instant::now() + self.timeouts.shutdown;
-        receive_reader_completion(
-            &reader_done_receiver,
-            shutdown_deadline,
-            cancelled,
-        )?;
-        drop(response_receiver);
-        drop(reader_done_receiver);
 
-        let status = child.wait_until(shutdown_deadline, cancelled)?;
-        if !status.success() {
-            return Err(ProviderErrorKind::WorkerExited {
-                exit_code: status.code(),
-            });
+        match attempt {
+            Ok(execution) => Ok(execution),
+            Err(original_error) => Err(cleanup_failure_or_original(
+                original_error,
+                child.cleanup_after_failure(),
+            )),
         }
-        let (stderr_bytes, stderr_truncated) = stderr_snapshot(&stderr_capture);
-        Ok(ProviderExecution {
-            provider,
-            capabilities,
-            result,
-            stderr_bytes,
-            stderr_truncated,
-        })
+    }
+
+    #[cfg(not(windows))]
+    fn run_inner(
+        &self,
+        request: RecognitionRequestV1,
+        cancelled: &AtomicBool,
+        _stderr_capture: Arc<Mutex<BoundedStderr>>,
+    ) -> Result<ProviderExecution, ProviderErrorKind> {
+        let _ = (request, cancelled);
+        Err(ProviderErrorKind::UnsupportedPlatform)
     }
 }
 
@@ -1909,10 +2351,14 @@ fn validate_recognition_result(
         return Err(ProviderErrorKind::ProviderRequestMismatch);
     }
     if result.provider_configuration_id != request.provider_configuration.configuration_id
-        || result.provider_configuration_fingerprint
-            != request.provider_configuration_fingerprint
+        || result.provider_configuration_fingerprint != request.provider_configuration_fingerprint
     {
         return Err(ProviderErrorKind::ProviderConfigurationMismatch);
+    }
+    if result.consumed_input_modalities != request.requested_input_modalities {
+        return Err(ProviderErrorKind::InvalidResponse(
+            "provider did not acknowledge the exact requested input modalities".to_owned(),
+        ));
     }
     if result.provider != *provider {
         return Err(ProviderErrorKind::InvalidResponse(
@@ -2011,22 +2457,12 @@ fn validate_capabilities_for_request(
     capabilities: &ProviderCapabilitiesV1,
     request: &RecognitionRequestV1,
 ) -> Result<(), ProviderErrorKind> {
-    if !capabilities
-        .inputs
-        .contains(&ProviderInputCapabilityV1::OnlineStrokes)
-    {
-        return Err(ProviderErrorKind::UnsupportedCapability(
-            "provider did not advertise online stroke input".to_owned(),
-        ));
-    }
-    if request.raster.is_some()
-        && !capabilities
-            .inputs
-            .contains(&ProviderInputCapabilityV1::Raster)
-    {
-        return Err(ProviderErrorKind::UnsupportedCapability(
-            "provider did not advertise raster input".to_owned(),
-        ));
+    for modality in &request.requested_input_modalities {
+        if !capabilities.inputs.contains(modality) {
+            return Err(ProviderErrorKind::UnsupportedCapability(format!(
+                "provider did not advertise requested {modality:?} input"
+            )));
+        }
     }
     if !capabilities
         .outputs
@@ -2054,16 +2490,24 @@ pub(crate) fn validate_result_for_current_view(
     current_source_revision: &ProviderSourceRevisionV1,
     current_input_view_id: &str,
 ) -> Result<(), ProviderErrorKind> {
-    if request.source_revision != *current_source_revision
-        || result.source_revision != *current_source_revision
+    if result.source_revision != request.source_revision
+        || request.source_revision.journal_id != current_source_revision.journal_id
+        || request.source_revision.logical_revision != current_source_revision.logical_revision
     {
         return Err(ProviderErrorKind::StaleSourceRevision);
     }
     if request.input_view_id != current_input_view_id
         || result.input_view_id != current_input_view_id
         || result.request_id != request.request_id
+        || result.region_id != request.region_id
+        || result.line_id != request.line_id
     {
         return Err(ProviderErrorKind::ProviderRequestMismatch);
+    }
+    if result.consumed_input_modalities != request.requested_input_modalities {
+        return Err(ProviderErrorKind::InvalidResponse(
+            "provider did not acknowledge the exact requested input modalities".to_owned(),
+        ));
     }
     if result.provider_configuration_id != request.provider_configuration.configuration_id
         || result.provider_configuration_fingerprint != request.provider_configuration_fingerprint
@@ -2117,7 +2561,10 @@ impl Write for BoundedBuffer {
     }
 }
 
-fn bounded_json_bytes<T: Serialize>(value: &T, maximum: usize) -> Result<Vec<u8>, ProviderErrorKind> {
+fn bounded_json_bytes<T: Serialize>(
+    value: &T,
+    maximum: usize,
+) -> Result<Vec<u8>, ProviderErrorKind> {
     let mut buffer = BoundedBuffer::new(maximum);
     if let Err(error) = serde_json::to_writer(&mut buffer, value) {
         if buffer.overflowed {
@@ -2233,10 +2680,7 @@ struct WorkerWriteCommand {
     acknowledgement: SyncSender<Result<(), String>>,
 }
 
-fn write_worker_frames(
-    mut stdin: impl Write,
-    receiver: Receiver<WorkerWriteCommand>,
-) {
+fn write_worker_frames(mut stdin: impl Write, receiver: Receiver<WorkerWriteCommand>) {
     while let Ok(command) = receiver.recv() {
         let result = stdin
             .write_all(&command.frame)
@@ -2400,36 +2844,67 @@ fn stderr_snapshot(capture: &Arc<Mutex<BoundedStderr>>) -> (Vec<u8>, bool) {
     }
 }
 
-struct ChildGuard(Option<Child>);
+#[cfg(windows)]
+struct ChildGuard {
+    child: Option<windows_process::NativeChild>,
+    helpers: Vec<thread::JoinHandle<()>>,
+    cleanup_permit: ProcessCleanupPermit,
+    completed: bool,
+}
 
+#[cfg(windows)]
 impl ChildGuard {
-    fn new(child: Child) -> Self {
-        Self(Some(child))
+    fn new(cleanup_permit: ProcessCleanupPermit) -> Self {
+        Self {
+            child: None,
+            helpers: Vec::new(),
+            cleanup_permit,
+            completed: false,
+        }
     }
 
-    fn child_mut(&mut self) -> &mut Child {
-        self.0.as_mut().expect("child is present until exit status")
+    fn attach_child(&mut self, child: windows_process::NativeChild) {
+        self.child = Some(child);
+    }
+
+    fn reserve_helper_slot(&mut self) -> Result<(), ProviderErrorKind> {
+        if self.helpers.len() >= MAX_PROVIDER_HELPER_THREADS {
+            return Err(ProviderErrorKind::ProcessCleanupFailed(
+                "provider helper-thread cap exceeded".to_owned(),
+            ));
+        }
+        self.helpers
+            .try_reserve(1)
+            .map_err(|_| ProviderErrorKind::AllocationFailed)?;
+        Ok(())
+    }
+
+    fn add_helper(&mut self, helper: thread::JoinHandle<()>) {
+        self.helpers.push(helper);
+    }
+
+    fn child_mut(&mut self) -> &mut windows_process::NativeChild {
+        self.child.as_mut().expect("child is owned until cleanup")
     }
 
     fn wait_until(
         &mut self,
         deadline: Instant,
         cancelled: &AtomicBool,
-    ) -> Result<ExitStatus, ProviderErrorKind> {
+    ) -> Result<u32, ProviderErrorKind> {
         loop {
             if cancelled.load(Ordering::Acquire) {
                 return Err(ProviderErrorKind::Cancelled);
             }
-            if let Some(status) = self
-                .child_mut()
-                .try_wait()
-                .map_err(|error| ProviderErrorKind::IoFailed {
-                    phase: ProviderPhase::Shutdown,
-                    message: error.to_string(),
-                })?
+            if let Some(exit_code) =
+                self.child_mut()
+                    .try_wait()
+                    .map_err(|error| ProviderErrorKind::IoFailed {
+                        phase: ProviderPhase::Shutdown,
+                        message: error.to_string(),
+                    })?
             {
-                self.0 = None;
-                return Ok(status);
+                return Ok(exit_code);
             }
             if Instant::now() >= deadline {
                 return Err(ProviderErrorKind::TimedOut(ProviderPhase::Shutdown));
@@ -2437,23 +2912,156 @@ impl ChildGuard {
             thread::sleep(IO_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
         }
     }
+
+    fn wait_for_job_tree_until(
+        &mut self,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> Result<(), ProviderErrorKind> {
+        self.child_mut()
+            .wait_for_job_tree_until(deadline, cancelled)
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::Interrupted => ProviderErrorKind::Cancelled,
+                std::io::ErrorKind::TimedOut => ProviderErrorKind::ProcessCleanupFailed(
+                    format!("provider process tree did not drain: {error}"),
+                ),
+                _ => ProviderErrorKind::ProcessCleanupFailed(format!(
+                    "provider process-tree accounting/termination failed: {error}"
+                )),
+            })
+    }
+
+    fn finish_success(&mut self, deadline: Instant) -> Result<(), ProviderErrorKind> {
+        if !self.wait_for_helpers(deadline) {
+            self.cancel_helpers();
+            let retry_deadline = Instant::now() + CHILD_CLEANUP_GRACE;
+            if !self.wait_for_helpers(retry_deadline) {
+                return Err(ProviderErrorKind::ProcessCleanupFailed(
+                    concat!(
+                        "provider stdio helpers did not stop after EOF and verified ",
+                        "tree drain"
+                    )
+                    .to_owned(),
+                ));
+            }
+        }
+        self.join_finished_helpers()?;
+        self.child_mut().close_job().map_err(|error| {
+            ProviderErrorKind::ProcessCleanupFailed(format!(
+                "provider Job Object could not be released after helpers joined: {error}"
+            ))
+        })?;
+        if !self.child.as_ref().is_some_and(windows_process::NativeChild::is_closed) {
+            return Err(ProviderErrorKind::ProcessCleanupFailed(
+                concat!(
+                    "provider process tree, Job Object, or setup handle remained open ",
+                    "after verified drain"
+                )
+                .to_owned(),
+            ));
+        }
+        self.cleanup_permit.release();
+        self.completed = true;
+        Ok(())
+    }
+
+    fn wait_for_helpers(&self, deadline: Instant) -> bool {
+        loop {
+            if self.helpers.iter().all(|helper| helper.is_finished()) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(IO_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
+
+    fn cancel_helpers(&self) {
+        for helper in &self.helpers {
+            if !helper.is_finished() {
+                windows_process::cancel_synchronous_io(helper);
+            }
+        }
+    }
+
+    fn join_finished_helpers(&mut self) -> Result<(), ProviderErrorKind> {
+        let mut helper_panicked = false;
+        for helper in self.helpers.drain(..) {
+            if helper.join().is_err() {
+                helper_panicked = true;
+            }
+        }
+        if helper_panicked {
+            Err(ProviderErrorKind::ProcessCleanupFailed(
+                "provider stdio helper panicked".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn cleanup_after_failure(&mut self) -> Result<(), String> {
+        if self.completed {
+            return Ok(());
+        }
+        let had_prior_cleanup_fault = self
+            .child
+            .as_ref()
+            .is_some_and(windows_process::NativeChild::cleanup_faulted);
+        let process_tree_reaped = self
+            .child
+            .as_mut()
+            .is_none_or(|child| child.terminate_and_reap(CHILD_CLEANUP_GRACE));
+        self.cancel_helpers();
+        let helper_deadline = Instant::now() + CHILD_CLEANUP_GRACE;
+        let _ = self.wait_for_helpers(helper_deadline);
+        let helpers_closed = self.helpers.iter().all(|helper| helper.is_finished());
+        if process_tree_reaped && helpers_closed {
+            let _ = self.join_finished_helpers();
+        }
+        let job_closed = if process_tree_reaped && helpers_closed && !had_prior_cleanup_fault {
+            self.child
+                .as_mut()
+                .is_none_or(|child| child.close_job().is_ok())
+        } else {
+            false
+        };
+        let child_closed = self
+            .child
+            .as_ref()
+            .is_none_or(windows_process::NativeChild::is_closed);
+        if process_tree_reaped
+            && helpers_closed
+            && job_closed
+            && child_closed
+            && !had_prior_cleanup_fault
+        {
+            self.child.take();
+            self.cleanup_permit.release();
+            self.completed = true;
+            return Ok(());
+        }
+
+        let failure = format!(
+            "bounded cleanup did not confirm parent exit, Job Object ActiveProcesses == 0, \
+             helper completion, and Job Object release \
+             (process_tree_reaped={process_tree_reaped}, helpers_finished={helpers_closed}, \
+             job_closed={job_closed}, prior_cleanup_fault={had_prior_cleanup_fault}); \
+             owned handles retained in quarantine"
+        );
+        self.cleanup_permit
+            .quarantine(self.child.take(), std::mem::take(&mut self.helpers));
+        self.completed = true;
+        Err(failure)
+    }
 }
 
+#[cfg(windows)]
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
-            if child.try_wait().ok().flatten().is_none() {
-                let _ = child.kill();
-                let cleanup_deadline = Instant::now() + CHILD_CLEANUP_GRACE;
-                while Instant::now() < cleanup_deadline {
-                    if child.try_wait().ok().flatten().is_some() {
-                        break;
-                    }
-                    thread::sleep(
-                        IO_POLL_INTERVAL.min(cleanup_deadline.saturating_duration_since(Instant::now())),
-                    );
-                }
-            }
+        if !self.completed {
+            let _ = self.cleanup_after_failure();
         }
     }
 }
@@ -2461,13 +3069,20 @@ impl Drop for ChildGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::{EditCommand, StoredEditAction, StoredPhysicalSample, StoredStrokeStart};
+    use crate::journal::{
+        EditCommand, JournalMetadata, MetadataScope, StoredEditAction, StoredMetadata,
+        StoredPhysicalSample, StoredStrokeStart,
+    };
     use std::{
         collections::BTreeMap,
-        fs,
-        process,
+        fs, process::{self, Command},
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
+    };
+    #[cfg(windows)]
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0},
+        System::Threading::{OpenProcess, WaitForSingleObject},
     };
 
     static NEXT_MOCK_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -2598,6 +3213,22 @@ mod tests {
         selected: &[StrokeRef],
         provider_configuration: ProviderConfigurationV1,
     ) -> RecognitionRequestV1 {
+        fixture_request_with_inputs(
+            state,
+            selected,
+            provider_configuration,
+            vec![ProviderInputCapabilityV1::OnlineStrokes],
+            None,
+        )
+    }
+
+    fn fixture_request_with_inputs(
+        state: &JournalReplayState,
+        selected: &[StrokeRef],
+        provider_configuration: ProviderConfigurationV1,
+        requested_input_modalities: Vec<ProviderInputCapabilityV1>,
+        raster: Option<ProviderRasterInputV1>,
+    ) -> RecognitionRequestV1 {
         build_recognition_request(
             state,
             "request-1".to_owned(),
@@ -2606,9 +3237,10 @@ mod tests {
             "windows-screen-coordinates".to_owned(),
             "screen-pixel".to_owned(),
             vec!["vi-VN".to_owned(), "en-US".to_owned()],
+            requested_input_modalities,
             provider_configuration,
             selected,
-            None,
+            raster,
         )
         .unwrap()
     }
@@ -2655,6 +3287,7 @@ mod tests {
             provider_configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
             provider: fixture_provider(),
             provider_provenance: "CI-only mock fixture; not recognition evidence".to_owned(),
+            consumed_input_modalities: request.requested_input_modalities.clone(),
             candidates: vec![ProviderCandidateV1 {
                 recognized_text: "fixture text".to_owned(),
                 native_score_raw: Some(score),
@@ -2779,36 +3412,83 @@ mod tests {
     }
 
     #[test]
-    fn stale_source_revision_or_input_view_is_rejected_before_acceptance() {
-        let (state, request) = fixture_request();
+    fn unrelated_appends_preserve_freshness_but_logical_edits_stale_results() {
+        let (mut state, selected) = fixture_state_and_selection();
+        let request = fixture_request_for_state(&state, &selected, fixture_configuration());
         let result = fixture_result(&request, request.source_revision.clone());
-        assert!(validate_result_for_current_view(
-            &request,
-            &result,
-            &request.source_revision,
-            &request.input_view_id
-        )
-        .is_ok());
-
-        let mut advanced = ProviderSourceRevisionV1::from_journal(&state);
-        advanced.last_sequence += 1;
+        let mut wrong_boundary_echo = result.clone();
+        wrong_boundary_echo.source_revision.last_sequence += 1;
         assert_eq!(
-            validate_result_for_current_view(
+            validate_recognition_result(
+                &wrong_boundary_echo,
                 &request,
-                &result,
-                &advanced,
-                &request.input_view_id
+                &fixture_provider(),
+                &fixture_capabilities()
             ),
             Err(ProviderErrorKind::StaleSourceRevision)
         );
+
+        let mut hover = physical_sample(&selected[0], 901, 999);
+        hover.stroke_id = None;
+        state.physical_samples.push(StoredPhysicalSample {
+            sequence: 31,
+            sample: hover,
+        });
+        state.metadata_history.push(StoredMetadata {
+            sequence: 32,
+            app_epoch_id: state.current_session_id.clone(),
+            metadata: JournalMetadata {
+                scope: MetadataScope::Session,
+                scope_id: state.current_session_id.clone(),
+                source_api: None,
+                device_id: None,
+                key: "provider-test-note".to_owned(),
+                value: "unrelated metadata append".to_owned(),
+                provenance: "test fixture".to_owned(),
+                app_arrival_elapsed_ns: 99,
+            },
+        });
+        state.last_sequence = 32;
+        let latest_unrelated =
+            fixture_request_for_state(&state, &selected, fixture_configuration());
+        assert_ne!(
+            request.source_revision.last_sequence,
+            latest_unrelated.source_revision.last_sequence
+        );
+        assert_eq!(request.input_view_id, latest_unrelated.input_view_id);
+        assert!(validate_result_for_current_view(
+            &request,
+            &result,
+            &latest_unrelated.source_revision,
+            &latest_unrelated.input_view_id
+        )
+        .is_ok());
+
+        let mut edited = state.clone();
+        edited.logical_revision += 1;
+        if let EditCommand::Move { delta_x_raw, .. } = &mut edited.edit_actions[0].command {
+            *delta_x_raw += 1;
+        }
+        let edited_request = fixture_request_for_state(&edited, &selected, fixture_configuration());
+        assert_ne!(request.input_view_id, edited_request.input_view_id);
         assert_eq!(
             validate_result_for_current_view(
                 &request,
                 &result,
-                &request.source_revision,
-                "another-input-view"
+                &edited_request.source_revision,
+                &edited_request.input_view_id
             ),
             Err(ProviderErrorKind::StaleSourceRevision)
+        );
+
+        assert_eq!(
+            validate_result_for_current_view(
+                &request,
+                &result,
+                &latest_unrelated.source_revision,
+                "another-input-view"
+            ),
+            Err(ProviderErrorKind::ProviderRequestMismatch)
         );
     }
 
@@ -2850,7 +3530,8 @@ mod tests {
             Err(ProviderErrorKind::ProviderConfigurationMismatch)
         );
 
-        let mut wrong_request_result = fixture_result(&request_b, request_b.source_revision.clone());
+        let mut wrong_request_result =
+            fixture_result(&request_b, request_b.source_revision.clone());
         wrong_request_result.request_id = "another-request".to_owned();
         assert_eq!(
             validate_recognition_result(
@@ -2862,7 +3543,8 @@ mod tests {
             Err(ProviderErrorKind::ProviderRequestMismatch)
         );
 
-        let mut wrong_provider_result = fixture_result(&request_b, request_b.source_revision.clone());
+        let mut wrong_provider_result =
+            fixture_result(&request_b, request_b.source_revision.clone());
         wrong_provider_result.provider.provider_id = "another-provider".to_owned();
         assert!(matches!(
             validate_recognition_result(
@@ -2914,36 +3596,136 @@ mod tests {
     }
 
     #[test]
-    fn capability_negotiation_rejects_unsupported_inputs_without_fallback() {
-        let (_, request) = fixture_request();
-        let capabilities = ProviderCapabilitiesV1 {
-            inputs: vec![ProviderInputCapabilityV1::OnlineStrokes],
-            outputs: vec![ProviderOutputCapabilityV1::Text],
-            languages: vec!["en-US".to_owned()],
-        };
-        assert!(matches!(
-            validate_capabilities_for_request(&capabilities, &request),
-            Err(ProviderErrorKind::UnsupportedCapability(_))
-        ));
-
-        let mut raster_request = request;
-        raster_request.raster = Some(ProviderRasterInputV1 {
-            width: 1,
-            height: 1,
-            pixel_format: "gray8".to_owned(),
-            coordinate_space: "windows-screen-coordinates".to_owned(),
-            units: "screen-pixel".to_owned(),
-            raw_payload_hex: "00".to_owned(),
-        });
-        raster_request.input_view_id = input_view_id(&raster_request).unwrap();
-        let capabilities = ProviderCapabilitiesV1 {
+    fn requested_modalities_require_available_and_advertised_inputs() {
+        let (state, selected) = fixture_state_and_selection();
+        let online_request =
+            fixture_request_for_state(&state, &selected, fixture_configuration());
+        let online_capabilities = ProviderCapabilitiesV1 {
             inputs: vec![ProviderInputCapabilityV1::OnlineStrokes],
             outputs: vec![ProviderOutputCapabilityV1::Text],
             languages: vec!["vi-VN".to_owned(), "en-US".to_owned()],
         };
+        assert!(validate_capabilities_for_request(&online_capabilities, &online_request).is_ok());
+
+        let raster = ProviderRasterInputV1 {
+            width: 1,
+            height: 1,
+            payload_contract: ProviderRasterPayloadContractV1::OpaqueBytes,
+            coordinate_space: "windows-screen-coordinates".to_owned(),
+            units: "screen-pixel".to_owned(),
+            raw_payload_hex: "00".to_owned(),
+        };
+        let raster_request = fixture_request_with_inputs(
+            &state,
+            &selected,
+            fixture_configuration(),
+            vec![ProviderInputCapabilityV1::Raster],
+            Some(raster.clone()),
+        );
+        assert_ne!(online_request.input_view_id, raster_request.input_view_id);
+        assert!(!raster_request.stroke_views.is_empty());
+        assert!(!raster_request.samples.is_empty());
+        let raster_capabilities = ProviderCapabilitiesV1 {
+            inputs: vec![ProviderInputCapabilityV1::Raster],
+            outputs: vec![
+                ProviderOutputCapabilityV1::Text,
+                ProviderOutputCapabilityV1::NativeScore,
+                ProviderOutputCapabilityV1::StrokeRanges,
+            ],
+            languages: vec!["vi-VN".to_owned(), "en-US".to_owned()],
+        };
+        assert!(validate_capabilities_for_request(&raster_capabilities, &raster_request).is_ok());
+        let raster_result = fixture_result(&raster_request, raster_request.source_revision.clone());
+        assert!(validate_recognition_result(
+            &raster_result,
+            &raster_request,
+            &fixture_provider(),
+            &raster_capabilities
+        )
+        .is_ok());
+
+        let both_request = fixture_request_with_inputs(
+            &state,
+            &selected,
+            fixture_configuration(),
+            vec![
+                ProviderInputCapabilityV1::OnlineStrokes,
+                ProviderInputCapabilityV1::Raster,
+            ],
+            Some(raster.clone()),
+        );
+        let reversed_both_request = fixture_request_with_inputs(
+            &state,
+            &selected,
+            fixture_configuration(),
+            vec![
+                ProviderInputCapabilityV1::Raster,
+                ProviderInputCapabilityV1::OnlineStrokes,
+            ],
+            Some(raster.clone()),
+        );
+        let both_capabilities = ProviderCapabilitiesV1 {
+            inputs: vec![
+                ProviderInputCapabilityV1::OnlineStrokes,
+                ProviderInputCapabilityV1::Raster,
+            ],
+            outputs: vec![ProviderOutputCapabilityV1::Text],
+            languages: vec!["vi-VN".to_owned(), "en-US".to_owned()],
+        };
+        assert!(validate_capabilities_for_request(&both_capabilities, &both_request).is_ok());
+        assert_eq!(
+            both_request.requested_input_modalities,
+            reversed_both_request.requested_input_modalities
+        );
+        assert_eq!(both_request.input_view_id, reversed_both_request.input_view_id);
+        let mut reversed_wire_request = both_request.clone();
+        reversed_wire_request.requested_input_modalities = vec![
+            ProviderInputCapabilityV1::Raster,
+            ProviderInputCapabilityV1::OnlineStrokes,
+        ];
+        assert!(validate_request_admission(&reversed_wire_request).is_ok());
+        assert_eq!(
+            input_view_id(&reversed_wire_request).unwrap(),
+            both_request.input_view_id
+        );
+        assert_ne!(raster_request.input_view_id, both_request.input_view_id);
         assert!(matches!(
-            validate_capabilities_for_request(&capabilities, &raster_request),
+            validate_capabilities_for_request(&raster_capabilities, &both_request),
             Err(ProviderErrorKind::UnsupportedCapability(_))
+        ));
+        let mut unacknowledged =
+            fixture_result(&both_request, both_request.source_revision.clone());
+        unacknowledged.consumed_input_modalities = vec![ProviderInputCapabilityV1::OnlineStrokes];
+        assert!(matches!(
+            validate_recognition_result(
+                &unacknowledged,
+                &both_request,
+                &fixture_provider(),
+                &both_capabilities
+            ),
+            Err(ProviderErrorKind::InvalidResponse(_))
+        ));
+
+        let mut missing_required = raster_request.clone();
+        missing_required.raster = None;
+        assert!(matches!(
+            validate_request_admission(&missing_required),
+            Err(ProviderErrorKind::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            validate_capabilities_for_request(&online_capabilities, &raster_request),
+            Err(ProviderErrorKind::UnsupportedCapability(_))
+        ));
+
+        let mut empty_payload = raster_request;
+        empty_payload.raster.as_mut().unwrap().raw_payload_hex.clear();
+        assert!(matches!(
+            input_view_id(&empty_payload),
+            Err(ProviderErrorKind::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            validate_request_admission(&empty_payload),
+            Err(ProviderErrorKind::InvalidRequest(_))
         ));
     }
 
@@ -2960,8 +3742,7 @@ mod tests {
             #[serde(deserialize_with = "deserialize_bounded_candidates")]
             candidates: Vec<ProviderCandidateV1>,
         }
-        let candidate =
-            r#"{"recognized_text":"x","native_score_raw":null,"stroke_ranges":[],"raw_candidate":{}}"#;
+        let candidate = r#"{"recognized_text":"x","native_score_raw":null,"stroke_ranges":[],"raw_candidate":{}}"#;
         let mut json = String::from("{\"candidates\":[");
         for index in 0..=MAX_PROVIDER_CANDIDATES {
             if index > 0 {
@@ -2971,6 +3752,34 @@ mod tests {
         }
         json.push_str("]}");
         assert!(serde_json::from_str::<CandidateList>(&json).is_err());
+    }
+
+    #[test]
+    fn incomplete_process_cleanup_is_reported_and_quarantine_blocks_launches() {
+        assert_eq!(
+            cleanup_failure_or_original(
+                ProviderErrorKind::Cancelled,
+                Ok(())
+            ),
+            ProviderErrorKind::Cancelled
+        );
+        assert!(matches!(
+            cleanup_failure_or_original(
+                ProviderErrorKind::TimedOut(ProviderPhase::Recognition),
+                Err("helper and process remain owned in quarantine".to_owned())
+            ),
+            ProviderErrorKind::ProcessCleanupFailed(message)
+                if message.contains("TimedOut(Recognition)")
+                    && message.contains("owned in quarantine")
+        ));
+        assert_eq!(ensure_no_quarantined_provider_sessions(0), Ok(()));
+        assert_eq!(
+            ensure_no_quarantined_provider_sessions(1),
+            Err(ProviderErrorKind::WorkerSubsystemPoisoned)
+        );
+        assert!(!quarantine_can_release(false, true, true));
+        assert!(!quarantine_can_release(true, true, false));
+        assert!(quarantine_can_release(true, true, true));
     }
 
     #[test]
@@ -3092,6 +3901,24 @@ mod tests {
         request: RecognitionRequestV1,
         recognition_timeout: Duration,
     ) -> Result<ProviderExecution, ProviderExecutionError> {
+        run_mock_worker_with_arguments(
+            executable,
+            mode,
+            response,
+            request,
+            recognition_timeout,
+            &[],
+        )
+    }
+
+    fn run_mock_worker_with_arguments(
+        executable: &std::path::Path,
+        mode: &str,
+        response: String,
+        request: RecognitionRequestV1,
+        recognition_timeout: Duration,
+        trailing_arguments: &[String],
+    ) -> Result<ProviderExecution, ProviderExecutionError> {
         let configuration = request.provider_configuration.clone();
         let handshake_response = serde_json::to_string(&WorkerResponseFrameV1::Handshake {
             protocol_version: PROVIDER_PROTOCOL_VERSION,
@@ -3101,10 +3928,12 @@ mod tests {
             capabilities: fixture_capabilities(),
         })
         .unwrap();
+        let mut arguments = vec![mode.to_owned(), handshake_response, response];
+        arguments.extend_from_slice(trailing_arguments);
         let approved = OperatorApprovedProviderConfig::from_explicit_selection(
             "mock-provider".to_owned(),
             executable.to_path_buf(),
-            vec![mode.to_owned(), handshake_response, response],
+            arguments,
             configuration,
         )
         .unwrap();
@@ -3122,41 +3951,202 @@ mod tests {
         loop {
             match worker.try_receive() {
                 ProviderWorkerPoll::Outcome(outcome) => return outcome.outcome,
-                ProviderWorkerPoll::Stopped => panic!("provider worker exited before returning a result"),
+                ProviderWorkerPoll::Stopped => {
+                    panic!("provider worker exited before returning a result")
+                }
                 ProviderWorkerPoll::Pending => {}
             }
-            assert!(Instant::now() < deadline, "provider worker result timed out");
+            assert!(
+                Instant::now() < deadline,
+                "provider worker result timed out"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
+    fn process_is_signaled(pid: u32) -> bool {
+        // SYNCHRONIZE is the only access right needed to wait on this same-user
+        // CI fixture process; avoid query/termination rights in the assertion.
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        // SAFETY: OpenProcess returns an owned synchronization-only process
+        // handle for the fixture's recorded PID, or null with a thread error.
+        let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            // A process object may already be gone after the Job Object reached
+            // ActiveProcesses == 0. ERROR_INVALID_PARAMETER means no such PID.
+            return unsafe { GetLastError() } == ERROR_INVALID_PARAMETER;
+        }
+        // SAFETY: `handle` is the owned process handle returned above.
+        let signaled = unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0;
+        // SAFETY: the test owns exactly this OpenProcess handle.
+        let close_succeeded = unsafe { CloseHandle(handle) } != 0;
+        signaled && close_succeeded
+    }
+
+    #[cfg(not(windows))]
+    fn process_is_signaled(_pid: u32) -> bool {
+        false
+    }
+
+    fn run_mock_worker_cancelled_after_descendant_start(
+        mock: &MockWorkerBinary,
+        request: RecognitionRequestV1,
+    ) -> Result<ProviderExecution, ProviderExecutionError> {
+        require_provider_mock_test_opt_in();
+        let marker = mock.directory.join("cancel-holder-ready.txt");
+        let configuration = request.provider_configuration.clone();
+        let handshake_response = serde_json::to_string(&WorkerResponseFrameV1::Handshake {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            provider: fixture_provider(),
+            configuration_id: configuration.configuration_id.clone(),
+            configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
+            capabilities: fixture_capabilities(),
+        })
+        .unwrap();
+        let approved = OperatorApprovedProviderConfig::from_explicit_selection(
+            "mock-provider".to_owned(),
+            mock.executable.clone(),
+            vec![
+                "cancel-holder".to_owned(),
+                handshake_response,
+                String::new(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            configuration,
+        )
+        .unwrap();
+        let worker = ProviderWorkerHandle::start(
+            approved,
+            ProviderCallTimeouts {
+                handshake: Duration::from_secs(5),
+                recognition: Duration::from_secs(30),
+                shutdown: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        worker.try_submit(request).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "pipe-holder descendant did not signal startup"
+            );
+            assert!(matches!(worker.try_receive(), ProviderWorkerPoll::Pending));
+            thread::sleep(Duration::from_millis(10));
+        }
+        worker.cancel();
+        loop {
+            match worker.try_receive() {
+                ProviderWorkerPoll::Outcome(outcome) => return outcome.outcome,
+                ProviderWorkerPoll::Stopped => {
+                    panic!("provider worker stopped without returning cancellation result")
+                }
+                ProviderWorkerPoll::Pending => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled worker did not finish cleanup"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn run_mock_worker_timed_out_after_descendant_start(
+        mock: &MockWorkerBinary,
+        request: RecognitionRequestV1,
+    ) -> Result<ProviderExecution, ProviderExecutionError> {
+        require_provider_mock_test_opt_in();
+        let marker = mock.directory.join("timeout-holder-ready.txt");
+        let configuration = request.provider_configuration.clone();
+        let handshake_response = serde_json::to_string(&WorkerResponseFrameV1::Handshake {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            provider: fixture_provider(),
+            configuration_id: configuration.configuration_id.clone(),
+            configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
+            capabilities: fixture_capabilities(),
+        })
+        .unwrap();
+        let approved = OperatorApprovedProviderConfig::from_explicit_selection(
+            "mock-provider".to_owned(),
+            mock.executable.clone(),
+            vec![
+                "hang-holder".to_owned(),
+                handshake_response,
+                String::new(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            configuration,
+        )
+        .unwrap();
+        let worker = ProviderWorkerHandle::start(
+            approved,
+            ProviderCallTimeouts {
+                handshake: Duration::from_secs(5),
+                recognition: Duration::from_secs(2),
+                shutdown: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        worker.try_submit(request).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "pipe-holder descendant did not signal startup before timeout"
+            );
+            assert!(matches!(worker.try_receive(), ProviderWorkerPoll::Pending));
+            thread::sleep(Duration::from_millis(10));
+        }
+        loop {
+            match worker.try_receive() {
+                ProviderWorkerPoll::Outcome(outcome) => return outcome.outcome,
+                ProviderWorkerPoll::Stopped => {
+                    panic!("provider worker stopped without returning timeout result")
+                }
+                ProviderWorkerPoll::Pending => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed-out worker did not finish cleanup"
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
 
     #[test]
     #[ignore = "CI-only subprocess integration test; see guarded hosted provider test job"]
-    fn provider_mock_crash_timeout_and_stale_revision_are_isolated() {
+    fn provider_mock_process_tree_cleanup_and_protocol_failures_are_isolated() {
         require_provider_mock_test_opt_in();
         let mock = compile_mock_worker();
         let (_state, request) = fixture_request();
 
         let crash = run_mock_worker(
             &mock.executable,
-            "crash",
+            "crash-holder",
             String::new(),
             request.clone(),
             Duration::from_secs(2),
         );
-        assert!(crash.is_err(), "worker process crash returns an error to core");
-
-        let timeout = run_mock_worker(
-            &mock.executable,
-            "hang",
-            String::new(),
-            request.clone(),
-            Duration::from_millis(150),
+        assert!(
+            crash.is_err(),
+            "worker process crash returns an error to core"
         );
+
+        let timeout = run_mock_worker_timed_out_after_descendant_start(&mock, request.clone());
         assert!(matches!(
             timeout,
             Err(ProviderExecutionError {
                 kind: ProviderErrorKind::TimedOut(ProviderPhase::Recognition),
+                ..
+            })
+        ));
+
+        let cancelled = run_mock_worker_cancelled_after_descendant_start(&mock, request.clone());
+        assert!(matches!(
+            cancelled,
+            Err(ProviderExecutionError {
+                kind: ProviderErrorKind::Cancelled,
                 ..
             })
         ));
@@ -3196,7 +4186,7 @@ mod tests {
         .unwrap();
         let extra_response = run_mock_worker(
             &mock.executable,
-            "extra",
+            "extra-holder",
             serde_json::to_string(&WorkerResponseFrameV1::Recognition {
                 protocol_version: PROVIDER_PROTOCOL_VERSION,
                 result: valid_result.clone(),
@@ -3215,12 +4205,12 @@ mod tests {
 
         let valid = run_mock_worker(
             &mock.executable,
-            "ok",
-            valid_response,
-            request,
+            "ok-holder",
+            valid_response.clone(),
+            request.clone(),
             Duration::from_secs(2),
         )
-        .expect("the worker remains usable after earlier provider failures");
+        .expect("a successful one-shot result closes descendants holding its stdout pipe");
         assert_eq!(valid.provider.provider_id, "mock-provider");
         assert!(valid
             .capabilities
@@ -3228,5 +4218,71 @@ mod tests {
             .contains(&ProviderInputCapabilityV1::OnlineStrokes));
         assert_eq!(valid.result.candidates[0].recognized_text, "fixture text");
         assert!(!valid.stderr_truncated);
+
+        let silent_holder_marker = mock.directory.join("silent-holder-ready.txt");
+        let silent_holder = run_mock_worker_with_arguments(
+            &mock.executable,
+            "ok-silent-holder",
+            valid_response.clone(),
+            request.clone(),
+            Duration::from_secs(2),
+            &[silent_holder_marker.to_string_lossy().into_owned()],
+        )
+        .expect("success waits for the silent descendant to leave its Job Object");
+        assert_eq!(silent_holder.result.candidates[0].recognized_text, "fixture text");
+        let silent_holder_pid = fs::read_to_string(&silent_holder_marker)
+            .expect("silent descendant startup marker")
+            .parse::<u32>()
+            .expect("silent descendant process ID");
+        assert!(
+            process_is_signaled(silent_holder_pid),
+            "the descendant is signaled before the provider slot is reusable"
+        );
+
+        let after_silent_cleanup = run_mock_worker(
+            &mock.executable,
+            "ok",
+            valid_response.clone(),
+            request.clone(),
+            Duration::from_secs(2),
+        )
+        .expect("the next request is admitted only after ActiveProcesses reached zero");
+        assert_eq!(
+            after_silent_cleanup.result.candidates[0].recognized_text,
+            "fixture text"
+        );
+
+        let mut argv_request = request.clone();
+        argv_request.provider_configuration.configuration_id =
+            "cfg with spaces \"embedded\" slash\\\"quote trailing\\\\".to_owned();
+        argv_request.provider_configuration_fingerprint =
+            argv_request.provider_configuration.fingerprint().unwrap();
+        let argv_response = serde_json::to_string(&WorkerResponseFrameV1::Recognition {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            result: fixture_result(&argv_request, argv_request.source_revision.clone()),
+        })
+        .unwrap();
+        let argv_roundtrip = run_mock_worker(
+            &mock.executable,
+            "ok",
+            argv_response,
+            argv_request.clone(),
+            Duration::from_secs(2),
+        )
+        .expect("Windows argv quoting preserves whitespace, quotes, and backslashes");
+        assert_eq!(
+            argv_roundtrip.result.provider_configuration_id,
+            argv_request.provider_configuration.configuration_id
+        );
+
+        let after_cleanup = run_mock_worker(
+            &mock.executable,
+            "ok",
+            valid_response,
+            request,
+            Duration::from_secs(2),
+        )
+        .expect("another provider call is admitted after verified tree and helper cleanup");
+        assert_eq!(after_cleanup.result.candidates[0].recognized_text, "fixture text");
     }
 }
