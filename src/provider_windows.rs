@@ -612,8 +612,9 @@ impl ProcessAttributeList {
         storage.resize(word_count, 0);
         let list = storage.as_mut_ptr().cast::<c_void>();
         // SAFETY: storage has sufficient byte size and natural usize alignment.
-        if unsafe { InitializeProcThreadAttributeList(list, attribute_count, 0, &mut required_bytes) }
-            == 0
+        if unsafe {
+            InitializeProcThreadAttributeList(list, attribute_count, 0, &mut required_bytes)
+        } == 0
         {
             return Err(io::Error::last_os_error());
         }
@@ -676,7 +677,8 @@ impl OwnedHandle {
     }
 
     fn is_valid(&self) -> bool {
-        self.handle.is_some_and(|handle| handle != 0 && handle != -1)
+        self.handle
+            .is_some_and(|handle| handle != 0 && handle != -1)
     }
 
     fn raw(&self) -> HANDLE {
