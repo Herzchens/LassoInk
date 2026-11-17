@@ -99,3 +99,7 @@ M1 session files may contain sensitive handwriting, timing, pressure, and device
 ## Dependencies
 
 The app directly depends on Serde 1.0.229 with derives, Serde JSON 1.0.154 for the bounded local provider protocol, Winit 0.30.13 with default features disabled and the `rwh_06` interoperability feature, plus Windows-target `windows-sys` 0.52.0. `Cargo.lock` records the resolved transitive packages including `raw-window-handle`.
+
+## Optional hosted raster runtime compatibility check
+
+The `raster-cpu-compatibility` job has a source-controlled explicit opt-in and runs only for a same-repository pull request from `test/raster-cpu-compatibility` on a GitHub-hosted Windows x64 runner. Before checkout or dependency/model network access, it verifies the event, repository, runner, and exact head SHA. The script pins a full-precision SenOCR-Vi revision, downloads only its fixed safetensors/config/tokenizer allowlist into runner temporary storage, verifies the pinned file identities, and removes that directory at exit. It uses built-in Transformers classes with remote code disabled and tests one programmatically generated blank image with at most one generated token. The job uploads no model, input, generated text, or report artifact. This probe checks a narrow runtime path only; it does not measure recognition quality, raster parity, device fidelity, product eligibility, license clearance, or provider selection.
