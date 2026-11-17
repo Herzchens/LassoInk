@@ -2456,7 +2456,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         return benchmark::run_batch_cli(
             Path::new(&arguments[1]),
             Path::new(&arguments[2]),
-            arguments.get(3).map(|path| Path::new(path)),
+            arguments.get(3).map(Path::new),
         );
     }
     if arguments.len() == 1 && arguments[0] == "--help" {

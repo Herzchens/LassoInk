@@ -310,7 +310,7 @@ struct BenchmarkArtifactHeaderV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BenchmarkRawResponseFrameHexV1 {
+pub(crate) struct BenchmarkRawResponseFrameHexV1 {
     pub ordinal: u8,
     pub length_prefix_be_hex: String,
     pub payload_hex: String,
@@ -413,14 +413,14 @@ pub(crate) struct BenchmarkCandidateMetricsV1 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum BenchmarkRunStatusV1 {
+pub(crate) enum BenchmarkRunStatusV1 {
     Completed,
     Failed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum BenchmarkFailureCategoryV1 {
+pub(crate) enum BenchmarkFailureCategoryV1 {
     InvalidConfig,
     InvalidRequest,
     UnsupportedPlatform,
@@ -543,7 +543,7 @@ pub(crate) struct BenchmarkBootstrapIntervalV1 {
 #[serde(tag = "record_type", content = "record", rename_all = "snake_case")]
 enum BenchmarkArtifactRecordV1 {
     Header(BenchmarkArtifactHeaderV1),
-    Run(BenchmarkRunRecordV1),
+    Run(Box<BenchmarkRunRecordV1>),
     Footer(BenchmarkArtifactFooterV1),
 }
 
@@ -636,7 +636,7 @@ impl BenchmarkArtifactWriter {
 
     fn write_run(&mut self, run: BenchmarkRunRecordV1) -> io::Result<()> {
         let status = run.status;
-        self.write_record(&BenchmarkArtifactRecordV1::Run(run))?;
+        self.write_record(&BenchmarkArtifactRecordV1::Run(Box::new(run)))?;
         self.run_count = self.run_count.saturating_add(1);
         if status == BenchmarkRunStatusV1::Failed {
             self.failure_count = self.failure_count.saturating_add(1);
@@ -3350,7 +3350,8 @@ mod tests {
             sha256_hex: hex_encode(&Sha256::digest(b"exe")).unwrap(),
             observation: "test".to_owned(),
         };
-        let (model_artifacts, reason) = model_artifact_hash_status(&[executable.clone()]).unwrap();
+        let (model_artifacts, reason) =
+            model_artifact_hash_status(std::slice::from_ref(&executable)).unwrap();
         assert!(model_artifacts.is_empty());
         assert!(
             reason
