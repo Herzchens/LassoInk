@@ -4704,7 +4704,10 @@ mod tests {
         .unwrap();
         let injected_path_row: serde_json::Value =
             serde_json::from_str(&injected_path_json).unwrap();
-        assert!(json_value_contains_string(&injected_path_row, &path_sentinel));
+        assert!(json_value_contains_string(
+            &injected_path_row,
+            &path_sentinel
+        ));
         for private_path in [
             &mock.executable,
             &journal_path,
