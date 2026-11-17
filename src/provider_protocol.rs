@@ -3340,6 +3340,19 @@ mod tests {
 
     static NEXT_MOCK_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
+    fn json_value_contains_string(value: &serde_json::Value, needle: &str) -> bool {
+        match value {
+            serde_json::Value::String(value) => value.contains(needle),
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| json_value_contains_string(value, needle)),
+            serde_json::Value::Object(values) => values
+                .values()
+                .any(|value| json_value_contains_string(value, needle)),
+            _ => false,
+        }
+    }
+
     fn stroke_ref(stroke_id: &str, device_id: &str) -> StrokeRef {
         StrokeRef {
             journal_id: "provider-test-journal".to_owned(),
@@ -4678,6 +4691,20 @@ mod tests {
         let artifact_text = String::from_utf8(artifact_bytes).unwrap();
         assert!(!artifact_text.contains("PRIVATE_PROVIDER_SETTING_SENTINEL"));
         assert!(!artifact_text.contains("PRIVATE_REFERENCE_TEXT_SENTINEL"));
+
+        let rows = artifact_text
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let path_sentinel = mock.executable.to_string_lossy().into_owned();
+        let injected_path_json = serde_json::to_string(&serde_json::json!({
+            "nested": {"path": path_sentinel.clone()}
+        }))
+        .unwrap();
+        let injected_path_row: serde_json::Value =
+            serde_json::from_str(&injected_path_json).unwrap();
+        assert!(json_value_contains_string(&injected_path_row, &path_sentinel));
         for private_path in [
             &mock.executable,
             &journal_path,
@@ -4686,14 +4713,12 @@ mod tests {
             &corpus_manifest_path,
         ] {
             let path_text = private_path.to_string_lossy();
-            assert!(!artifact_text.contains(path_text.as_ref()));
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| json_value_contains_string(row, path_text.as_ref()))
+            );
         }
-
-        let rows = artifact_text
-            .lines()
-            .map(serde_json::from_str::<serde_json::Value>)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
         assert_eq!(rows.len(), 5);
         let header = &rows
             .iter()
