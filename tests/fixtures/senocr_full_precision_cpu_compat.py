@@ -36,6 +36,12 @@ EXPECTED_TORCH = "2.15.0+cpu"
 EXPECTED_TRANSFORMERS = "5.23.0"
 EXPECTED_PILLOW = "13.0.0"
 EXPECTED_JINJA2 = "3.1.6"
+LOADING_INFO_KEYS = (
+    "missing_keys",
+    "unexpected_keys",
+    "mismatched_keys",
+    "error_msgs",
+)
 MAX_API_BYTES = 1_000_000
 MAX_INDEX_BYTES = 64 * 1024
 MAX_TOTAL_MODEL_BYTES = 3_900_000_000
@@ -329,6 +335,94 @@ def validate_safetensors_index_policy() -> None:
         raise ProbeFailure("safetensors_index_self_check_failed")
 
 
+def validate_loading_info(loading_info: object) -> dict[str, int]:
+    require(isinstance(loading_info, dict), "loading_info_missing")
+    require(set(loading_info.keys()) == set(LOADING_INFO_KEYS), "loading_info_keys_invalid")
+    require(isinstance(loading_info["missing_keys"], set), "loading_info_type_invalid")
+    require(isinstance(loading_info["unexpected_keys"], set), "loading_info_type_invalid")
+    require(isinstance(loading_info["mismatched_keys"], set), "loading_info_type_invalid")
+    require(isinstance(loading_info["error_msgs"], list), "loading_info_type_invalid")
+
+    counts = {key: len(loading_info[key]) for key in LOADING_INFO_KEYS}
+    if any(counts.values()):
+        raise ProbeFailure(
+            "state_dict_key_mismatch_"
+            f"missing_{counts['missing_keys']}_unexpected_{counts['unexpected_keys']}_"
+            f"mismatched_{counts['mismatched_keys']}_errors_{counts['error_msgs']}"
+        )
+    return counts
+
+
+def validate_loading_info_policy() -> None:
+    zero_diagnostics = {
+        "missing_keys": set(),
+        "unexpected_keys": set(),
+        "mismatched_keys": set(),
+        "error_msgs": [],
+    }
+    require(
+        validate_loading_info(zero_diagnostics)
+        == {key: 0 for key in LOADING_INFO_KEYS},
+        "loading_info_self_check_failed",
+    )
+
+    malformed_diagnostics = []
+    for missing_key in LOADING_INFO_KEYS:
+        malformed_diagnostics.append(
+            {key: value for key, value in zero_diagnostics.items() if key != missing_key}
+        )
+    malformed_diagnostics.append(
+        {
+            **zero_diagnostics,
+            "missing_keys": [],
+        }
+    )
+    malformed_diagnostics.append(
+        {
+            **zero_diagnostics,
+            "unexpected_keys": [],
+        }
+    )
+    malformed_diagnostics.append(
+        {
+            **zero_diagnostics,
+            "mismatched_keys": [],
+        }
+    )
+    malformed_diagnostics.append(
+        {
+            **zero_diagnostics,
+            "error_msgs": set(),
+        }
+    )
+    malformed_diagnostics.append({**zero_diagnostics, "extra": []})
+    for diagnostics in malformed_diagnostics:
+        try:
+            validate_loading_info(diagnostics)
+        except ProbeFailure:
+            continue
+        raise ProbeFailure("loading_info_self_check_failed")
+
+    nonzero_diagnostics = (
+        ("missing_keys", {"sentinel"}),
+        ("unexpected_keys", {"sentinel"}),
+        ("mismatched_keys", {("sentinel", (1,), (2,))}),
+        ("error_msgs", ["sentinel"]),
+    )
+    for category, value in nonzero_diagnostics:
+        diagnostics = {**zero_diagnostics, category: value}
+        try:
+            validate_loading_info(diagnostics)
+        except ProbeFailure as error:
+            require(
+                isinstance(error.args[0], str)
+                and error.args[0].startswith("state_dict_key_mismatch_"),
+                "loading_info_self_check_failed",
+            )
+            continue
+        raise ProbeFailure("loading_info_self_check_failed")
+
+
 def download_one_file(model_dir: Path, name: str, deadline: float, already_downloaded: int) -> dict[str, object]:
     expected_size, expected_git_oid, expected_lfs_sha256 = MODEL_FILES[name]
     require(Path(name).name == name and "/" not in name and "\\" not in name, "unsafe_model_filename")
@@ -461,6 +555,8 @@ def run_probe() -> dict[str, object]:
     global CURRENT_STAGE
     CURRENT_STAGE = "safetensors_index_policy_self_check"
     validate_safetensors_index_policy()
+    CURRENT_STAGE = "loading_info_policy_self_check"
+    validate_loading_info_policy()
 
     runner_temp = Path(os.environ.get("RUNNER_TEMP", ""))
     require(runner_temp.is_absolute() and runner_temp.is_dir(), "runner_temp_unavailable")
@@ -567,27 +663,7 @@ def run_probe() -> dict[str, object]:
             ignore_mismatched_sizes=False,
             output_loading_info=True,
         )
-        diagnostic_keys = (
-            "missing_keys",
-            "unexpected_keys",
-            "mismatched_keys",
-            "error_msgs",
-        )
-        require(isinstance(loading_info, dict), "loading_info_missing")
-        require(
-            all(key in loading_info and isinstance(loading_info[key], list) for key in diagnostic_keys),
-            "loading_info_incomplete",
-        )
-        missing_count = len(loading_info["missing_keys"])
-        unexpected_count = len(loading_info["unexpected_keys"])
-        mismatched_count = len(loading_info["mismatched_keys"])
-        error_count = len(loading_info["error_msgs"])
-        if missing_count or unexpected_count or mismatched_count or error_count:
-            raise ProbeFailure(
-                "state_dict_key_mismatch_"
-                f"missing_{missing_count}_unexpected_{unexpected_count}_"
-                f"mismatched_{mismatched_count}_errors_{error_count}"
-            )
+        loading_info_counts = validate_loading_info(loading_info)
         require(
             model.__class__.__module__.startswith("transformers.models.paddleocr_vl."),
             "non_builtin_model_class",
@@ -658,12 +734,7 @@ def run_probe() -> dict[str, object]:
             "downloaded_bytes": total_bytes,
             "indexed_tensor_count": indexed_tensor_count,
             "downloaded_manifest": downloaded_files,
-            "loading_info_counts": {
-                "missing": missing_count,
-                "unexpected": unexpected_count,
-                "mismatched": mismatched_count,
-                "errors": error_count,
-            },
+            "loading_info_counts": loading_info_counts,
             "input_tokens": input_token_count,
             "generated_tokens": generated_token_count,
             "metadata_elapsed_ms": metadata_elapsed_ms,
