@@ -2,6 +2,7 @@
 compile_error!("The LassoInk Gate 0 probe is Windows-only.");
 
 mod canvas;
+mod benchmark;
 #[allow(dead_code)]
 mod journal;
 mod process_cpu;
@@ -2451,6 +2452,13 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if (arguments.len() == 3 || arguments.len() == 4) && arguments[0] == "--benchmark-batch" {
+        return benchmark::run_batch_cli(
+            Path::new(&arguments[1]),
+            Path::new(&arguments[2]),
+            arguments.get(3).map(|path| Path::new(path)),
+        );
+    }
     if arguments.len() == 1 && arguments[0] == "--help" {
         println!("LassoInk M3 minimal canvas with explicitly provisional capture diagnostics");
         println!("Usage: lassoink-capture-probe [options]");
@@ -2463,6 +2471,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!("  --pressure-curve TEXT --windows-build TEXT");
         println!("  --controlled-stall-ms 1..30000 (press F9 once while capture is running)");
         println!("  --report PATH --help --version --status");
+        println!("  --benchmark-batch CASES.json PROVIDERS.json [CORPUS-ANNOTATIONS.json]");
+        println!("Benchmark artifacts are local-only; never include credentials or private corpus data in Git.");
         println!("{STATUS}");
         println!("{NOT_IMPLEMENTED}");
         println!("{STORAGE_POLICY}");

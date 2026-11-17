@@ -49,6 +49,9 @@ const MAX_PROVIDER_CANDIDATES: usize = 128;
 const MAX_PROVIDER_STROKE_RANGES: usize = 256;
 const MAX_RAW_SAMPLE_BYTES: usize = 8192;
 const MAX_TOTAL_RAW_SAMPLE_BYTES: usize = 1024 * 1024;
+const MAX_RAW_PROVIDER_RESPONSE_FRAMES: usize = 3;
+const MAX_RAW_PROVIDER_RESPONSE_BYTES: usize =
+    MAX_HANDSHAKE_FRAME_BYTES + MAX_RESPONSE_FRAME_BYTES * 2;
 const MAX_ID_BYTES: usize = 256;
 const MAX_TEXT_BYTES: usize = 4096;
 const MAX_LANGUAGE_HINTS: usize = 16;
@@ -1871,6 +1874,7 @@ pub(crate) struct ProviderExecutionError {
     pub kind: ProviderErrorKind,
     pub stderr_bytes: Vec<u8>,
     pub stderr_truncated: bool,
+    pub raw_response_transcript: ProviderRawResponseTranscriptV1,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1880,6 +1884,103 @@ pub(crate) struct ProviderExecution {
     pub result: RecognitionResultV1,
     pub stderr_bytes: Vec<u8>,
     pub stderr_truncated: bool,
+    pub raw_response_transcript: ProviderRawResponseTranscriptV1,
+    pub process_resources: Option<ProviderProcessResourcesV1>,
+    pub timing: ProviderExecutionTimingV1,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderRawResponseFrameV1 {
+    pub ordinal: u8,
+    pub payload_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderRawResponseTranscriptV1 {
+    pub frames: Vec<ProviderRawResponseFrameV1>,
+    pub capture_complete: bool,
+    pub omitted_frame_count: u32,
+    pub omitted_payload_bytes: u64,
+}
+
+impl ProviderRawResponseTranscriptV1 {
+    fn capture_frame(&mut self, ordinal: u8, payload_bytes: Vec<u8>) {
+        let frame_size = payload_bytes.len();
+        let accumulated = self
+            .frames
+            .iter()
+            .map(|frame| frame.payload_bytes.len())
+            .sum::<usize>();
+        if self.frames.len() >= MAX_RAW_PROVIDER_RESPONSE_FRAMES
+            || accumulated.saturating_add(frame_size) > MAX_RAW_PROVIDER_RESPONSE_BYTES
+            || self.frames.try_reserve(1).is_err()
+        {
+            self.capture_complete = false;
+            self.omitted_frame_count = self.omitted_frame_count.saturating_add(1);
+            self.omitted_payload_bytes = self
+                .omitted_payload_bytes
+                .saturating_add(frame_size as u64);
+            return;
+        }
+        self.frames.push(ProviderRawResponseFrameV1 {
+            ordinal,
+            payload_bytes,
+        });
+    }
+
+    fn mark_clean_eof(&mut self) {
+        self.capture_complete = self.frames.len() == 2 && self.omitted_frame_count == 0;
+    }
+
+    fn mark_incomplete(&mut self) {
+        self.capture_complete = false;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderResourceScopeV1 {
+    JobProcessTree,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderProcessResourcesV1 {
+    pub scope: ProviderResourceScopeV1,
+    /// Raw Job Object accumulated user CPU counter in 100-nanosecond units,
+    /// observed after the job reached ActiveProcesses == 0.
+    pub total_user_time_100ns_raw: i64,
+    /// Raw Job Object accumulated kernel CPU counter in 100-nanosecond units.
+    pub total_kernel_time_100ns_raw: i64,
+    pub total_page_fault_count_raw: u32,
+    pub total_process_count_raw: u32,
+    /// Raw `JOBOBJECT_EXTENDED_LIMIT_INFORMATION.PeakJobMemoryUsed` bytes:
+    /// peak memory usage of processes associated with the job as documented
+    /// by Windows. This is not a claim about RSS, VRAM, or a separate memory
+    /// accounting model.
+    pub peak_job_memory_bytes_raw: Option<u64>,
+    /// Raw `PeakProcessMemoryUsed` bytes: peak memory used by any process ever
+    /// associated with the job, per the Windows structure documentation.
+    pub peak_process_memory_bytes_raw: Option<u64>,
+    pub memory_unavailable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderExecutionTimingV1 {
+    /// All durations use `Instant` sampled immediately before the CreateProcessW
+    /// call. Job CPU starts after the job-list assignment inside that call; this
+    /// wall denominator is conservatively a little wider and may understate the
+    /// core-equivalent ratio. It is not physical latency.
+    pub process_create_call_to_handshake_ns: u64,
+    pub process_create_call_to_recognition_ns: u64,
+    pub process_create_call_to_parent_exit_ns: u64,
+    pub process_create_call_to_tree_drain_ns: u64,
+    /// No provider protocol frame separately measures model initialization.
+    pub model_cold_start_ns: Option<u64>,
+    pub model_cold_start_unavailable_reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1979,6 +2080,8 @@ impl ProviderWorkerHandle {
                                         kind: ProviderErrorKind::Cancelled,
                                         stderr_bytes: Vec::new(),
                                         stderr_truncated: false,
+                                        raw_response_transcript:
+                                            ProviderRawResponseTranscriptV1::default(),
                                     }),
                                 });
                                 let _ = result_sender.send(cancelled_result);
@@ -2007,6 +2110,8 @@ impl ProviderWorkerHandle {
                                     kind: ProviderErrorKind::WorkerThreadPanicked,
                                     stderr_bytes: Vec::new(),
                                     stderr_truncated: false,
+                                    raw_response_transcript:
+                                        ProviderRawResponseTranscriptV1::default(),
                                 })
                             });
                             if result_sender
@@ -2102,13 +2207,28 @@ impl ProviderProcessRunner<'_> {
         cancelled: &AtomicBool,
     ) -> Result<ProviderExecution, ProviderExecutionError> {
         let stderr_capture = Arc::new(Mutex::new(BoundedStderr::default()));
-        let result = self.run_inner(request, cancelled, Arc::clone(&stderr_capture));
+        let raw_response_capture =
+            Arc::new(Mutex::new(ProviderRawResponseTranscriptV1::default()));
+        let result = self.run_inner(
+            request,
+            cancelled,
+            Arc::clone(&stderr_capture),
+            Arc::clone(&raw_response_capture),
+        );
         let (stderr_bytes, stderr_truncated) = stderr_snapshot(&stderr_capture);
-        result.map_err(|kind| ProviderExecutionError {
-            kind,
-            stderr_bytes,
-            stderr_truncated,
-        })
+        let raw_response_transcript = raw_response_snapshot(&raw_response_capture);
+        match result {
+            Ok(mut execution) => {
+                execution.raw_response_transcript = raw_response_transcript;
+                Ok(execution)
+            }
+            Err(kind) => Err(ProviderExecutionError {
+                kind,
+                stderr_bytes,
+                stderr_truncated,
+                raw_response_transcript,
+            }),
+        }
     }
 
     #[cfg(windows)]
@@ -2117,6 +2237,7 @@ impl ProviderProcessRunner<'_> {
         mut request: RecognitionRequestV1,
         cancelled: &AtomicBool,
         stderr_capture: Arc<Mutex<BoundedStderr>>,
+        raw_response_capture: Arc<Mutex<ProviderRawResponseTranscriptV1>>,
     ) -> Result<ProviderExecution, ProviderErrorKind> {
         request.requested_input_modalities =
             canonicalize_input_modalities(&request.requested_input_modalities)?;
@@ -2164,6 +2285,7 @@ impl ProviderProcessRunner<'_> {
                 stdin,
                 stdout,
                 stderr,
+                create_process_call_started,
             } = windows_process::spawn_provider(
                 &self.approved.executable,
                 &self.approved.arguments,
@@ -2188,7 +2310,14 @@ impl ProviderProcessRunner<'_> {
             child.reserve_helper_slot()?;
             let stdout_thread = thread::Builder::new()
                 .name("lassoink-provider-stdout".to_owned())
-                .spawn(move || read_worker_responses(stdout, response_sender, reader_done_sender))
+                .spawn(move || {
+                    read_worker_responses(
+                        stdout,
+                        response_sender,
+                        reader_done_sender,
+                        raw_response_capture,
+                    )
+                })
                 .map_err(|error| ProviderErrorKind::SpawnFailed(error.to_string()))?;
             child.add_helper(stdout_thread);
 
@@ -2256,6 +2385,7 @@ impl ProviderProcessRunner<'_> {
                     )));
                 }
             };
+            let process_create_call_to_handshake_ns = elapsed_ns(create_process_call_started);
 
             let recognition_deadline = Instant::now() + self.timeouts.recognition;
             send_frame_to_worker(
@@ -2297,6 +2427,7 @@ impl ProviderProcessRunner<'_> {
                     )));
                 }
             };
+            let process_create_call_to_recognition_ns = elapsed_ns(create_process_call_started);
             let shutdown_deadline = Instant::now() + self.timeouts.shutdown;
             // Observe and release the direct process handle first. A descendant
             // may outlive its parent even when it closes all three stdio handles,
@@ -2304,7 +2435,12 @@ impl ProviderProcessRunner<'_> {
             // state until ActiveProcesses reaches zero before waiting for EOF.
             // The reader still rejects any third frame before success is accepted.
             let exit_code = child.wait_until(shutdown_deadline, cancelled)?;
+            let process_create_call_to_parent_exit_ns =
+                elapsed_ns(create_process_call_started);
             child.wait_for_job_tree_until(shutdown_deadline, cancelled)?;
+            let process_create_call_to_tree_drain_ns =
+                elapsed_ns(create_process_call_started);
+            let process_resources = child.process_resources();
             receive_reader_completion(&reader_done_receiver, shutdown_deadline, cancelled)?;
             drop(response_receiver);
             drop(reader_done_receiver);
@@ -2322,6 +2458,19 @@ impl ProviderProcessRunner<'_> {
                 result,
                 stderr_bytes,
                 stderr_truncated,
+                raw_response_transcript: ProviderRawResponseTranscriptV1::default(),
+                process_resources,
+                timing: ProviderExecutionTimingV1 {
+                    process_create_call_to_handshake_ns,
+                    process_create_call_to_recognition_ns,
+                    process_create_call_to_parent_exit_ns,
+                    process_create_call_to_tree_drain_ns,
+                    model_cold_start_ns: None,
+                    model_cold_start_unavailable_reason: Some(
+                        "the generic process protocol reports no separate model-load phase"
+                            .to_owned(),
+                    ),
+                },
             })
         }));
         let attempt = match attempt {
@@ -2344,6 +2493,7 @@ impl ProviderProcessRunner<'_> {
         request: RecognitionRequestV1,
         cancelled: &AtomicBool,
         _stderr_capture: Arc<Mutex<BoundedStderr>>,
+        _raw_response_capture: Arc<Mutex<ProviderRawResponseTranscriptV1>>,
     ) -> Result<ProviderExecution, ProviderErrorKind> {
         let _ = (request, cancelled);
         Err(ProviderErrorKind::UnsupportedPlatform)
@@ -2663,17 +2813,23 @@ fn read_worker_responses(
     mut stdout: impl Read,
     sender: SyncSender<Result<WorkerResponseFrameV1, String>>,
     completion: SyncSender<Result<(), String>>,
+    raw_response_capture: Arc<Mutex<ProviderRawResponseTranscriptV1>>,
 ) {
-    for maximum in [MAX_HANDSHAKE_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES] {
+    for (ordinal, maximum) in [MAX_HANDSHAKE_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES]
+        .into_iter()
+        .enumerate()
+    {
         let frame = match read_frame(&mut stdout, maximum) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 let message = "worker closed stdout before protocol response".to_owned();
+                mark_raw_response_capture_incomplete(&raw_response_capture);
                 let _ = sender.send(Err(message.clone()));
                 let _ = completion.send(Err(message));
                 return;
             }
             Err(message) => {
+                mark_raw_response_capture_incomplete(&raw_response_capture);
                 let _ = sender.send(Err(message.clone()));
                 let _ = completion.send(Err(message));
                 return;
@@ -2683,12 +2839,16 @@ fn read_worker_responses(
             .map_err(|error| format!("invalid worker response JSON: {error}"));
         match parsed {
             Ok(response) => {
+                capture_raw_response_frame(&raw_response_capture, ordinal as u8, frame);
                 if sender.send(Ok(response)).is_err() {
+                    mark_raw_response_capture_incomplete(&raw_response_capture);
                     let _ = completion.send(Err("protocol response receiver closed".to_owned()));
                     return;
                 }
             }
             Err(message) => {
+                capture_raw_response_frame(&raw_response_capture, ordinal as u8, frame);
+                mark_raw_response_capture_incomplete(&raw_response_capture);
                 let _ = sender.send(Err(message.clone()));
                 let _ = completion.send(Err(message));
                 return;
@@ -2697,9 +2857,19 @@ fn read_worker_responses(
     }
 
     let completion_status = match read_frame(&mut stdout, MAX_RESPONSE_FRAME_BYTES) {
-        Ok(None) => Ok(()),
-        Ok(Some(_)) => Err("worker emitted an unexpected third protocol frame".to_owned()),
-        Err(message) => Err(message),
+        Ok(None) => {
+            mark_raw_response_capture_clean_eof(&raw_response_capture);
+            Ok(())
+        }
+        Ok(Some(frame)) => {
+            capture_raw_response_frame(&raw_response_capture, 2, frame);
+            mark_raw_response_capture_incomplete(&raw_response_capture);
+            Err("worker emitted an unexpected third protocol frame".to_owned())
+        }
+        Err(message) => {
+            mark_raw_response_capture_incomplete(&raw_response_capture);
+            Err(message)
+        }
     };
     let _ = completion.send(completion_status);
 }
@@ -2873,6 +3043,50 @@ fn stderr_snapshot(capture: &Arc<Mutex<BoundedStderr>>) -> (Vec<u8>, bool) {
     }
 }
 
+fn raw_response_snapshot(
+    capture: &Arc<Mutex<ProviderRawResponseTranscriptV1>>,
+) -> ProviderRawResponseTranscriptV1 {
+    capture.lock().map_or_else(
+        |_| ProviderRawResponseTranscriptV1 {
+            frames: Vec::new(),
+            capture_complete: false,
+            omitted_frame_count: 1,
+            omitted_payload_bytes: 0,
+        },
+        |stored| stored.clone(),
+    )
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn capture_raw_response_frame(
+    capture: &Arc<Mutex<ProviderRawResponseTranscriptV1>>,
+    ordinal: u8,
+    payload_bytes: Vec<u8>,
+) {
+    if let Ok(mut stored) = capture.lock() {
+        stored.capture_frame(ordinal, payload_bytes);
+    }
+}
+
+fn mark_raw_response_capture_incomplete(
+    capture: &Arc<Mutex<ProviderRawResponseTranscriptV1>>,
+) {
+    if let Ok(mut stored) = capture.lock() {
+        stored.mark_incomplete();
+    }
+}
+
+fn mark_raw_response_capture_clean_eof(
+    capture: &Arc<Mutex<ProviderRawResponseTranscriptV1>>,
+) {
+    if let Ok(mut stored) = capture.lock() {
+        stored.mark_clean_eof();
+    }
+}
+
 #[cfg(windows)]
 struct ChildGuard {
     child: Option<windows_process::NativeChild>,
@@ -2914,6 +3128,12 @@ impl ChildGuard {
 
     fn child_mut(&mut self) -> &mut windows_process::NativeChild {
         self.child.as_mut().expect("child is owned until cleanup")
+    }
+
+    fn process_resources(&self) -> Option<ProviderProcessResourcesV1> {
+        self.child
+            .as_ref()
+            .and_then(windows_process::NativeChild::process_resources)
     }
 
     fn wait_until(
@@ -3851,6 +4071,90 @@ mod tests {
         let oversized_length = (MAX_RESPONSE_FRAME_BYTES as u32 + 1).to_be_bytes();
         let mut input = io::Cursor::new(oversized_length);
         assert!(read_frame(&mut input, MAX_RESPONSE_FRAME_BYTES).is_err());
+    }
+
+    #[test]
+    fn raw_response_transcript_preserves_two_frames_clean_eof_and_incomplete_cases() {
+        let (_, request) = fixture_request();
+        let handshake = WorkerResponseFrameV1::Handshake {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            provider: fixture_provider(),
+            configuration_id: request.provider_configuration.configuration_id.clone(),
+            configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
+            capabilities: fixture_capabilities(),
+        };
+        let recognition = WorkerResponseFrameV1::Recognition {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            result: fixture_result(&request, request.source_revision.clone()),
+        };
+        let handshake_frame = encode_frame(&handshake, MAX_HANDSHAKE_FRAME_BYTES).unwrap();
+        let recognition_frame = encode_frame(&recognition, MAX_RESPONSE_FRAME_BYTES).unwrap();
+        let mut clean_stream = handshake_frame.clone();
+        clean_stream.extend_from_slice(&recognition_frame);
+        let (response_sender, responses) = mpsc::sync_channel(2);
+        let (completion_sender, completion) = mpsc::sync_channel(1);
+        let capture = Arc::new(Mutex::new(ProviderRawResponseTranscriptV1::default()));
+        read_worker_responses(
+            io::Cursor::new(clean_stream),
+            response_sender,
+            completion_sender,
+            Arc::clone(&capture),
+        );
+        assert!(completion.recv().unwrap().is_ok());
+        assert!(matches!(responses.recv().unwrap(), Ok(WorkerResponseFrameV1::Handshake { .. })));
+        assert!(matches!(responses.recv().unwrap(), Ok(WorkerResponseFrameV1::Recognition { .. })));
+        let transcript = capture.lock().unwrap().clone();
+        assert!(transcript.capture_complete);
+        assert_eq!(transcript.frames.len(), 2);
+        assert_eq!(transcript.frames[0].ordinal, 0);
+        assert_eq!(&transcript.frames[0].payload_bytes, &handshake_frame[4..]);
+        assert_eq!(transcript.frames[1].ordinal, 1);
+        assert_eq!(&transcript.frames[1].payload_bytes, &recognition_frame[4..]);
+
+        let third_frame = encode_frame(
+            &WorkerResponseFrameV1::Failure {
+                protocol_version: PROVIDER_PROTOCOL_VERSION,
+                code: "unexpected".to_owned(),
+                message: "third frame fixture".to_owned(),
+            },
+            MAX_RESPONSE_FRAME_BYTES,
+        )
+        .unwrap();
+        let mut extra_stream = handshake_frame.clone();
+        extra_stream.extend_from_slice(&recognition_frame);
+        extra_stream.extend_from_slice(&third_frame);
+        let (response_sender, responses) = mpsc::sync_channel(2);
+        let (completion_sender, completion) = mpsc::sync_channel(1);
+        let extra_capture = Arc::new(Mutex::new(ProviderRawResponseTranscriptV1::default()));
+        read_worker_responses(
+            io::Cursor::new(extra_stream),
+            response_sender,
+            completion_sender,
+            Arc::clone(&extra_capture),
+        );
+        assert!(responses.recv().unwrap().is_ok());
+        assert!(responses.recv().unwrap().is_ok());
+        let completion_error = completion.recv().unwrap().unwrap_err();
+        assert!(completion_error.contains("unexpected third"));
+        let transcript = extra_capture.lock().unwrap().clone();
+        assert!(!transcript.capture_complete);
+        assert_eq!(transcript.frames.len(), 3);
+        assert_eq!(&transcript.frames[2].payload_bytes, &third_frame[4..]);
+
+        let (response_sender, responses) = mpsc::sync_channel(2);
+        let (completion_sender, completion) = mpsc::sync_channel(1);
+        let partial_capture = Arc::new(Mutex::new(ProviderRawResponseTranscriptV1::default()));
+        read_worker_responses(
+            io::Cursor::new(handshake_frame),
+            response_sender,
+            completion_sender,
+            Arc::clone(&partial_capture),
+        );
+        assert!(responses.recv().unwrap().is_ok());
+        assert!(completion.recv().unwrap().is_err());
+        let transcript = partial_capture.lock().unwrap().clone();
+        assert!(!transcript.capture_complete);
+        assert_eq!(transcript.frames.len(), 1);
     }
 
     #[test]
