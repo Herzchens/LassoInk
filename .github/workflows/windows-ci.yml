@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   verify:
-    name: Verify M3 source and default tests on Windows x64
+    name: Verify M4 provider protocol and default tests on Windows x64
     runs-on: windows-2025
     steps:
       - name: Check out exact PR head or pushed commit
@@ -50,12 +50,13 @@ jobs:
         run: cargo +1.100.0 build --locked --workspace
 
   native-ui:
-    name: Guarded Win32 Winit and GDI tests
+    name: Guarded Windows and provider subprocess tests
     needs: verify
     runs-on: windows-2025
     timeout-minutes: 20
     env:
       LASSOINK_RUN_NATIVE_UI_TESTS: "1"
+      LASSOINK_RUN_PROVIDER_MOCK_TESTS: "1"
     steps:
       - name: Check out exact PR head or pushed commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -80,4 +81,7 @@ jobs:
 
       - name: Run guarded native UI tests serially
         shell: pwsh
-        run: cargo +1.100.0 test --locked --workspace -- --include-ignored --test-threads=1
+        run: |
+          $env:RUSTUP_TOOLCHAIN = "1.100.0"
+          $env:RUSTC = "rustc"
+          cargo +1.100.0 test --locked --workspace -- --include-ignored --test-threads=1
