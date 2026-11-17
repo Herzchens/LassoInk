@@ -10,8 +10,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process,
-    thread,
+    process, thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -21,11 +20,11 @@ use sha2::{Digest, Sha256};
 use crate::{
     journal::{StrokeRef, read_journal},
     provider_protocol::{
-        OperatorApprovedProviderConfig, ProviderCallTimeouts, ProviderConfigurationV1,
-        ProviderCapabilitiesV1, ProviderErrorKind, ProviderExecution, ProviderExecutionError,
+        OperatorApprovedProviderConfig, ProviderCallTimeouts, ProviderCapabilitiesV1,
+        ProviderConfigurationV1, ProviderErrorKind, ProviderExecution, ProviderExecutionError,
         ProviderIdentityV1, ProviderInputCapabilityV1, ProviderProcessResourcesV1,
-        ProviderRawResponseFrameV1, ProviderRawResponseTranscriptV1, ProviderRasterInputV1,
-        ProviderRasterPayloadContractV1, ProviderSourceRevisionV1, ProviderSubmitError,
+        ProviderRasterInputV1, ProviderRasterPayloadContractV1, ProviderRawResponseFrameV1,
+        ProviderRawResponseTranscriptV1, ProviderSourceRevisionV1, ProviderSubmitError,
         ProviderWorkerHandle, ProviderWorkerPoll, RecognitionRequestBuildInput,
         RecognitionRequestV1, RecognitionResultV1, build_recognition_request,
     },
@@ -707,13 +706,15 @@ impl BenchmarkArtifactWriter {
             ));
         }
         let mut buffer = BoundedJsonBuffer::new(MAX_BENCHMARK_RECORD_BYTES);
-        serde_json::to_writer(&mut buffer, record)
-            .map_err(|error| {
-                io::Error::other(format!("benchmark JSON encoding failed: {error}"))
-            })?;
+        serde_json::to_writer(&mut buffer, record).map_err(|error| {
+            io::Error::other(format!("benchmark JSON encoding failed: {error}"))
+        })?;
         buffer.write_all(b"\n")?;
         let row_length = u64::try_from(buffer.bytes.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "benchmark row size does not fit u64")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "benchmark row size does not fit u64",
+            )
         })?;
         let next_total = self.bytes_written.checked_add(row_length).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "benchmark byte count overflow")
@@ -836,7 +837,9 @@ fn read_json_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, Box<dyn Error>>
     let reserve = usize::try_from(before.len())?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(reserve)?;
-    (&mut file).take(maximum.saturating_add(1)).read_to_end(&mut bytes)?;
+    (&mut file)
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > maximum || file.metadata()?.len() != before.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -849,13 +852,14 @@ fn read_json_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, Box<dyn Error>>
 
 fn hex_encode(bytes: &[u8]) -> Result<String, io::Error> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let capacity = bytes.len().checked_mul(2).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "hex output length overflow")
-    })?;
+    let capacity = bytes
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "hex output length overflow"))?;
     let mut encoded = Vec::new();
-    encoded.try_reserve_exact(capacity).map_err(|error| {
-        io::Error::other(format!("hex output allocation failed: {error}"))
-    })?;
+    encoded
+        .try_reserve_exact(capacity)
+        .map_err(|error| io::Error::other(format!("hex output allocation failed: {error}")))?;
     for byte in bytes {
         encoded.push(HEX[usize::from(byte >> 4)]);
         encoded.push(HEX[usize::from(byte & 0x0f)]);
@@ -865,7 +869,9 @@ fn hex_encode(bytes: &[u8]) -> Result<String, io::Error> {
 
 fn validate_sha256_hex(value: &str, label: &str) -> io::Result<()> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(invalid_data(format!("{label} is not a 32-byte hexadecimal SHA-256")));
+        return Err(invalid_data(format!(
+            "{label} is not a 32-byte hexadecimal SHA-256"
+        )));
     }
     Ok(())
 }
@@ -909,11 +915,7 @@ struct ProviderSummaryAccumulator {
 }
 
 impl ProviderSummaryAccumulator {
-    fn new(
-        provider_id: String,
-        configuration_id: String,
-        maximum_runs: usize,
-    ) -> io::Result<Self> {
+    fn new(provider_id: String, configuration_id: String, maximum_runs: usize) -> io::Result<Self> {
         let mut summary = Self {
             provider_id,
             configuration_id,
@@ -1298,9 +1300,7 @@ pub(crate) fn run_batch_cli(
                     requested_input_modalities: case.requested_input_modalities.clone(),
                     provider_configuration: provider.configuration.clone(),
                     selected_strokes: &selected_strokes,
-                    raster: raster
-                        .as_ref()
-                        .map(|value| value.request_input.clone()),
+                    raster: raster.as_ref().map(|value| value.request_input.clone()),
                 })
                 .map_err(|error| {
                     invalid_data(format!("case {} request invalid: {error}", case.case_id))
@@ -1328,30 +1328,29 @@ pub(crate) fn run_batch_cli(
                     None => {
                         request_views.insert(
                             case.case_id.clone(),
-                            (request.source_revision.clone(), request.input_view_id.clone()),
+                            (
+                                request.source_revision.clone(),
+                                request.input_view_id.clone(),
+                            ),
                         );
                     }
                 }
                 let mut source_sample_sequences = Vec::new();
                 source_sample_sequences.try_reserve_exact(request.samples.len())?;
-                source_sample_sequences.extend(
-                    request.samples.iter().map(|sample| sample.journal_sequence),
-                );
+                source_sample_sequences
+                    .extend(request.samples.iter().map(|sample| sample.journal_sequence));
                 let mut selected_strokes = Vec::new();
                 selected_strokes.try_reserve_exact(request.stroke_views.len())?;
-                selected_strokes.extend(
-                    request
-                        .stroke_views
-                        .iter()
-                        .map(|view| BenchmarkStrokeRefV1 {
+                selected_strokes.extend(request.stroke_views.iter().map(|view| {
+                    BenchmarkStrokeRefV1 {
                         journal_id: view.stroke.journal_id.clone(),
                         session_id: view.stroke.session_id.clone(),
                         source_api: view.stroke.source_api.clone(),
                         device_id: view.stroke.device_id.clone(),
                         pointer_id: view.stroke.pointer_id,
                         stroke_id: view.stroke.stroke_id.clone(),
-                    }),
-                );
+                    }
+                }));
                 let base = BenchmarkRunBase {
                     case,
                     region_id: case.region_id.clone(),
@@ -1384,15 +1383,12 @@ pub(crate) fn run_batch_cli(
                         execution,
                         elapsed_app_batch_call_wall_ns,
                         annotation,
-                        corpus_manifest.as_ref().map(|corpus| corpus.tokenization_policy),
+                        corpus_manifest
+                            .as_ref()
+                            .map(|corpus| corpus.tokenization_policy),
                     )?,
                     Err(error) => {
-                        failed_run_record(
-                            base,
-                            error,
-                            elapsed_app_batch_call_wall_ns,
-                            annotation,
-                        )?
+                        failed_run_record(base, error, elapsed_app_batch_call_wall_ns, annotation)?
                     }
                 };
                 if let (Some(_annotation), Some(split)) = (annotation, case.provenance.split) {
@@ -1405,9 +1401,8 @@ pub(crate) fn run_batch_cli(
                         writer_key: case.provenance.writer_key.clone(),
                         session_key: case.provenance.session_key.clone(),
                         cer: first.and_then(|metrics| metrics.nfc_unicode_scalar_cer.clone()),
-                        wer: first.and_then(|metrics| {
-                            metrics.whitespace_token_syllable_wer.clone()
-                        }),
+                        wer: first
+                            .and_then(|metrics| metrics.whitespace_token_syllable_wer.clone()),
                     });
                 }
                 let summary_key = (
@@ -1526,7 +1521,9 @@ fn execute_provider(
                 return outcome.outcome;
             }
             ProviderWorkerPoll::Stopped => {
-                return Err(empty_execution_error(ProviderErrorKind::WorkerSubsystemPoisoned));
+                return Err(empty_execution_error(
+                    ProviderErrorKind::WorkerSubsystemPoisoned,
+                ));
             }
             ProviderWorkerPoll::Pending => {
                 if Instant::now() >= deadline {
@@ -1557,17 +1554,18 @@ fn successful_run_record(
     annotation: Option<&BenchmarkAnnotationCaseV1>,
     tokenization_policy: Option<BenchmarkTokenizationPolicyV1>,
 ) -> Result<BenchmarkRunRecordV1, io::Error> {
-    let (candidate_metrics, metric_evaluation_unavailable_reason) =
-        match (annotation, tokenization_policy) {
-            (Some(_), Some(_)) if execution.result.candidates.is_empty() => (
-                Vec::new(),
-                Some("text metrics unavailable because provider returned no rank-0 candidate".to_owned()),
+    let (candidate_metrics, metric_evaluation_unavailable_reason) = match (
+        annotation,
+        tokenization_policy,
+    ) {
+        (Some(_), Some(_)) if execution.result.candidates.is_empty() => (
+            Vec::new(),
+            Some(
+                "text metrics unavailable because provider returned no rank-0 candidate".to_owned(),
             ),
-            (Some(annotation), Some(policy)) => match score_candidates(
-                &execution.result,
-                annotation,
-                policy,
-            ) {
+        ),
+        (Some(annotation), Some(policy)) => {
+            match score_candidates(&execution.result, annotation, policy) {
                 Ok(metrics) => (metrics, None),
                 Err(error) => (
                     Vec::new(),
@@ -1575,18 +1573,18 @@ fn successful_run_record(
                         "text metrics unavailable; provider result and raw response are preserved: {error}"
                     )),
                 ),
-            },
-            _ => (Vec::new(), None),
-        };
+            }
+        }
+        _ => (Vec::new(), None),
+    };
     let transcript = execution.raw_response_transcript;
     let raw_response_frames = encode_response_frames(transcript.frames)?;
     let (model_artifact_digests, model_artifact_hash_unavailable_reason) =
         model_artifact_hash_status(&base.provider.artifact_digests)?;
-    let (job_cpu_ratio, job_cpu_ratio_unavailable_reason) =
-        job_cpu_core_equivalent_percent(
-            execution.process_resources.as_ref(),
-            Some(&execution.timing),
-        );
+    let (job_cpu_ratio, job_cpu_ratio_unavailable_reason) = job_cpu_core_equivalent_percent(
+        execution.process_resources.as_ref(),
+        Some(&execution.timing),
+    );
     let run = BenchmarkRunRecordV1 {
         case_id: base.case.case_id.clone(),
         region_id: base.region_id,
@@ -1775,20 +1773,32 @@ fn job_cpu_core_equivalent_percent(
                 .and_then(|kernel| user.checked_add(kernel))
         })
     else {
-        return (None, Some("raw Job Object CPU counter sum overflowed".to_owned()));
+        return (
+            None,
+            Some("raw Job Object CPU counter sum overflowed".to_owned()),
+        );
     };
     let Some(cpu_ns) = total_cpu_100ns.checked_mul(100) else {
-        return (None, Some("Job Object CPU nanosecond conversion overflowed".to_owned()));
+        return (
+            None,
+            Some("Job Object CPU nanosecond conversion overflowed".to_owned()),
+        );
     };
     let wall_ns = timing.process_create_call_to_tree_drain_ns;
     if wall_ns == 0 {
-        return (None, Some("observed provider wall interval is zero".to_owned()));
+        return (
+            None,
+            Some("observed provider wall interval is zero".to_owned()),
+        );
     }
     let ratio = (cpu_ns as f64 / wall_ns as f64) * 100.0;
     if ratio.is_finite() {
         (Some(ratio), None)
     } else {
-        (None, Some("derived Job Object core-equivalent ratio is non-finite".to_owned()))
+        (
+            None,
+            Some("derived Job Object core-equivalent ratio is non-finite".to_owned()),
+        )
     }
 }
 
@@ -1845,7 +1855,10 @@ fn encode_response_frames(
     encoded.try_reserve_exact(frames.len())?;
     for frame in frames {
         let length = u32::try_from(frame.payload_bytes.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "provider response frame exceeds u32")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "provider response frame exceeds u32",
+            )
         })?;
         encoded.push(BenchmarkRawResponseFrameHexV1 {
             ordinal: frame.ordinal,
@@ -1881,7 +1894,9 @@ fn validate_case_manifest(manifest: &BenchmarkCaseManifestV1) -> io::Result<()> 
         require_local_absolute_path(&case.journal_path, "journal path")?;
         let journal_metadata = fs::symlink_metadata(&case.journal_path)?;
         if journal_metadata.file_type().is_symlink() || !journal_metadata.is_file() {
-            return Err(invalid_data("journal input must be a regular non-symlink file"));
+            return Err(invalid_data(
+                "journal input must be a regular non-symlink file",
+            ));
         }
         for (value, label) in [
             (case.region_id.as_str(), "region ID"),
@@ -1897,9 +1912,7 @@ fn validate_case_manifest(manifest: &BenchmarkCaseManifestV1) -> io::Result<()> 
         for language in &case.language_hints {
             validate_bounded_text(language, "language hint", 128)?;
         }
-        if case.requested_input_modalities.is_empty()
-            || case.requested_input_modalities.len() > 2
-        {
+        if case.requested_input_modalities.is_empty() || case.requested_input_modalities.len() > 2 {
             return Err(invalid_data("requested input modality count is invalid"));
         }
         if case.requested_input_modalities.len() == 2
@@ -1908,7 +1921,9 @@ fn validate_case_manifest(manifest: &BenchmarkCaseManifestV1) -> io::Result<()> 
             return Err(invalid_data("requested input modalities must be unique"));
         }
         if case.selected_strokes.is_empty() || case.selected_strokes.len() > 256 {
-            return Err(invalid_data("selected StrokeRef count is empty or exceeds 256"));
+            return Err(invalid_data(
+                "selected StrokeRef count is empty or exceeds 256",
+            ));
         }
         for (index, stroke) in case.selected_strokes.iter().enumerate() {
             if case.selected_strokes[..index].contains(stroke) {
@@ -1976,13 +1991,20 @@ fn validate_provider_spec(provider: &ApprovedBenchmarkProviderV1) -> io::Result<
     validate_local_id(&provider.provider_id, "provider ID")?;
     require_local_absolute_path(&provider.executable_path, "provider executable path")?;
     if provider.arguments.len() > 64
-        || provider.arguments.iter().any(|argument| argument.len() > 4096)
+        || provider
+            .arguments
+            .iter()
+            .any(|argument| argument.len() > 4096)
         || provider.arguments.iter().map(String::len).sum::<usize>() > 16 * 1024
     {
-        return Err(invalid_data("provider argument count or bytes exceed fixed limits"));
+        return Err(invalid_data(
+            "provider argument count or bytes exceed fixed limits",
+        ));
     }
     if provider.artifacts.len() > MAX_PROVIDER_ARTIFACTS {
-        return Err(invalid_data("explicit provider artifact list exceeds 16 entries"));
+        return Err(invalid_data(
+            "explicit provider artifact list exceeds 16 entries",
+        ));
     }
     let mut artifact_ids = BTreeSet::new();
     let executable_digests = provider
@@ -2006,11 +2028,17 @@ fn validate_provider_spec(provider: &ApprovedBenchmarkProviderV1) -> io::Result<
         require_local_absolute_path(&artifact.path, "explicit artifact path")?;
     }
     if let Some(timeouts) = provider.timeouts
-        && [timeouts.handshake_ms, timeouts.recognition_ms, timeouts.shutdown_ms]
-            .iter()
-            .any(|milliseconds| !(1..=120_000).contains(milliseconds))
+        && [
+            timeouts.handshake_ms,
+            timeouts.recognition_ms,
+            timeouts.shutdown_ms,
+        ]
+        .iter()
+        .any(|milliseconds| !(1..=120_000).contains(milliseconds))
     {
-        return Err(invalid_data("provider deadlines must be between 1 and 120000 ms"));
+        return Err(invalid_data(
+            "provider deadlines must be between 1 and 120000 ms",
+        ));
     }
     Ok(())
 }
@@ -2025,7 +2053,9 @@ fn validate_corpus_manifest(
         || corpus.cases.len() != batch.cases.len()
         || !(1..=MAX_BOOTSTRAP_REPLICATES).contains(&corpus.bootstrap_replicates)
     {
-        return Err(invalid_data("corpus annotation version/count/bootstrap settings are invalid"));
+        return Err(invalid_data(
+            "corpus annotation version/count/bootstrap settings are invalid",
+        ));
     }
     validate_local_id(&corpus.corpus_id, "corpus ID")?;
     let batch_by_id = batch
@@ -2050,12 +2080,16 @@ fn validate_corpus_manifest(
             usize::try_from(mark.reference_scalar_index)
                 .is_ok_and(|index| index >= normalized_reference.chars().count())
         }) {
-            return Err(invalid_data("delayed-mark scalar index is outside reference text"));
+            return Err(invalid_data(
+                "delayed-mark scalar index is outside reference text",
+            ));
         }
         if let Some(tokens) = &annotation.reference_lexical_tokens
             && (tokens.len() > 4096 || tokens.iter().any(|token| token.len() > 256))
         {
-            return Err(invalid_data("optional reference lexical segmentation exceeds limits"));
+            return Err(invalid_data(
+                "optional reference lexical segmentation exceeds limits",
+            ));
         }
         if annotation.delayed_marks.len() > 4096 {
             return Err(invalid_data("delayed-mark annotation count exceeds 4096"));
@@ -2087,14 +2121,12 @@ fn validate_corpus_manifest(
             .provenance
             .split
             .ok_or_else(|| invalid_data("every annotated case requires an explicit split"))?;
-        if let Some((previous_time, previous_split, previous_writer)) = session_assignments
-            .insert(
-                case.provenance.session_key.clone(),
-                (session_time, split, case.provenance.writer_key.clone()),
-            )
-            && (previous_time != session_time
-                || previous_split != split
-                || previous_writer.as_str() != case.provenance.writer_key.as_str())
+        if let Some((previous_time, previous_split, previous_writer)) = session_assignments.insert(
+            case.provenance.session_key.clone(),
+            (session_time, split, case.provenance.writer_key.clone()),
+        ) && (previous_time != session_time
+            || previous_split != split
+            || previous_writer.as_str() != case.provenance.writer_key.as_str())
         {
             return Err(invalid_data(format!(
                 "session-disjoint split violation for session {}",
@@ -2104,9 +2136,7 @@ fn validate_corpus_manifest(
         let split_key = match corpus.split_key {
             BenchmarkSplitKeyV1::Writer => Some(case.provenance.writer_key.as_str()),
             BenchmarkSplitKeyV1::Session => Some(case.provenance.session_key.as_str()),
-            BenchmarkSplitKeyV1::Configuration => {
-                Some(case.provenance.configuration_key.as_str())
-            }
+            BenchmarkSplitKeyV1::Configuration => Some(case.provenance.configuration_key.as_str()),
             BenchmarkSplitKeyV1::SessionStartTime => None,
         };
         if let Some(key) = split_key
@@ -2124,9 +2154,10 @@ fn validate_corpus_manifest(
         let mut has_adaptation_calibration = false;
         let mut earliest_evaluation = None::<u64>;
         for case in &batch.cases {
-            let timestamp = case.provenance.session_start_unix_ns.ok_or_else(|| {
-                invalid_data("corpus case is missing a session timestamp")
-            })?;
+            let timestamp = case
+                .provenance
+                .session_start_unix_ns
+                .ok_or_else(|| invalid_data("corpus case is missing a session timestamp"))?;
             match case.provenance.split {
                 Some(BenchmarkSplitV1::Adaptation | BenchmarkSplitV1::Calibration) => {
                     has_adaptation_calibration = true;
@@ -2155,8 +2186,9 @@ fn validate_corpus_manifest(
         let earlier = latest_prior_session.ok_or_else(|| {
             invalid_data("session-time split requires adaptation/calibration sessions")
         })?;
-        let future = earliest_evaluation
-            .ok_or_else(|| invalid_data("session-time split requires future evaluation sessions"))?;
+        let future = earliest_evaluation.ok_or_else(|| {
+            invalid_data("session-time split requires future evaluation sessions")
+        })?;
         if earlier >= future {
             return Err(invalid_data(
                 "time-disjoint split requires every non-evaluation session to predate evaluation",
@@ -2192,7 +2224,9 @@ fn validate_delayed_mark_links(
 
 fn validate_bounded_text(value: &str, label: &str, maximum: usize) -> io::Result<()> {
     if value.is_empty() || value.len() > maximum || value.chars().any(char::is_control) {
-        return Err(invalid_data(format!("{label} is empty, oversized, or contains controls")));
+        return Err(invalid_data(format!(
+            "{label} is empty, oversized, or contains controls"
+        )));
     }
     Ok(())
 }
@@ -2232,11 +2266,11 @@ fn read_raster_input(spec: &BenchmarkRasterInputSpecV1) -> io::Result<LoadedRast
 fn read_bounded_regular_file(path: &Path, maximum: u64) -> io::Result<Vec<u8>> {
     require_local_absolute_path(path, "input path")?;
     let before_link = fs::symlink_metadata(path)?;
-    if before_link.file_type().is_symlink()
-        || !before_link.is_file()
-        || before_link.len() > maximum
+    if before_link.file_type().is_symlink() || !before_link.is_file() || before_link.len() > maximum
     {
-        return Err(invalid_data("input is not a bounded regular non-symlink file"));
+        return Err(invalid_data(
+            "input is not a bounded regular non-symlink file",
+        ));
     }
     let mut file = File::open(path)?;
     let before = file.metadata()?;
@@ -2244,15 +2278,20 @@ fn read_bounded_regular_file(path: &Path, maximum: u64) -> io::Result<Vec<u8>> {
         return Err(invalid_data("input changed during bounded open"));
     }
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(usize::try_from(before.len()).map_err(|_| {
-        invalid_data("input size does not fit addressable memory")
-    })?)?;
-    (&mut file).take(maximum.saturating_add(1)).read_to_end(&mut bytes)?;
+    bytes.try_reserve_exact(
+        usize::try_from(before.len())
+            .map_err(|_| invalid_data("input size does not fit addressable memory"))?,
+    )?;
+    (&mut file)
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > maximum
         || bytes.len() as u64 != before.len()
         || file.metadata()?.len() != before.len()
     {
-        return Err(invalid_data("input exceeded its cap or changed while being read"));
+        return Err(invalid_data(
+            "input exceeded its cap or changed while being read",
+        ));
     }
     Ok(bytes)
 }
@@ -2301,7 +2340,9 @@ fn hash_explicit_file(path: &Path, remaining_total_cap: u64) -> io::Result<(u64,
             .checked_add(read as u64)
             .ok_or_else(|| invalid_data("artifact byte count overflow"))?;
         if total > MAX_PROVIDER_ARTIFACT_HASH_BYTES || total > remaining_total_cap {
-            return Err(invalid_data("artifact exceeded its per-file or total hash cap"));
+            return Err(invalid_data(
+                "artifact exceeded its per-file or total hash cap",
+            ));
         }
         digest.update(&buffer[..read]);
     }
@@ -2388,12 +2429,7 @@ fn score_candidate(
             } else {
                 None
             };
-            (
-                cer,
-                wer,
-                cer_reason,
-                wer_reason,
-            )
+            (cer, wer, cer_reason, wer_reason)
         }
     };
     let (tone_mark_inventory_difference_count, vowel_modifier_inventory_difference_count) =
@@ -2404,7 +2440,8 @@ fn score_candidate(
         vietnamese_vowel_modifier_alignment_edits,
         vietnamese_vowel_modifier_unavailable_reason,
         vietnamese_mark_alignment_policy,
-    ) = if annotation.reference_language_scope != BenchmarkReferenceLanguageScopeV1::VietnameseOnly {
+    ) = if annotation.reference_language_scope != BenchmarkReferenceLanguageScopeV1::VietnameseOnly
+    {
         let reason = match annotation.reference_language_scope {
             BenchmarkReferenceLanguageScopeV1::MixedOrUnknown => {
                 "reference is mixed/unknown and has no annotated Vietnamese spans; Vietnamese mark alignment is withheld"
@@ -2414,7 +2451,13 @@ fn score_candidate(
             }
             BenchmarkReferenceLanguageScopeV1::VietnameseOnly => unreachable!(),
         };
-        (None, Some(reason.to_owned()), None, Some(reason.to_owned()), None)
+        (
+            None,
+            Some(reason.to_owned()),
+            None,
+            Some(reason.to_owned()),
+            None,
+        )
     } else {
         let reference_nfd = bounded_nfd_scalars(&reference)?;
         let hypothesis_nfd = bounded_nfd_scalars(&hypothesis)?;
@@ -2545,12 +2588,16 @@ fn bounded_levenshtein<T: Eq>(left: &[T], right: &[T]) -> io::Result<Option<u64>
                 .checked_add(substitution_cost)
                 .ok_or_else(|| invalid_data("edit-distance substitution count overflow"))?;
             current[column_index + 1] = substitution
-                .min(previous[column_index + 1].checked_add(1).ok_or_else(|| {
-                    invalid_data("edit-distance deletion count overflow")
-                })?)
-                .min(current[column_index].checked_add(1).ok_or_else(|| {
-                    invalid_data("edit-distance insertion count overflow")
-                })?);
+                .min(
+                    previous[column_index + 1]
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("edit-distance deletion count overflow"))?,
+                )
+                .min(
+                    current[column_index]
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("edit-distance insertion count overflow"))?,
+                );
         }
         std::mem::swap(&mut previous, &mut current);
     }
@@ -2603,7 +2650,10 @@ fn count_map_difference(left: &BTreeMap<char, u64>, right: &BTreeMap<char, u64>)
 }
 
 fn is_tone_mark(character: char) -> bool {
-    matches!(character, '\u{0300}' | '\u{0301}' | '\u{0303}' | '\u{0309}' | '\u{0323}')
+    matches!(
+        character,
+        '\u{0300}' | '\u{0301}' | '\u{0303}' | '\u{0309}' | '\u{0323}'
+    )
 }
 
 fn is_vowel_modifier(character: char) -> bool {
@@ -2681,7 +2731,11 @@ fn aligned_vietnamese_mark_edits(
         for column in 1..columns {
             let reference_scalar = reference_nfd[row - 1];
             let hypothesis_scalar = hypothesis_nfd[column - 1];
-            let substitution_cost = if reference_scalar == hypothesis_scalar { 0 } else { 1 };
+            let substitution_cost = if reference_scalar == hypothesis_scalar {
+                0
+            } else {
+                1
+            };
             let mut best_distance = previous[column - 1] + substitution_cost;
             let mut best_operation = ALIGN_DIAGONAL;
             let deletion = previous[column] + 1;
@@ -2792,7 +2846,9 @@ fn build_paired_comparisons_with_work_budget(
             observation.case_id.clone(),
         );
         if indexed.insert(key, observation).is_some() {
-            return Err(invalid_data("duplicate provider/case evaluation observation"));
+            return Err(invalid_data(
+                "duplicate provider/case evaluation observation",
+            ));
         }
     }
     let provider_keys = provider_keys.into_iter().collect::<Vec<_>>();
@@ -2827,7 +2883,11 @@ fn build_paired_comparisons_with_work_budget(
                 );
                 let pair_clusters = u64::try_from(cer_clusters)
                     .ok()
-                    .and_then(|cer| u64::try_from(wer_clusters).ok().and_then(|wer| cer.checked_add(wer)))
+                    .and_then(|cer| {
+                        u64::try_from(wer_clusters)
+                            .ok()
+                            .and_then(|wer| cer.checked_add(wer))
+                    })
                     .ok_or_else(|| invalid_data("bootstrap cluster-draw estimate overflow"))?;
                 let pair_draws = pair_clusters
                     .checked_mul(u64::from(corpus.bootstrap_replicates))
@@ -3023,7 +3083,12 @@ fn paired_bootstrap_for_metric(
             continue;
         }
         let totals = clusters.entry(case.cluster.clone()).or_default();
-        totals.add(left.errors, left.reference_units, right.errors, right.reference_units)?;
+        totals.add(
+            left.errors,
+            left.reference_units,
+            right.errors,
+            right.reference_units,
+        )?;
     }
     if clusters.is_empty() {
         return Ok((
@@ -3034,14 +3099,22 @@ fn paired_bootstrap_for_metric(
     if clusters.len() < 2 {
         return Ok((
             None,
-            Some("paired clustered bootstrap unavailable with fewer than two independent clusters".to_owned()),
+            Some(
+                "paired clustered bootstrap unavailable with fewer than two independent clusters"
+                    .to_owned(),
+            ),
         ));
     }
     let mut totals = Vec::new();
     totals.try_reserve_exact(clusters.len())?;
     totals.extend(clusters.into_values());
     let cluster_count = totals.len();
-    let mut rng = seed ^ if cer { 0x4345_525f_5631 } else { 0x5745_525f_5631 };
+    let mut rng = seed
+        ^ if cer {
+            0x4345_525f_5631
+        } else {
+            0x5745_525f_5631
+        };
     if rng == 0 {
         rng = 0x9e37_79b9_7f4a_7c15;
     }
@@ -3104,18 +3177,22 @@ impl ClusterMetricTotals {
         right_errors: u64,
         right_units: u64,
     ) -> io::Result<()> {
-        self.left_errors = self.left_errors.checked_add(left_errors).ok_or_else(|| {
-            invalid_data("bootstrap left error total overflow")
-        })?;
-        self.left_units = self.left_units.checked_add(left_units).ok_or_else(|| {
-            invalid_data("bootstrap left denominator overflow")
-        })?;
-        self.right_errors = self.right_errors.checked_add(right_errors).ok_or_else(|| {
-            invalid_data("bootstrap right error total overflow")
-        })?;
-        self.right_units = self.right_units.checked_add(right_units).ok_or_else(|| {
-            invalid_data("bootstrap right denominator overflow")
-        })?;
+        self.left_errors = self
+            .left_errors
+            .checked_add(left_errors)
+            .ok_or_else(|| invalid_data("bootstrap left error total overflow"))?;
+        self.left_units = self
+            .left_units
+            .checked_add(left_units)
+            .ok_or_else(|| invalid_data("bootstrap left denominator overflow"))?;
+        self.right_errors = self
+            .right_errors
+            .checked_add(right_errors)
+            .ok_or_else(|| invalid_data("bootstrap right error total overflow"))?;
+        self.right_units = self
+            .right_units
+            .checked_add(right_units)
+            .ok_or_else(|| invalid_data("bootstrap right denominator overflow"))?;
         Ok(())
     }
 
@@ -3227,10 +3304,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "lassoink-{label}-{}-{unique}",
-            process::id()
-        ))
+        std::env::temp_dir().join(format!("lassoink-{label}-{}-{unique}", process::id()))
     }
 
     #[test]
@@ -3247,8 +3321,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("explicit-model.bin");
         fs::write(&path, b"abc").unwrap();
-        let (length, digest) =
-            hash_explicit_file(&path, MAX_PROVIDER_ARTIFACT_HASH_BYTES).unwrap();
+        let (length, digest) = hash_explicit_file(&path, MAX_PROVIDER_ARTIFACT_HASH_BYTES).unwrap();
         assert_eq!(length, 3);
         assert_eq!(digest, hex_encode(&Sha256::digest(b"abc")).unwrap());
         assert!(hash_explicit_file(&path, 2).is_err());
@@ -3277,12 +3350,13 @@ mod tests {
             sha256_hex: hex_encode(&Sha256::digest(b"exe")).unwrap(),
             observation: "test".to_owned(),
         };
-        let (model_artifacts, reason) =
-            model_artifact_hash_status(&[executable.clone()]).unwrap();
+        let (model_artifacts, reason) = model_artifact_hash_status(&[executable.clone()]).unwrap();
         assert!(model_artifacts.is_empty());
-        assert!(reason
-            .as_deref()
-            .is_some_and(|value| value.contains("not model-content hashes")));
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|value| value.contains("not model-content hashes"))
+        );
 
         let tokenizer = ProviderArtifactDigestV1 {
             artifact_id: "tokenizer-1".to_owned(),
@@ -3303,7 +3377,8 @@ mod tests {
             sha256_hex: hex_encode(&Sha256::digest(b"model")).unwrap(),
             observation: "test".to_owned(),
         };
-        let (model_artifacts, reason) = model_artifact_hash_status(&[executable, model.clone()]).unwrap();
+        let (model_artifacts, reason) =
+            model_artifact_hash_status(&[executable, model.clone()]).unwrap();
         assert_eq!(model_artifacts, vec![model]);
         assert!(reason.is_none());
     }
@@ -3321,10 +3396,7 @@ mod tests {
         assert_eq!(exact.nfc_unicode_scalar_cer.unwrap().errors, 0);
         assert_eq!(exact.tone_mark_inventory_difference_count, 0);
         assert_eq!(
-            exact
-                .vietnamese_tone_mark_alignment_edits
-                .unwrap()
-                .errors,
+            exact.vietnamese_tone_mark_alignment_edits.unwrap().errors,
             0
         );
 
@@ -3337,12 +3409,7 @@ mod tests {
         .unwrap();
         assert_eq!(tone.tone_mark_inventory_difference_count, 1);
         assert_eq!(tone.vowel_modifier_inventory_difference_count, 0);
-        assert_eq!(
-            tone.vietnamese_tone_mark_alignment_edits
-                .unwrap()
-                .errors,
-            1
-        );
+        assert_eq!(tone.vietnamese_tone_mark_alignment_edits.unwrap().errors, 1);
 
         let modifier = score_candidate(
             "â",
@@ -3372,9 +3439,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(metrics.tone_mark_inventory_difference_count, 0);
-        assert!(metrics
-            .vietnamese_tone_mark_alignment_edits
-            .is_some_and(|metric| metric.errors > 0));
+        assert!(
+            metrics
+                .vietnamese_tone_mark_alignment_edits
+                .is_some_and(|metric| metric.errors > 0)
+        );
     }
 
     #[test]
@@ -3393,10 +3462,12 @@ mod tests {
         assert!(metrics.tone_mark_inventory_difference_count > 0);
         assert!(metrics.vietnamese_tone_mark_alignment_edits.is_none());
         assert!(metrics.vietnamese_vowel_modifier_alignment_edits.is_none());
-        assert!(metrics
-            .vietnamese_tone_mark_unavailable_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("mixed/unknown")));
+        assert!(
+            metrics
+                .vietnamese_tone_mark_unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("mixed/unknown"))
+        );
     }
 
     #[test]
@@ -3410,17 +3481,20 @@ mod tests {
         .unwrap();
         assert_eq!(metrics.whitespace_token_syllable_wer.unwrap().errors, 1);
         assert_eq!(
-            metrics
-                .syllable_boundary_offset_diagnostic
-                .unwrap()
-                .errors,
+            metrics.syllable_boundary_offset_diagnostic.unwrap().errors,
             1
         );
-        assert!(metrics
-            .syllable_boundary_diagnostic_policy
-            .contains("not aligned boundary accuracy"));
+        assert!(
+            metrics
+                .syllable_boundary_diagnostic_policy
+                .contains("not aligned boundary accuracy")
+        );
         assert!(metrics.lexical_wer_unavailable_reason.contains("lexical"));
-        assert!(metrics.delayed_attachment_unavailable_reason.contains("no delayed-mark"));
+        assert!(
+            metrics
+                .delayed_attachment_unavailable_reason
+                .contains("no delayed-mark")
+        );
     }
 
     #[test]
@@ -3435,9 +3509,11 @@ mod tests {
         let diagnostic = metrics.syllable_boundary_offset_diagnostic.unwrap();
         assert_eq!(diagnostic.errors, 2);
         assert_eq!(diagnostic.reference_units, 1);
-        assert!(metrics
-            .syllable_boundary_diagnostic_policy
-            .contains("not aligned boundary accuracy"));
+        assert!(
+            metrics
+                .syllable_boundary_diagnostic_policy
+                .contains("not aligned boundary accuracy")
+        );
     }
 
     #[test]
@@ -3469,9 +3545,11 @@ mod tests {
         assert!(metrics.whitespace_token_syllable_wer.is_none());
         assert!(metrics.whitespace_wer_unavailable_reason.is_some());
         assert!(metrics.syllable_boundary_offset_diagnostic.is_none());
-        assert!(metrics
-            .syllable_boundary_offset_diagnostic_unavailable_reason
-            .is_some());
+        assert!(
+            metrics
+                .syllable_boundary_offset_diagnostic_unavailable_reason
+                .is_some()
+        );
     }
 
     #[test]
@@ -3479,21 +3557,51 @@ mod tests {
         let cases = vec![
             PairedMetricCase {
                 cluster: "writer-a".to_owned(),
-                left_cer: Some(BenchmarkCountMetricV1 { errors: 2, reference_units: 10 }),
-                right_cer: Some(BenchmarkCountMetricV1 { errors: 1, reference_units: 10 }),
-                left_wer: Some(BenchmarkCountMetricV1 { errors: 1, reference_units: 5 }),
-                right_wer: Some(BenchmarkCountMetricV1 { errors: 0, reference_units: 5 }),
+                left_cer: Some(BenchmarkCountMetricV1 {
+                    errors: 2,
+                    reference_units: 10,
+                }),
+                right_cer: Some(BenchmarkCountMetricV1 {
+                    errors: 1,
+                    reference_units: 10,
+                }),
+                left_wer: Some(BenchmarkCountMetricV1 {
+                    errors: 1,
+                    reference_units: 5,
+                }),
+                right_wer: Some(BenchmarkCountMetricV1 {
+                    errors: 0,
+                    reference_units: 5,
+                }),
             },
             PairedMetricCase {
                 cluster: "writer-b".to_owned(),
-                left_cer: Some(BenchmarkCountMetricV1 { errors: 2, reference_units: 10 }),
-                right_cer: Some(BenchmarkCountMetricV1 { errors: 1, reference_units: 10 }),
-                left_wer: Some(BenchmarkCountMetricV1 { errors: 1, reference_units: 5 }),
-                right_wer: Some(BenchmarkCountMetricV1 { errors: 0, reference_units: 5 }),
+                left_cer: Some(BenchmarkCountMetricV1 {
+                    errors: 2,
+                    reference_units: 10,
+                }),
+                right_cer: Some(BenchmarkCountMetricV1 {
+                    errors: 1,
+                    reference_units: 10,
+                }),
+                left_wer: Some(BenchmarkCountMetricV1 {
+                    errors: 1,
+                    reference_units: 5,
+                }),
+                right_wer: Some(BenchmarkCountMetricV1 {
+                    errors: 0,
+                    reference_units: 5,
+                }),
             },
         ];
-        let first = paired_bootstrap_for_metric(&cases, true, 100, 42).unwrap().0.unwrap();
-        let second = paired_bootstrap_for_metric(&cases, true, 100, 42).unwrap().0.unwrap();
+        let first = paired_bootstrap_for_metric(&cases, true, 100, 42)
+            .unwrap()
+            .0
+            .unwrap();
+        let second = paired_bootstrap_for_metric(&cases, true, 100, 42)
+            .unwrap()
+            .0
+            .unwrap();
         assert_eq!(first, second);
         assert!((first.median_difference + 0.1).abs() < f64::EPSILON);
         assert_eq!(first.nominal_95_unadjusted_low, first.median_difference);
@@ -3510,33 +3618,54 @@ mod tests {
         let cases = vec![
             PairedMetricCase {
                 cluster: "session-a".to_owned(),
-                left_cer: Some(BenchmarkCountMetricV1 { errors: 1, reference_units: 10 }),
-                right_cer: Some(BenchmarkCountMetricV1 { errors: 0, reference_units: 10 }),
-                left_wer: Some(BenchmarkCountMetricV1 { errors: 1, reference_units: 2 }),
-                right_wer: Some(BenchmarkCountMetricV1 { errors: 0, reference_units: 2 }),
+                left_cer: Some(BenchmarkCountMetricV1 {
+                    errors: 1,
+                    reference_units: 10,
+                }),
+                right_cer: Some(BenchmarkCountMetricV1 {
+                    errors: 0,
+                    reference_units: 10,
+                }),
+                left_wer: Some(BenchmarkCountMetricV1 {
+                    errors: 1,
+                    reference_units: 2,
+                }),
+                right_wer: Some(BenchmarkCountMetricV1 {
+                    errors: 0,
+                    reference_units: 2,
+                }),
             },
             PairedMetricCase {
                 cluster: "session-b".to_owned(),
                 left_cer: None,
                 right_cer: None,
-                left_wer: Some(BenchmarkCountMetricV1 { errors: 0, reference_units: 2 }),
-                right_wer: Some(BenchmarkCountMetricV1 { errors: 1, reference_units: 2 }),
+                left_wer: Some(BenchmarkCountMetricV1 {
+                    errors: 0,
+                    reference_units: 2,
+                }),
+                right_wer: Some(BenchmarkCountMetricV1 {
+                    errors: 1,
+                    reference_units: 2,
+                }),
             },
         ];
         assert_eq!(metric_pair_counts(&cases, true).unwrap(), (1, 1));
         assert_eq!(metric_pair_counts(&cases, false).unwrap(), (2, 2));
         let (interval, reason) = paired_bootstrap_for_metric(&cases[..1], true, 100, 7).unwrap();
         assert!(interval.is_none());
-        assert!(reason.unwrap().contains("fewer than two independent clusters"));
+        assert!(
+            reason
+                .unwrap()
+                .contains("fewer than two independent clusters")
+        );
     }
 
     #[test]
     fn bootstrap_work_budget_keeps_counts_and_marks_intervals_unavailable() {
         let mut observations = Vec::new();
-        for (case_id, session_key, errors) in [
-            ("case-a", "session-a", 1),
-            ("case-b", "session-b", 2),
-        ] {
+        for (case_id, session_key, errors) in
+            [("case-a", "session-a", 1), ("case-b", "session-b", 2)]
+        {
             for (provider_id, metric_errors) in [("left", errors), ("right", errors - 1)] {
                 observations.push(EvaluationObservation {
                     case_id: case_id.to_owned(),
@@ -3566,16 +3695,18 @@ mod tests {
             tokenization_policy: BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
             cases: vec![annotation_for("case-a", "ann-a", "x")],
         };
-        let comparisons = build_paired_comparisons_with_work_budget(&observations, &corpus, 0)
-            .unwrap();
+        let comparisons =
+            build_paired_comparisons_with_work_budget(&observations, &corpus, 0).unwrap();
         assert_eq!(comparisons.len(), 1);
         assert_eq!(comparisons[0].nfc_cer_paired_case_count, 2);
         assert_eq!(comparisons[0].nfc_cer_cluster_count, 2);
         assert!(comparisons[0].nfc_cer_rate_difference.is_none());
-        assert!(comparisons[0]
-            .nfc_cer_unavailable_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("cluster-draw budget exceeded")));
+        assert!(
+            comparisons[0]
+                .nfc_cer_unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cluster-draw budget exceeded"))
+        );
     }
 
     #[test]
@@ -3604,7 +3735,10 @@ mod tests {
         let empty = u64_percentiles(&mut empty_values, 3, "bytes", "no memory counter").unwrap();
         assert_eq!(empty.sample_count, 0);
         assert_eq!(empty.p99, None);
-        assert_eq!(empty.unavailable_reason.as_deref(), Some("no memory counter"));
+        assert_eq!(
+            empty.unavailable_reason.as_deref(),
+            Some("no memory counter")
+        );
     }
 
     #[test]
@@ -3738,13 +3872,8 @@ mod tests {
         let directory = temp_dir("no-clobber");
         fs::create_dir_all(&directory).unwrap();
         let manifest_sha = hex_encode(&Sha256::digest(b"case manifest")).unwrap();
-        let writer = BenchmarkArtifactWriter::create_at(
-            &directory,
-            "batch-1",
-            &manifest_sha,
-            None,
-        )
-        .unwrap();
+        let writer =
+            BenchmarkArtifactWriter::create_at(&directory, "batch-1", &manifest_sha, None).unwrap();
         let final_path = writer.final_path.clone();
         let partial_path = writer.partial_path.clone();
         fs::write(&final_path, b"pre-existing-result").unwrap();
@@ -3761,17 +3890,11 @@ mod tests {
         let manifest_sha = hex_encode(&Sha256::digest(b"case manifest")).unwrap();
         let corpus_digest = hex_encode(&Sha256::digest(b"corpus manifest")).unwrap();
         let corpus_sha = Some(corpus_digest.clone());
-        let writer = BenchmarkArtifactWriter::create_at(
-            &directory,
-            "batch-2",
-            &manifest_sha,
-            corpus_sha,
-        )
-        .unwrap();
+        let writer =
+            BenchmarkArtifactWriter::create_at(&directory, "batch-2", &manifest_sha, corpus_sha)
+                .unwrap();
         let partial_path = writer.partial_path.clone();
-        let completion = writer
-            .finish(0, 0, Vec::new(), Vec::new(), None)
-            .unwrap();
+        let completion = writer.finish(0, 0, Vec::new(), Vec::new(), None).unwrap();
         assert!(completion.artifact_path.is_file());
         assert!(!partial_path.exists());
         let contents = fs::read_to_string(&completion.artifact_path).unwrap();

@@ -1,8 +1,8 @@
 #[cfg(not(target_os = "windows"))]
 compile_error!("The LassoInk Gate 0 probe is Windows-only.");
 
-mod canvas;
 mod benchmark;
+mod canvas;
 #[allow(dead_code)]
 mod journal;
 mod process_cpu;
@@ -2472,7 +2472,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!("  --controlled-stall-ms 1..30000 (press F9 once while capture is running)");
         println!("  --report PATH --help --version --status");
         println!("  --benchmark-batch CASES.json PROVIDERS.json [CORPUS-ANNOTATIONS.json]");
-        println!("Benchmark artifacts are local-only; never include credentials or private corpus data in Git.");
+        println!(
+            "Benchmark artifacts are local-only; never include credentials or private corpus data in Git."
+        );
         println!("{STATUS}");
         println!("{NOT_IMPLEMENTED}");
         println!("{STORAGE_POLICY}");

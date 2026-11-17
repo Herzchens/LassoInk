@@ -1919,9 +1919,8 @@ impl ProviderRawResponseTranscriptV1 {
         {
             self.capture_complete = false;
             self.omitted_frame_count = self.omitted_frame_count.saturating_add(1);
-            self.omitted_payload_bytes = self
-                .omitted_payload_bytes
-                .saturating_add(frame_size as u64);
+            self.omitted_payload_bytes =
+                self.omitted_payload_bytes.saturating_add(frame_size as u64);
             return;
         }
         self.frames.push(ProviderRawResponseFrameV1 {
@@ -2207,8 +2206,7 @@ impl ProviderProcessRunner<'_> {
         cancelled: &AtomicBool,
     ) -> Result<ProviderExecution, ProviderExecutionError> {
         let stderr_capture = Arc::new(Mutex::new(BoundedStderr::default()));
-        let raw_response_capture =
-            Arc::new(Mutex::new(ProviderRawResponseTranscriptV1::default()));
+        let raw_response_capture = Arc::new(Mutex::new(ProviderRawResponseTranscriptV1::default()));
         let result = self.run_inner(
             request,
             cancelled,
@@ -2435,11 +2433,9 @@ impl ProviderProcessRunner<'_> {
             // state until ActiveProcesses reaches zero before waiting for EOF.
             // The reader still rejects any third frame before success is accepted.
             let exit_code = child.wait_until(shutdown_deadline, cancelled)?;
-            let process_create_call_to_parent_exit_ns =
-                elapsed_ns(create_process_call_started);
+            let process_create_call_to_parent_exit_ns = elapsed_ns(create_process_call_started);
             child.wait_for_job_tree_until(shutdown_deadline, cancelled)?;
-            let process_create_call_to_tree_drain_ns =
-                elapsed_ns(create_process_call_started);
+            let process_create_call_to_tree_drain_ns = elapsed_ns(create_process_call_started);
             let process_resources = child.process_resources();
             receive_reader_completion(&reader_done_receiver, shutdown_deadline, cancelled)?;
             drop(response_receiver);
@@ -3071,17 +3067,13 @@ fn capture_raw_response_frame(
     }
 }
 
-fn mark_raw_response_capture_incomplete(
-    capture: &Arc<Mutex<ProviderRawResponseTranscriptV1>>,
-) {
+fn mark_raw_response_capture_incomplete(capture: &Arc<Mutex<ProviderRawResponseTranscriptV1>>) {
     if let Ok(mut stored) = capture.lock() {
         stored.mark_incomplete();
     }
 }
 
-fn mark_raw_response_capture_clean_eof(
-    capture: &Arc<Mutex<ProviderRawResponseTranscriptV1>>,
-) {
+fn mark_raw_response_capture_clean_eof(capture: &Arc<Mutex<ProviderRawResponseTranscriptV1>>) {
     if let Ok(mut stored) = capture.lock() {
         stored.mark_clean_eof();
     }
@@ -4101,8 +4093,14 @@ mod tests {
             Arc::clone(&capture),
         );
         assert!(completion.recv().unwrap().is_ok());
-        assert!(matches!(responses.recv().unwrap(), Ok(WorkerResponseFrameV1::Handshake { .. })));
-        assert!(matches!(responses.recv().unwrap(), Ok(WorkerResponseFrameV1::Recognition { .. })));
+        assert!(matches!(
+            responses.recv().unwrap(),
+            Ok(WorkerResponseFrameV1::Handshake { .. })
+        ));
+        assert!(matches!(
+            responses.recv().unwrap(),
+            Ok(WorkerResponseFrameV1::Recognition { .. })
+        ));
         let transcript = capture.lock().unwrap().clone();
         assert!(transcript.capture_complete);
         assert_eq!(transcript.frames.len(), 2);
