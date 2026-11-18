@@ -3474,6 +3474,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_configuration_fingerprint_shared_golden_vector() {
+        let configuration = fixture_configuration();
+        assert_eq!(
+            bounded_json_bytes(&configuration, MAX_REQUEST_FRAME_BYTES / 4).unwrap(),
+            br#"{"configuration_id":"operator-approved-config","values":{"language-mode":"recognize"}}"#,
+        );
+        assert_eq!(
+            configuration.fingerprint().unwrap(),
+            "provider-config-v1-fnv64-5d449396c33394f8",
+        );
+    }
+
     fn fixture_request_for_state(
         state: &JournalReplayState,
         selected: &[StrokeRef],

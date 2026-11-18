@@ -87,6 +87,41 @@ jobs:
           $env:RUSTC = "rustc"
           cargo +1.100.0 test --locked --workspace -- --include-ignored --test-threads=1
 
+  raster-reference-protocol:
+    name: Test stdlib Raster worker protocol helpers
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact PR head or pushed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out head SHA
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:EXPECTED_HEAD_SHA) {
+            throw "Expected $env:EXPECTED_HEAD_SHA; got $actual"
+          }
+
+      - name: Set up pinned Python x64
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13.17'
+          architecture: x64
+          check-latest: false
+
+      - name: Run stdlib protocol tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -p test_raster_reference_protocol.py
+
   raster-cpu-compatibility:
     name: Opt-in SenOCR full-precision CPU compatibility probe
     if: >-
