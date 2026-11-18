@@ -4646,7 +4646,8 @@ mod tests {
         for (
             provider_index,
             (configuration_id, mode_label, behavior, requested_modalities, advertised_inputs),
-        ) in provider_configurations.iter().enumerate() {
+        ) in provider_configurations.iter().enumerate()
+        {
             let configuration = ProviderConfigurationV1 {
                 configuration_id: (*configuration_id).to_owned(),
                 values: BTreeMap::from([
