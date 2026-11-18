@@ -2178,6 +2178,118 @@ pub(crate) struct CanonicalRasterImageV1 {
     raster_artifact_sha256: [u8; 32],
 }
 
+impl CanonicalRasterOutputGeometryV1 {
+    pub(crate) fn source_revision_parts(&self) -> (&str, u64, u64) {
+        (
+            &self.source_journal_id,
+            self.source_logical_revision,
+            self.source_last_sequence,
+        )
+    }
+
+    pub(crate) fn source_content_sha256(&self) -> [u8; 32] {
+        self.source_content_sha256
+    }
+
+    pub(crate) fn projection_spec_sha256(&self) -> [u8; 32] {
+        self.projection_spec_sha256
+    }
+
+    pub(crate) fn geometry_sha256(&self) -> [u8; 32] {
+        self.geometry_sha256
+    }
+
+    pub(crate) fn geometry_schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub(crate) fn projection_schema_version(&self) -> u32 {
+        self.spec.schema_version
+    }
+
+    pub(crate) fn canonical_stroke_draw_order(&self) -> &[StrokeRef] {
+        &self.stroke_draw_order
+    }
+
+    pub(crate) fn caller_selection_order(&self) -> &[StrokeRef] {
+        &self.caller_selection_order
+    }
+
+    pub(crate) fn physical_sample_sequence_provenance(
+        &self,
+    ) -> impl Iterator<Item = (&StrokeRef, u64, u64)> + '_ {
+        self.points_in_journal_order.iter().map(|point| {
+            (
+                &point.stroke_ref,
+                point.journal_sequence,
+                point.source_sequence_raw,
+            )
+        })
+    }
+}
+
+impl CanonicalRasterImageV1 {
+    pub(crate) fn source_revision_parts(&self) -> (&str, u64, u64) {
+        (
+            &self.source_journal_id,
+            self.source_logical_revision,
+            self.source_last_sequence,
+        )
+    }
+
+    pub(crate) fn source_content_sha256(&self) -> [u8; 32] {
+        self.source_content_sha256
+    }
+
+    pub(crate) fn projection_spec_sha256(&self) -> [u8; 32] {
+        self.projection_spec_sha256
+    }
+
+    pub(crate) fn geometry_sha256(&self) -> [u8; 32] {
+        self.geometry_sha256
+    }
+
+    pub(crate) fn renderer_version(&self) -> &'static str {
+        self.renderer_version
+    }
+
+    pub(crate) fn output_dimensions_and_stride(&self) -> (u32, u32, u32) {
+        (
+            self.output_width_px,
+            self.output_height_px,
+            self.row_stride_bytes,
+        )
+    }
+
+    pub(crate) fn pixel_layout(&self) -> CanonicalRasterPixelLayoutV1 {
+        self.pixel_layout
+    }
+
+    pub(crate) fn pixel_layout_name(&self) -> &'static str {
+        match self.pixel_layout {
+            CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown => {
+                "rgba8_premultiplied_srgb_top_down"
+            }
+        }
+    }
+
+    pub(crate) fn pixel_bytes_sha256(&self) -> [u8; 32] {
+        self.pixel_bytes_sha256
+    }
+
+    pub(crate) fn png_bytes_sha256(&self) -> [u8; 32] {
+        self.png_bytes_sha256
+    }
+
+    pub(crate) fn raster_artifact_sha256(&self) -> [u8; 32] {
+        self.raster_artifact_sha256
+    }
+
+    pub(crate) fn png_bytes(&self) -> &[u8] {
+        &self.png_bytes
+    }
+}
+
 /// Build a strict, immutable geometry view from the current append-only
 /// journal projection. No session-origin/default-frame fallback is used here:
 /// every selected stroke must have exactly one valid captured start frame.

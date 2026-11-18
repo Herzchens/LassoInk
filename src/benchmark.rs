@@ -18,7 +18,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    journal::{StrokeRef, read_journal},
+    canvas::{
+        CanonicalRasterProjectionCropV1, CanonicalRasterProjectionSpecV1,
+        build_canonical_raster_projection_plan, render_canonical_raster,
+        transform_canonical_raster_geometry,
+    },
+    journal::{JournalReplayState, StrokeRef, read_journal},
     provider_protocol::{
         OperatorApprovedProviderConfig, ProviderCallTimeouts, ProviderCapabilitiesV1,
         ProviderConfigurationV1, ProviderErrorKind, ProviderExecution, ProviderExecutionError,
@@ -45,6 +50,15 @@ const MAX_PROVIDER_ARTIFACTS: usize = 16;
 const MAX_PROVIDER_ARTIFACT_HASH_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_TOTAL_PROVIDER_ARTIFACT_HASH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_RASTER_INPUT_BYTES: u64 = 1024 * 1024;
+const MAX_GENERATED_RASTER_OUTPUT_DIMENSION: u32 = 2048;
+const MAX_GENERATED_RASTER_OUTPUT_PIXELS: u64 = 262_144;
+const MAX_GENERATED_RASTER_OUTPUT_BYTES: u64 = 1024 * 1024;
+const MAX_GENERATED_RASTER_CROP_DIMENSION: i128 = 1_048_576;
+const MAX_GENERATED_RASTER_CROP_AREA: i128 = 67_108_864;
+const MAX_GENERATED_RASTER_PROVENANCE_SAMPLES: usize = 4096;
+const MAX_GENERATED_RASTER_PROVENANCE_STROKES: usize = 512;
+const GENERATED_RASTER_COORDINATE_SPACE: &str = "canonical-raster-output-v1";
+const GENERATED_RASTER_COORDINATE_UNITS: &str = "pixel";
 const MAX_BENCHMARK_RECORD_BYTES: usize = 48 * 1024 * 1024;
 const MAX_BENCHMARK_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_BENCHMARK_RECORDS: u64 = 50_000;
@@ -153,6 +167,8 @@ pub(crate) struct BenchmarkCaseSpecV1 {
     pub selected_strokes: Vec<BenchmarkStrokeRefV1>,
     pub provenance: BenchmarkCaseProvenanceV1,
     pub raster: Option<BenchmarkRasterInputSpecV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_raster: Option<BenchmarkGeneratedRasterSpecV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -234,6 +250,25 @@ pub(crate) struct BenchmarkRasterInputSpecV1 {
     pub height: u32,
     pub coordinate_space: String,
     pub units: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkGeneratedRasterSpecV1 {
+    /// Version of the supported canonical raster projection specification.
+    pub projection_schema_version: u32,
+    pub output_width_px: u32,
+    pub output_height_px: u32,
+    pub source_crop: BenchmarkGeneratedRasterCropV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkGeneratedRasterCropV1 {
+    pub left_px: i32,
+    pub top_px: i32,
+    pub right_px_exclusive: i32,
+    pub bottom_px_exclusive: i32,
 }
 
 /// This operator-supplied file is separate from the journal/corpus manifest.
@@ -338,6 +373,46 @@ pub(crate) struct BenchmarkCanonicalInkComparisonBindingV1 {
     pub raster_pixel_parity: BenchmarkRasterPixelParityV1,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkGeneratedRasterOriginV1 {
+    pub schema_version: u32,
+    /// Binds this producer record to this run's shared canonical-ink request view.
+    pub canonical_ink_comparison_binding_sha256: String,
+    pub producer: BenchmarkGeneratedRasterProducerV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkGeneratedRasterProducerV1 {
+    pub schema_version: u32,
+    pub geometry_schema_version: u32,
+    pub projection_schema_version: u32,
+    pub source_revision: ProviderSourceRevisionV1,
+    pub selected_strokes: Vec<BenchmarkStrokeRefV1>,
+    pub source_content_sha256: String,
+    pub projection_spec_sha256: String,
+    pub geometry_sha256: String,
+    pub renderer_version: String,
+    pub pixel_bytes_sha256: String,
+    pub png_bytes_sha256: String,
+    pub raster_artifact_sha256: String,
+    pub output_width_px: u32,
+    pub output_height_px: u32,
+    pub row_stride_bytes: u32,
+    pub pixel_layout: String,
+    pub stroke_draw_order: Vec<BenchmarkStrokeRefV1>,
+    pub physical_sample_provenance: Vec<BenchmarkGeneratedRasterSampleProvenanceV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkGeneratedRasterSampleProvenanceV1 {
+    pub stroke: BenchmarkStrokeRefV1,
+    pub journal_sequence: u64,
+    pub source_sequence_raw: u64,
+}
+
 #[derive(Serialize)]
 struct CanonicalInkComparisonFingerprintV1<'a> {
     schema_version: u32,
@@ -387,6 +462,8 @@ pub(crate) struct BenchmarkRunRecordV1 {
     /// Shared canonical-ink identity; the per-request M4 view ID remains separate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_ink_comparison_binding: Option<BenchmarkCanonicalInkComparisonBindingV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_raster_origin: Option<BenchmarkGeneratedRasterOriginV1>,
     pub requested_input_modalities: Vec<ProviderInputCapabilityV1>,
     pub selected_strokes: Vec<BenchmarkStrokeRefV1>,
     pub source_sample_sequences: Vec<u64>,
@@ -1277,7 +1354,6 @@ fn run_batch_cli_inner(
         }
         provider_input_modalities_by_case.push(modalities_for_case);
     }
-
     let annotations = match corpus_manifest.as_ref() {
         Some(corpus) => {
             validate_corpus_manifest(corpus, &case_manifest)?;
@@ -1401,7 +1477,27 @@ fn run_batch_cli_inner(
                 .iter()
                 .any(|modalities| modalities.contains(&ProviderInputCapabilityV1::Raster));
             let raster = if raster_is_selected {
-                case.raster.as_ref().map(read_raster_input).transpose()?
+                match (&case.raster, &case.generated_raster) {
+                    (Some(file_spec), None) => Some(read_raster_input(file_spec)?),
+                    (None, Some(generated_spec)) => Some(materialize_generated_raster(
+                        &journal.state,
+                        &source_revision,
+                        &selected_strokes,
+                        generated_spec,
+                    )?),
+                    (None, None) => {
+                        return Err(invalid_data(
+                            "a provider selected raster without a case raster source",
+                        )
+                        .into());
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(invalid_data(
+                            "file raster and generated raster sources are mutually exclusive",
+                        )
+                        .into());
+                    }
+                }
             } else {
                 None
             };
@@ -1472,18 +1568,13 @@ fn run_batch_cli_inner(
                 source_sample_sequences.try_reserve_exact(request.samples.len())?;
                 source_sample_sequences
                     .extend(request.samples.iter().map(|sample| sample.journal_sequence));
-                let mut selected_strokes = Vec::new();
-                selected_strokes.try_reserve_exact(request.stroke_views.len())?;
-                selected_strokes.extend(request.stroke_views.iter().map(|view| {
-                    BenchmarkStrokeRefV1 {
-                        journal_id: view.stroke.journal_id.clone(),
-                        session_id: view.stroke.session_id.clone(),
-                        source_api: view.stroke.source_api.clone(),
-                        device_id: view.stroke.device_id.clone(),
-                        pointer_id: view.stroke.pointer_id,
-                        stroke_id: view.stroke.stroke_id.clone(),
-                    }
-                }));
+                let selected_strokes = benchmark_selected_strokes_from_request(&request)?;
+                let generated_raster_origin = generated_raster_origin_for_request(
+                    &request,
+                    raster.as_ref(),
+                    &canonical_ink_comparison_binding,
+                    &selected_strokes,
+                )?;
                 let (raster_input_byte_count, raster_input_sha256) = raster_provenance_for_request(
                     &request.requested_input_modalities,
                     raster.as_ref(),
@@ -1500,6 +1591,7 @@ fn run_batch_cli_inner(
                     source_revision: request.source_revision.clone(),
                     input_view_id: request.input_view_id.clone(),
                     canonical_ink_comparison_binding,
+                    generated_raster_origin,
                     requested_input_modalities: request.requested_input_modalities.clone(),
                     selected_strokes,
                     source_sample_sequences,
@@ -1603,6 +1695,7 @@ struct BenchmarkRunBase<'a> {
     source_revision: ProviderSourceRevisionV1,
     input_view_id: String,
     canonical_ink_comparison_binding: BenchmarkCanonicalInkComparisonBindingV1,
+    generated_raster_origin: Option<BenchmarkGeneratedRasterOriginV1>,
     requested_input_modalities: Vec<ProviderInputCapabilityV1>,
     selected_strokes: Vec<BenchmarkStrokeRefV1>,
     source_sample_sequences: Vec<u64>,
@@ -1747,6 +1840,7 @@ fn successful_run_record(
         source_revision: base.source_revision,
         input_view_id: base.input_view_id,
         canonical_ink_comparison_binding: Some(base.canonical_ink_comparison_binding),
+        generated_raster_origin: base.generated_raster_origin,
         requested_input_modalities: base.requested_input_modalities,
         selected_strokes: base.selected_strokes,
         source_sample_sequences: base.source_sample_sequences,
@@ -1831,6 +1925,7 @@ fn failed_run_record(
         source_revision: base.source_revision,
         input_view_id: base.input_view_id,
         canonical_ink_comparison_binding: Some(base.canonical_ink_comparison_binding),
+        generated_raster_origin: base.generated_raster_origin,
         requested_input_modalities: base.requested_input_modalities,
         selected_strokes: base.selected_strokes,
         source_sample_sequences: base.source_sample_sequences,
@@ -2026,6 +2121,7 @@ fn validate_case_manifest(manifest: &BenchmarkCaseManifestV1) -> io::Result<()> 
         if !case_ids.insert(case.case_id.as_str()) {
             return Err(invalid_data("case IDs must be unique"));
         }
+        validate_raster_source_declaration(case.raster.as_ref(), case.generated_raster.as_ref())?;
         require_local_absolute_path(&case.journal_path, "journal path")?;
         let journal_metadata = fs::symlink_metadata(&case.journal_path)?;
         if journal_metadata.file_type().is_symlink() || !journal_metadata.is_file() {
@@ -2107,6 +2203,74 @@ fn validate_case_manifest(manifest: &BenchmarkCaseManifestV1) -> io::Result<()> 
     Ok(())
 }
 
+fn validate_raster_source_declaration(
+    file_raster: Option<&BenchmarkRasterInputSpecV1>,
+    generated_raster: Option<&BenchmarkGeneratedRasterSpecV1>,
+) -> io::Result<()> {
+    if file_raster.is_some() && generated_raster.is_some() {
+        return Err(invalid_data(
+            "file raster and generated raster sources are mutually exclusive",
+        ));
+    }
+    if let Some(spec) = generated_raster {
+        validate_generated_raster_spec(spec)?;
+    }
+    Ok(())
+}
+
+fn validate_generated_raster_spec(spec: &BenchmarkGeneratedRasterSpecV1) -> io::Result<()> {
+    if spec.projection_schema_version != 1
+        || spec.output_width_px == 0
+        || spec.output_height_px == 0
+        || spec.output_width_px > MAX_GENERATED_RASTER_OUTPUT_DIMENSION
+        || spec.output_height_px > MAX_GENERATED_RASTER_OUTPUT_DIMENSION
+    {
+        return Err(invalid_data(
+            "generated raster projection version or output dimensions are unsupported",
+        ));
+    }
+    let output_pixels = u64::from(spec.output_width_px)
+        .checked_mul(u64::from(spec.output_height_px))
+        .ok_or_else(|| invalid_data("generated raster output pixel count overflowed"))?;
+    let output_bytes = output_pixels
+        .checked_mul(4)
+        .ok_or_else(|| invalid_data("generated raster output byte count overflowed"))?;
+    if output_pixels > MAX_GENERATED_RASTER_OUTPUT_PIXELS
+        || output_bytes > MAX_GENERATED_RASTER_OUTPUT_BYTES
+    {
+        return Err(invalid_data(
+            "generated raster output exceeds the canonical pixel or byte cap",
+        ));
+    }
+
+    let crop_width = i128::from(spec.source_crop.right_px_exclusive)
+        - i128::from(spec.source_crop.left_px);
+    let crop_height = i128::from(spec.source_crop.bottom_px_exclusive)
+        - i128::from(spec.source_crop.top_px);
+    if crop_width <= 0
+        || crop_height <= 0
+        || crop_width > MAX_GENERATED_RASTER_CROP_DIMENSION
+        || crop_height > MAX_GENERATED_RASTER_CROP_DIMENSION
+    {
+        return Err(invalid_data(
+            "generated raster source crop is empty, reversed, or exceeds its dimension cap",
+        ));
+    }
+    let crop_area = crop_width
+        .checked_mul(crop_height)
+        .ok_or_else(|| invalid_data("generated raster crop area overflowed"))?;
+    if crop_area > MAX_GENERATED_RASTER_CROP_AREA {
+        return Err(invalid_data(
+            "generated raster source crop exceeds its area cap",
+        ));
+    }
+    Ok(())
+}
+
+fn case_has_raster_source(case: &BenchmarkCaseSpecV1) -> bool {
+    case.raster.is_some() || case.generated_raster.is_some()
+}
+
 fn validate_provider_input_modalities(modalities: &[ProviderInputCapabilityV1]) -> io::Result<()> {
     if modalities.is_empty() || modalities.len() > MAX_BENCHMARK_INPUT_MODALITIES {
         return Err(invalid_data(
@@ -2128,6 +2292,7 @@ fn resolve_provider_input_modalities(
     case: &BenchmarkCaseSpecV1,
     provider_modalities: Option<&[ProviderInputCapabilityV1]>,
 ) -> io::Result<Vec<ProviderInputCapabilityV1>> {
+    validate_raster_source_declaration(case.raster.as_ref(), case.generated_raster.as_ref())?;
     let has_provider_override = provider_modalities.is_some();
     let resolved = provider_modalities.unwrap_or(&case.requested_input_modalities);
     validate_provider_input_modalities(resolved)?;
@@ -2136,14 +2301,14 @@ fn resolve_provider_input_modalities(
         let legacy_requests_raster = case
             .requested_input_modalities
             .contains(&ProviderInputCapabilityV1::Raster);
-        if case.raster.is_some() && !legacy_requests_raster {
+        if case_has_raster_source(case) && !legacy_requests_raster {
             return Err(invalid_data(
-                "raster input is present but raster modality was not requested",
+                "raster source is present but raster modality was not requested",
             ));
         }
-        if case.raster.is_none() && legacy_requests_raster {
+        if !case_has_raster_source(case) && legacy_requests_raster {
             return Err(invalid_data(
-                "raster modality was requested without an explicit raster input",
+                "raster modality was requested without an explicit raster source",
             ));
         }
     }
@@ -2155,9 +2320,9 @@ fn resolve_provider_input_modalities(
                     "provider selected online strokes without case stroke data",
                 ));
             }
-            ProviderInputCapabilityV1::Raster if case.raster.is_none() => {
+            ProviderInputCapabilityV1::Raster if !case_has_raster_source(case) => {
                 return Err(invalid_data(
-                    "provider selected raster without case raster data",
+                    "provider selected raster without case raster source",
                 ));
             }
             _ => {}
@@ -2431,6 +2596,7 @@ struct LoadedRasterInput {
     request_input: ProviderRasterInputV1,
     byte_count: u64,
     sha256_hex: String,
+    generated_origin: Option<BenchmarkGeneratedRasterProducerV1>,
 }
 
 fn read_raster_input(spec: &BenchmarkRasterInputSpecV1) -> io::Result<LoadedRasterInput> {
@@ -2446,6 +2612,188 @@ fn read_raster_input(spec: &BenchmarkRasterInputSpecV1) -> io::Result<LoadedRast
         },
         byte_count: bytes.len() as u64,
         sha256_hex: hex_encode(&Sha256::digest(&bytes))?,
+        generated_origin: None,
+    })
+}
+
+fn validate_generated_raster_png_size(byte_count: usize) -> io::Result<u64> {
+    let byte_count = u64::try_from(byte_count)
+        .map_err(|_| invalid_data("generated raster PNG byte count exceeds u64"))?;
+    if byte_count == 0 || byte_count > MAX_RASTER_INPUT_BYTES {
+        return Err(invalid_data(
+            "generated raster PNG is empty or exceeds the 1 MiB provider intake cap",
+        ));
+    }
+    Ok(byte_count)
+}
+
+fn materialize_generated_raster(
+    state: &JournalReplayState,
+    expected_source_revision: &ProviderSourceRevisionV1,
+    selected_strokes: &[StrokeRef],
+    generated_spec: &BenchmarkGeneratedRasterSpecV1,
+) -> io::Result<LoadedRasterInput> {
+    validate_generated_raster_spec(generated_spec)?;
+    if ProviderSourceRevisionV1::from_journal(state) != *expected_source_revision {
+        return Err(invalid_data(
+            "generated raster journal state does not match the verified source revision",
+        ));
+    }
+
+    let plan = build_canonical_raster_projection_plan(state, selected_strokes).map_err(|error| {
+        invalid_data(format!("generated raster source projection failed: {error:?}"))
+    })?;
+    let projection_spec = CanonicalRasterProjectionSpecV1::new(
+        generated_spec.output_width_px,
+        generated_spec.output_height_px,
+        CanonicalRasterProjectionCropV1 {
+            left_px: generated_spec.source_crop.left_px,
+            top_px: generated_spec.source_crop.top_px,
+            right_px_exclusive: generated_spec.source_crop.right_px_exclusive,
+            bottom_px_exclusive: generated_spec.source_crop.bottom_px_exclusive,
+        },
+    );
+    let geometry = transform_canonical_raster_geometry(&plan, &projection_spec).map_err(|error| {
+        invalid_data(format!("generated raster geometry transform failed: {error:?}"))
+    })?;
+    let (geometry_journal_id, geometry_logical_revision, geometry_last_sequence) =
+        geometry.source_revision_parts();
+    if geometry_journal_id != expected_source_revision.journal_id
+        || geometry_logical_revision != expected_source_revision.logical_revision
+        || geometry_last_sequence != expected_source_revision.last_sequence
+        || geometry.caller_selection_order() != selected_strokes
+        || geometry.caller_selection_order().len() > MAX_GENERATED_RASTER_PROVENANCE_STROKES
+    {
+        return Err(invalid_data(
+            "generated raster geometry provenance does not match the frozen case selection/revision",
+        ));
+    }
+
+    let mut selected_stroke_refs = Vec::new();
+    selected_stroke_refs
+        .try_reserve_exact(geometry.canonical_stroke_draw_order().len())?;
+    selected_stroke_refs.extend(
+        geometry
+            .canonical_stroke_draw_order()
+            .iter()
+            .map(BenchmarkStrokeRefV1::from),
+    );
+    let mut stroke_draw_order = Vec::new();
+    stroke_draw_order.try_reserve_exact(geometry.canonical_stroke_draw_order().len())?;
+    stroke_draw_order.extend(
+        geometry
+            .canonical_stroke_draw_order()
+            .iter()
+            .map(BenchmarkStrokeRefV1::from),
+    );
+
+    let sequence_count = geometry.physical_sample_sequence_provenance().count();
+    if sequence_count == 0 || sequence_count > MAX_GENERATED_RASTER_PROVENANCE_SAMPLES {
+        return Err(invalid_data(
+            "generated raster physical sequence provenance is empty or exceeds its fixed cap",
+        ));
+    }
+    let mut physical_sample_provenance = Vec::new();
+    physical_sample_provenance.try_reserve_exact(sequence_count)?;
+    let mut previous_journal_sequence = None;
+    for (stroke_ref, journal_sequence, source_sequence_raw) in
+        geometry.physical_sample_sequence_provenance()
+    {
+        if journal_sequence == 0
+            || journal_sequence > expected_source_revision.last_sequence
+            || previous_journal_sequence.is_some_and(|previous| journal_sequence <= previous)
+        {
+            return Err(invalid_data(
+                "generated raster physical sequence provenance is not in the verified journal order",
+            ));
+        }
+        previous_journal_sequence = Some(journal_sequence);
+        physical_sample_provenance.push(BenchmarkGeneratedRasterSampleProvenanceV1 {
+            stroke: BenchmarkStrokeRefV1::from(stroke_ref),
+            journal_sequence,
+            source_sequence_raw,
+        });
+    }
+
+    let image = render_canonical_raster(&geometry)
+        .map_err(|error| invalid_data(format!("generated raster rendering failed: {error:?}")))?;
+    let (image_journal_id, image_logical_revision, image_last_sequence) =
+        image.source_revision_parts();
+    let (output_width_px, output_height_px, row_stride_bytes) =
+        image.output_dimensions_and_stride();
+    let expected_row_stride_bytes = output_width_px
+        .checked_mul(4)
+        .ok_or_else(|| invalid_data("generated raster row stride overflowed u32"))?;
+    if image_journal_id != expected_source_revision.journal_id
+        || image_logical_revision != expected_source_revision.logical_revision
+        || image_last_sequence != expected_source_revision.last_sequence
+        || image.source_content_sha256() != geometry.source_content_sha256()
+        || image.projection_spec_sha256() != geometry.projection_spec_sha256()
+        || image.geometry_sha256() != geometry.geometry_sha256()
+        || output_width_px != generated_spec.output_width_px
+        || output_height_px != generated_spec.output_height_px
+        || row_stride_bytes != expected_row_stride_bytes
+        || image.pixel_layout()
+            != crate::canvas::CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown
+    {
+        return Err(invalid_data(
+            "generated raster image metadata does not match its verified geometry/spec",
+        ));
+    }
+
+    let png_bytes = image.png_bytes();
+    let byte_count = validate_generated_raster_png_size(png_bytes.len())?;
+    let png_sha256: [u8; 32] = Sha256::digest(png_bytes).into();
+    if png_sha256 != image.png_bytes_sha256() {
+        return Err(invalid_data(
+            "generated raster PNG digest does not match actual producer bytes",
+        ));
+    }
+    let sha256_hex = hex_encode(&png_sha256)?;
+    let producer_metadata = BenchmarkGeneratedRasterProducerV1 {
+        schema_version: 1,
+        geometry_schema_version: geometry.geometry_schema_version(),
+        projection_schema_version: geometry.projection_schema_version(),
+        source_revision: expected_source_revision.clone(),
+        selected_strokes: selected_stroke_refs,
+        source_content_sha256: hex_encode(&image.source_content_sha256())?,
+        projection_spec_sha256: hex_encode(&image.projection_spec_sha256())?,
+        geometry_sha256: hex_encode(&image.geometry_sha256())?,
+        renderer_version: image.renderer_version().to_owned(),
+        pixel_bytes_sha256: hex_encode(&image.pixel_bytes_sha256())?,
+        png_bytes_sha256: sha256_hex.clone(),
+        raster_artifact_sha256: hex_encode(&image.raster_artifact_sha256())?,
+        output_width_px,
+        output_height_px,
+        row_stride_bytes,
+        pixel_layout: image.pixel_layout_name().to_owned(),
+        stroke_draw_order,
+        physical_sample_provenance,
+    };
+    if producer_metadata.schema_version != 1
+        || producer_metadata.geometry_schema_version != 1
+        || producer_metadata.projection_schema_version != generated_spec.projection_schema_version
+    {
+        return Err(invalid_data(
+            "generated raster producer schema version does not match the requested canonical spec",
+        ));
+    }
+    let raw_payload_hex = hex_encode(png_bytes)?;
+    // Only the PNG needed by the provider request survives this function;
+    // raw pixels and the encoded PNG are not copied into run metadata.
+    let request_input = ProviderRasterInputV1 {
+        width: output_width_px,
+        height: output_height_px,
+        payload_contract: ProviderRasterPayloadContractV1::OpaqueBytes,
+        coordinate_space: GENERATED_RASTER_COORDINATE_SPACE.to_owned(),
+        units: GENERATED_RASTER_COORDINATE_UNITS.to_owned(),
+        raw_payload_hex,
+    };
+    Ok(LoadedRasterInput {
+        request_input,
+        byte_count,
+        sha256_hex,
+        generated_origin: Some(producer_metadata),
     })
 }
 
@@ -2461,6 +2809,96 @@ fn raster_provenance_for_request(
     } else {
         Ok((None, None))
     }
+}
+
+fn generated_raster_origin_for_request(
+    request: &RecognitionRequestV1,
+    raster: Option<&LoadedRasterInput>,
+    canonical_binding: &BenchmarkCanonicalInkComparisonBindingV1,
+    request_selected_strokes: &[BenchmarkStrokeRefV1],
+) -> io::Result<Option<BenchmarkGeneratedRasterOriginV1>> {
+    if !request
+        .requested_input_modalities
+        .contains(&ProviderInputCapabilityV1::Raster)
+    {
+        return Ok(None);
+    }
+    let raster = raster.ok_or_else(|| {
+        invalid_data("raster request has no materialized case raster input")
+    })?;
+    let request_raster = request
+        .raster
+        .as_ref()
+        .ok_or_else(|| invalid_data("raster request omitted its raster payload"))?;
+    if request_raster != &raster.request_input {
+        return Err(invalid_data(
+            "request raster differs from the materialized case raster source",
+        ));
+    }
+    let Some(producer) = &raster.generated_origin else {
+        return Ok(None);
+    };
+    if !request_selected_strokes_match_request(request, request_selected_strokes) {
+        return Err(invalid_data(
+            "generated raster selection was not derived from the built request stroke views",
+        ));
+    }
+    if producer.source_revision != request.source_revision
+        || producer.selected_strokes != request_selected_strokes
+        || producer.output_width_px != request_raster.width
+        || producer.output_height_px != request_raster.height
+        || producer.png_bytes_sha256 != raster.sha256_hex
+        || canonical_binding.schema_version != CANONICAL_INK_COMPARISON_BINDING_SCHEMA_VERSION
+        || canonical_binding.raster_pixel_parity != BenchmarkRasterPixelParityV1::Unverified
+    {
+        return Err(invalid_data(
+            "generated raster provenance does not match the exact request revision, selection, or bytes",
+        ));
+    }
+    validate_sha256_hex(
+        &canonical_binding.sha256_hex,
+        "generated raster canonical-ink binding SHA-256",
+    )?;
+    Ok(Some(BenchmarkGeneratedRasterOriginV1 {
+        schema_version: 1,
+        canonical_ink_comparison_binding_sha256: canonical_binding.sha256_hex.clone(),
+        producer: producer.clone(),
+    }))
+}
+
+fn benchmark_selected_strokes_from_request(
+    request: &RecognitionRequestV1,
+) -> io::Result<Vec<BenchmarkStrokeRefV1>> {
+    let mut selected_strokes = Vec::new();
+    selected_strokes.try_reserve_exact(request.stroke_views.len())?;
+    selected_strokes.extend(request.stroke_views.iter().map(|view| BenchmarkStrokeRefV1 {
+        journal_id: view.stroke.journal_id.clone(),
+        session_id: view.stroke.session_id.clone(),
+        source_api: view.stroke.source_api.clone(),
+        device_id: view.stroke.device_id.clone(),
+        pointer_id: view.stroke.pointer_id,
+        stroke_id: view.stroke.stroke_id.clone(),
+    }));
+    Ok(selected_strokes)
+}
+
+fn request_selected_strokes_match_request(
+    request: &RecognitionRequestV1,
+    selected_strokes: &[BenchmarkStrokeRefV1],
+) -> bool {
+    request.stroke_views.len() == selected_strokes.len()
+        && request
+            .stroke_views
+            .iter()
+            .zip(selected_strokes)
+            .all(|(view, selected)| {
+                view.stroke.journal_id == selected.journal_id
+                    && view.stroke.session_id == selected.session_id
+                    && view.stroke.source_api == selected.source_api
+                    && view.stroke.device_id == selected.device_id
+                    && view.stroke.pointer_id == selected.pointer_id
+                    && view.stroke.stroke_id == selected.stroke_id
+            })
 }
 
 fn read_bounded_regular_file(path: &Path, maximum: u64) -> io::Result<Vec<u8>> {
@@ -3421,6 +3859,8 @@ fn nearest_rank(values: &[f64], percentile: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canvas::PROVISIONAL_DIRECT_SOURCE_API;
+    use crate::journal::{JournalHeader, JournalWriter, PhysicalSample, RawPosition, StrokeViewFrame};
     use crate::provider_protocol::{
         ProviderNativeTimestampV1, ProviderPositionV1, ProviderStrokeRefV1, ProviderViewFrameV1,
     };
@@ -3499,7 +3939,203 @@ mod tests {
                 pressure_curve: None,
             },
             raster: None,
+            generated_raster: None,
         }
+    }
+
+    fn generated_raster_spec() -> BenchmarkGeneratedRasterSpecV1 {
+        BenchmarkGeneratedRasterSpecV1 {
+            projection_schema_version: 1,
+            output_width_px: 100,
+            output_height_px: 100,
+            source_crop: BenchmarkGeneratedRasterCropV1 {
+                left_px: 0,
+                top_px: 0,
+                right_px_exclusive: 100,
+                bottom_px_exclusive: 100,
+            },
+        }
+    }
+
+    fn generated_raster_journal_fixture() -> (JournalReplayState, StrokeRef) {
+        let directory = temp_dir("generated-raster-source");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("source.lj");
+        let header = JournalHeader {
+            journal_id: "generated-raster-journal".to_owned(),
+            session_id: "generated-raster-session".to_owned(),
+            config_id: Some("generated-raster-config".to_owned()),
+            device_model_declared: None,
+            tilt_supported_declared: None,
+        };
+        let target = StrokeRef {
+            journal_id: header.journal_id.clone(),
+            session_id: header.session_id.clone(),
+            source_api: PROVISIONAL_DIRECT_SOURCE_API.to_owned(),
+            device_id: Some("generated-raster-device".to_owned()),
+            pointer_id: Some(5),
+            stroke_id: "generated-raster-stroke".to_owned(),
+        };
+        let mut writer = JournalWriter::create(path.clone(), header).unwrap();
+        writer
+            .start_stroke(target.clone(), StrokeViewFrame::default(), 1)
+            .unwrap();
+        writer
+            .append_sample(PhysicalSample {
+                session_id: target.session_id.clone(),
+                source_api: target.source_api.clone(),
+                source_device_id: target.device_id.clone(),
+                pointer_id: target.pointer_id,
+                stroke_id: Some(target.stroke_id.clone()),
+                source_sequence: 91,
+                config_id: Some("generated-raster-config".to_owned()),
+                app_arrival_elapsed_ns: 2,
+                position: Some(RawPosition {
+                    coordinate_space: "windows-screen-coordinates".to_owned(),
+                    units: "screen-pixel".to_owned(),
+                    x_raw: 50,
+                    y_raw: 80,
+                }),
+                pressure: None,
+                native_timestamp: None,
+                contact_range_state: Some("in_contact".to_owned()),
+                button_state_raw: None,
+                tilt_x_raw: None,
+                tilt_y_raw: None,
+                rotation_raw: None,
+                raw_payload: vec![0xd3; 128],
+            })
+            .unwrap();
+        writer.commit_stroke(target.clone(), 3).unwrap();
+        writer.flush().unwrap();
+        let state = writer.replay_state().clone();
+        drop(writer);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+        (state, target)
+    }
+
+    fn interleaved_generated_raster_journal_fixture() -> (JournalReplayState, StrokeRef, StrokeRef) {
+        let directory = temp_dir("generated-raster-interleaved");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("source.lj");
+        let header = JournalHeader {
+            journal_id: "generated-raster-interleaved-journal".to_owned(),
+            session_id: "generated-raster-interleaved-session".to_owned(),
+            config_id: Some("generated-raster-interleaved-config".to_owned()),
+            device_model_declared: None,
+            tilt_supported_declared: None,
+        };
+        let first = StrokeRef {
+            journal_id: header.journal_id.clone(),
+            session_id: header.session_id.clone(),
+            source_api: PROVISIONAL_DIRECT_SOURCE_API.to_owned(),
+            device_id: Some("generated-raster-device-a".to_owned()),
+            pointer_id: Some(5),
+            stroke_id: "generated-raster-stroke-a".to_owned(),
+        };
+        let second = StrokeRef {
+            journal_id: header.journal_id.clone(),
+            session_id: header.session_id.clone(),
+            source_api: PROVISIONAL_DIRECT_SOURCE_API.to_owned(),
+            device_id: Some("generated-raster-device-b".to_owned()),
+            pointer_id: Some(6),
+            stroke_id: "generated-raster-stroke-b".to_owned(),
+        };
+        let mut writer = JournalWriter::create(path.clone(), header).unwrap();
+        let frame = StrokeViewFrame::default();
+        writer.start_stroke(first.clone(), frame, 1).unwrap();
+        writer.start_stroke(second.clone(), frame, 2).unwrap();
+        let append_sample = |target: &StrokeRef,
+                             source_sequence: u64,
+                             x_raw: i64,
+                             y_raw: i64,
+                             app_arrival_elapsed_ns: u128,
+                             raw_payload: Vec<u8>| {
+            PhysicalSample {
+                session_id: target.session_id.clone(),
+                source_api: target.source_api.clone(),
+                source_device_id: target.device_id.clone(),
+                pointer_id: target.pointer_id,
+                stroke_id: Some(target.stroke_id.clone()),
+                source_sequence,
+                config_id: Some("generated-raster-interleaved-config".to_owned()),
+                app_arrival_elapsed_ns,
+                position: Some(RawPosition {
+                    coordinate_space: "windows-screen-coordinates".to_owned(),
+                    units: "screen-pixel".to_owned(),
+                    x_raw,
+                    y_raw,
+                }),
+                pressure: None,
+                native_timestamp: None,
+                contact_range_state: Some("in_contact".to_owned()),
+                button_state_raw: None,
+                tilt_x_raw: None,
+                tilt_y_raw: None,
+                rotation_raw: None,
+                raw_payload,
+            }
+        };
+        writer
+            .append_sample(append_sample(&first, 501, 20, 80, 3, vec![0xa1]))
+            .unwrap();
+        writer
+            .append_sample(append_sample(&second, 601, 60, 80, 4, vec![0xb1]))
+            .unwrap();
+        writer
+            .append_sample(append_sample(&first, 502, 40, 80, 5, vec![0xa2]))
+            .unwrap();
+        writer.commit_stroke(first.clone(), 6).unwrap();
+        writer.commit_stroke(second.clone(), 7).unwrap();
+        writer.flush().unwrap();
+        let state = writer.replay_state().clone();
+        drop(writer);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+        (state, first, second)
+    }
+
+    fn generated_raster_request(
+        state: &JournalReplayState,
+        target: &StrokeRef,
+        configuration_id: &str,
+        requested_input_modalities: Vec<ProviderInputCapabilityV1>,
+        raster: Option<ProviderRasterInputV1>,
+    ) -> RecognitionRequestV1 {
+        generated_raster_request_for_strokes(
+            state,
+            std::slice::from_ref(target),
+            configuration_id,
+            requested_input_modalities,
+            raster,
+        )
+    }
+
+    fn generated_raster_request_for_strokes(
+        state: &JournalReplayState,
+        selected_strokes: &[StrokeRef],
+        configuration_id: &str,
+        requested_input_modalities: Vec<ProviderInputCapabilityV1>,
+        raster: Option<ProviderRasterInputV1>,
+    ) -> RecognitionRequestV1 {
+        build_recognition_request(RecognitionRequestBuildInput {
+            state,
+            request_id: format!("generated-raster-{configuration_id}"),
+            region_id: "generated-raster-region".to_owned(),
+            line_id: "generated-raster-line".to_owned(),
+            coordinate_space: "document".to_owned(),
+            coordinate_units: "px".to_owned(),
+            language_hints: vec!["vi-VN".to_owned()],
+            requested_input_modalities,
+            provider_configuration: ProviderConfigurationV1 {
+                configuration_id: configuration_id.to_owned(),
+                values: BTreeMap::new(),
+            },
+            selected_strokes,
+            raster,
+        })
+        .unwrap()
     }
 
     fn canonical_comparison_request_fixture() -> RecognitionRequestV1 {
@@ -3769,6 +4405,449 @@ mod tests {
     }
 
     #[test]
+    fn generated_raster_spec_is_versioned_and_bounded() {
+        let valid = generated_raster_spec();
+        assert!(validate_generated_raster_spec(&valid).is_ok());
+
+        let mut unsupported_version = valid;
+        unsupported_version.projection_schema_version = 2;
+        assert!(validate_generated_raster_spec(&unsupported_version).is_err());
+
+        let mut zero_width = valid;
+        zero_width.output_width_px = 0;
+        assert!(validate_generated_raster_spec(&zero_width).is_err());
+
+        let mut output_area_over_cap = valid;
+        output_area_over_cap.output_width_px = 513;
+        output_area_over_cap.output_height_px = 512;
+        assert!(validate_generated_raster_spec(&output_area_over_cap).is_err());
+
+        let mut empty_crop = valid;
+        empty_crop.source_crop.right_px_exclusive = empty_crop.source_crop.left_px;
+        assert!(validate_generated_raster_spec(&empty_crop).is_err());
+
+        let mut crop_dimension_over_cap = valid;
+        crop_dimension_over_cap.source_crop.right_px_exclusive = i32::MAX;
+        assert!(validate_generated_raster_spec(&crop_dimension_over_cap).is_err());
+
+        let mut crop_area_over_cap = valid;
+        crop_area_over_cap.source_crop = BenchmarkGeneratedRasterCropV1 {
+            left_px: -4096,
+            top_px: -4096,
+            right_px_exclusive: 4097,
+            bottom_px_exclusive: 4096,
+        };
+        assert!(validate_generated_raster_spec(&crop_area_over_cap).is_err());
+    }
+
+    #[test]
+    fn legacy_file_raster_manifest_deserializes_without_generated_source_field() {
+        let mut case = case_with_split(
+            "case-1",
+            "writer-1",
+            "session-1",
+            "configuration-1",
+            BenchmarkSplitV1::Train,
+            "annotation-1",
+        );
+        case.requested_input_modalities = vec![ProviderInputCapabilityV1::Raster];
+        case.raster = Some(BenchmarkRasterInputSpecV1 {
+            path: PathBuf::from(r"C:\fixture\blank.png"),
+            width: 1,
+            height: 1,
+            coordinate_space: "document".to_owned(),
+            units: "px".to_owned(),
+        });
+
+        let mut manifest_value = serde_json::to_value(&case).unwrap();
+        let case_object = manifest_value.as_object_mut().unwrap();
+        assert!(case_object.remove("generated_raster").is_none());
+        let decoded: BenchmarkCaseSpecV1 = serde_json::from_value(manifest_value).unwrap();
+
+        assert_eq!(decoded.raster, case.raster);
+        assert_eq!(decoded.generated_raster, None);
+        assert_eq!(
+            resolve_provider_input_modalities(&decoded, None).unwrap(),
+            vec![ProviderInputCapabilityV1::Raster]
+        );
+    }
+
+    #[test]
+    fn generated_raster_is_a_raster_source_without_capability_fallback() {
+        let mut case = case_with_split(
+            "case-1",
+            "writer-1",
+            "session-1",
+            "configuration-1",
+            BenchmarkSplitV1::Train,
+            "annotation-1",
+        );
+        case.generated_raster = Some(generated_raster_spec());
+        assert!(validate_raster_source_declaration(None, case.generated_raster.as_ref()).is_ok());
+
+        // The legacy default stays OnlineStrokes and retains the old source /
+        // modality consistency rule. An explicit OnlineStrokes override can
+        // ignore a declared generated raster without switching modalities.
+        assert!(resolve_provider_input_modalities(&case, None).is_err());
+        let explicit_online = [ProviderInputCapabilityV1::OnlineStrokes];
+        assert_eq!(
+            resolve_provider_input_modalities(&case, Some(&explicit_online)).unwrap(),
+            explicit_online.to_vec()
+        );
+        let explicit_raster = [ProviderInputCapabilityV1::Raster];
+        assert_eq!(
+            resolve_provider_input_modalities(&case, Some(&explicit_raster)).unwrap(),
+            explicit_raster.to_vec()
+        );
+
+        let file_raster = BenchmarkRasterInputSpecV1 {
+            path: PathBuf::from(r"C:\fixture\blank.png"),
+            width: 1,
+            height: 1,
+            coordinate_space: "document".to_owned(),
+            units: "px".to_owned(),
+        };
+        assert!(validate_raster_source_declaration(
+            Some(&file_raster),
+            case.generated_raster.as_ref()
+        )
+        .is_err());
+
+        case.generated_raster = None;
+        assert!(resolve_provider_input_modalities(&case, Some(&explicit_raster)).is_err());
+
+        case.generated_raster = Some(generated_raster_spec());
+        case.requested_input_modalities = vec![ProviderInputCapabilityV1::Raster];
+        assert_eq!(
+            resolve_provider_input_modalities(&case, None).unwrap(),
+            explicit_raster.to_vec()
+        );
+    }
+
+    #[test]
+    fn generated_raster_materializes_once_and_links_origin_to_each_request() {
+        let (state, target) = generated_raster_journal_fixture();
+        let source_revision = ProviderSourceRevisionV1::from_journal(&state);
+        let selected = [target.clone()];
+        let materialized = materialize_generated_raster(
+            &state,
+            &source_revision,
+            &selected,
+            &generated_raster_spec(),
+        )
+        .unwrap();
+        let raster_modes = vec![ProviderInputCapabilityV1::Raster];
+
+        let request_a = generated_raster_request(
+            &state,
+            &target,
+            "generated-raster-config-a",
+            raster_modes.clone(),
+            Some(materialized.request_input.clone()),
+        );
+        let binding_a = canonical_ink_comparison_binding(&request_a).unwrap();
+        let selected_a = benchmark_selected_strokes_from_request(&request_a).unwrap();
+        let origin_a = generated_raster_origin_for_request(
+            &request_a,
+            Some(&materialized),
+            &binding_a,
+            &selected_a,
+        )
+        .unwrap()
+        .unwrap();
+
+        let request_b = generated_raster_request(
+            &state,
+            &target,
+            "generated-raster-config-b",
+            raster_modes,
+            Some(materialized.request_input.clone()),
+        );
+        let binding_b = canonical_ink_comparison_binding(&request_b).unwrap();
+        let selected_b = benchmark_selected_strokes_from_request(&request_b).unwrap();
+        let origin_b = generated_raster_origin_for_request(
+            &request_b,
+            Some(&materialized),
+            &binding_b,
+            &selected_b,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(request_a.input_view_id, request_b.input_view_id);
+        assert_eq!(binding_a, binding_b);
+        assert_eq!(origin_a, origin_b);
+        assert_eq!(origin_a.schema_version, 1);
+        assert_eq!(
+            origin_a.canonical_ink_comparison_binding_sha256,
+            binding_a.sha256_hex
+        );
+        assert_eq!(
+            binding_a.raster_pixel_parity,
+            BenchmarkRasterPixelParityV1::Unverified
+        );
+        assert_eq!(origin_a.producer.source_revision, request_a.source_revision);
+        assert_eq!(origin_a.producer.selected_strokes, selected_a);
+        assert_eq!(origin_a.producer.stroke_draw_order, selected_a);
+        assert_eq!(origin_a.producer.physical_sample_provenance.len(), 1);
+        assert_eq!(
+            origin_a.producer.physical_sample_provenance[0].source_sequence_raw,
+            91
+        );
+        assert_eq!(origin_a.producer.output_width_px, 100);
+        assert_eq!(origin_a.producer.output_height_px, 100);
+        assert_eq!(origin_a.producer.row_stride_bytes, 400);
+        assert_eq!(
+            origin_a.producer.pixel_layout,
+            "rgba8_premultiplied_srgb_top_down"
+        );
+        assert_eq!(
+            origin_a.producer.png_bytes_sha256,
+            materialized.sha256_hex
+        );
+        let serialized_origin = serde_json::to_string(&origin_a).unwrap();
+        let raw_sample_payload_hex = "d3".repeat(128);
+        assert!(!serialized_origin.contains(&materialized.request_input.raw_payload_hex));
+        assert!(!serialized_origin.contains(&raw_sample_payload_hex));
+        assert!(!serialized_origin.contains("generated-raster-config"));
+        assert!(!serialized_origin.contains("C:\\"));
+        let raster_provenance = raster_provenance_for_request(
+            &request_a.requested_input_modalities,
+            Some(&materialized),
+        )
+        .unwrap();
+        assert_eq!(
+            raster_provenance,
+            (Some(materialized.byte_count), Some(materialized.sha256_hex.clone()))
+        );
+        assert!(materialized.byte_count <= MAX_RASTER_INPUT_BYTES);
+    }
+
+    #[test]
+    fn generated_raster_origin_uses_journal_order_for_interleaved_strokes() {
+        let (state, first, second) = interleaved_generated_raster_journal_fixture();
+        let source_revision = ProviderSourceRevisionV1::from_journal(&state);
+        let caller_selection = [second.clone(), first.clone()];
+        let raw_samples_before = state
+            .physical_samples
+            .iter()
+            .map(|sample| sample.sample.clone())
+            .collect::<Vec<_>>();
+        let physical_journal_sequences = state
+            .physical_samples
+            .iter()
+            .map(|sample| sample.sequence)
+            .collect::<Vec<_>>();
+
+        let materialized = materialize_generated_raster(
+            &state,
+            &source_revision,
+            &caller_selection,
+            &generated_raster_spec(),
+        )
+        .unwrap();
+        let request = generated_raster_request_for_strokes(
+            &state,
+            &caller_selection,
+            "generated-raster-interleaved-config-a",
+            vec![ProviderInputCapabilityV1::Raster],
+            Some(materialized.request_input.clone()),
+        );
+        let binding = canonical_ink_comparison_binding(&request).unwrap();
+        let request_strokes = benchmark_selected_strokes_from_request(&request).unwrap();
+        let origin = generated_raster_origin_for_request(
+            &request,
+            Some(&materialized),
+            &binding,
+            &request_strokes,
+        )
+        .unwrap()
+        .unwrap();
+
+        let canonical_strokes = vec![
+            BenchmarkStrokeRefV1::from(&first),
+            BenchmarkStrokeRefV1::from(&second),
+        ];
+        assert_eq!(request_strokes, canonical_strokes);
+        assert_eq!(origin.producer.selected_strokes, canonical_strokes);
+        assert_eq!(origin.producer.stroke_draw_order, canonical_strokes);
+        assert_eq!(
+            origin
+                .producer
+                .physical_sample_provenance
+                .iter()
+                .map(|sample| sample.source_sequence_raw)
+                .collect::<Vec<_>>(),
+            vec![501, 601, 502]
+        );
+        assert_eq!(
+            origin
+                .producer
+                .physical_sample_provenance
+                .iter()
+                .map(|sample| sample.journal_sequence)
+                .collect::<Vec<_>>(),
+            physical_journal_sequences
+        );
+        assert_eq!(
+            state
+                .physical_samples
+                .iter()
+                .map(|sample| sample.sample.clone())
+                .collect::<Vec<_>>(),
+            raw_samples_before
+        );
+    }
+
+    #[test]
+    fn generated_raster_rejects_mismatched_revision_selection_and_oversized_png() {
+        let (state, target) = generated_raster_journal_fixture();
+        let source_revision = ProviderSourceRevisionV1::from_journal(&state);
+        let selected = [target.clone()];
+        let spec = generated_raster_spec();
+        assert_eq!(
+            validate_generated_raster_png_size(
+                usize::try_from(MAX_RASTER_INPUT_BYTES).unwrap()
+            )
+            .unwrap(),
+            MAX_RASTER_INPUT_BYTES
+        );
+        assert!(validate_generated_raster_png_size(
+            usize::try_from(MAX_RASTER_INPUT_BYTES).unwrap() + 1
+        )
+        .is_err());
+
+        let mut wrong_revision = source_revision.clone();
+        wrong_revision.last_sequence += 1;
+        assert!(materialize_generated_raster(&state, &wrong_revision, &selected, &spec).is_err());
+
+        let mut wrong_target = target.clone();
+        wrong_target.stroke_id.push_str("-other");
+        assert!(
+            materialize_generated_raster(&state, &source_revision, &[wrong_target], &spec).is_err()
+        );
+
+        let materialized =
+            materialize_generated_raster(&state, &source_revision, &selected, &spec).unwrap();
+        let request = generated_raster_request(
+            &state,
+            &target,
+            "generated-raster-config-a",
+            vec![ProviderInputCapabilityV1::Raster],
+            Some(materialized.request_input.clone()),
+        );
+        let binding = canonical_ink_comparison_binding(&request).unwrap();
+        let request_strokes = benchmark_selected_strokes_from_request(&request).unwrap();
+
+        let mut stale_request = request.clone();
+        stale_request.source_revision.logical_revision += 1;
+        let stale_strokes = benchmark_selected_strokes_from_request(&stale_request).unwrap();
+        assert!(generated_raster_origin_for_request(
+            &stale_request,
+            Some(&materialized),
+            &binding,
+            &stale_strokes,
+        )
+        .is_err());
+
+        let mut wrong_selection_request = request;
+        wrong_selection_request.stroke_views[0].stroke.stroke_id.push_str("-other");
+        let wrong_request_strokes =
+            benchmark_selected_strokes_from_request(&wrong_selection_request).unwrap();
+        assert!(generated_raster_origin_for_request(
+            &wrong_selection_request,
+            Some(&materialized),
+            &binding,
+            &wrong_request_strokes,
+        )
+        .is_err());
+        let expected_request_strokes = selected
+            .iter()
+            .map(BenchmarkStrokeRefV1::from)
+            .collect::<Vec<_>>();
+        assert_eq!(request_strokes, expected_request_strokes);
+    }
+
+    #[test]
+    fn file_raster_and_online_only_rows_have_no_generated_origin() {
+        let (state, target) = generated_raster_journal_fixture();
+        let source_revision = ProviderSourceRevisionV1::from_journal(&state);
+        let target_refs = [target.clone()];
+        let generated = materialize_generated_raster(
+            &state,
+            &source_revision,
+            &target_refs,
+            &generated_raster_spec(),
+        )
+        .unwrap();
+
+        let directory = temp_dir("external-raster-input");
+        fs::create_dir(&directory).unwrap();
+        let raster_path = directory.join("external.bin");
+        let file_bytes = [0x10, 0x20, 0x30, 0xff];
+        fs::write(&raster_path, file_bytes).unwrap();
+        let file_raster = read_raster_input(&BenchmarkRasterInputSpecV1 {
+            path: raster_path.clone(),
+            width: 1,
+            height: 1,
+            coordinate_space: "document".to_owned(),
+            units: "px".to_owned(),
+        })
+        .unwrap();
+        assert!(file_raster.generated_origin.is_none());
+        let file_request = generated_raster_request(
+            &state,
+            &target,
+            "external-file-config",
+            vec![ProviderInputCapabilityV1::Raster],
+            Some(file_raster.request_input.clone()),
+        );
+        let file_binding = canonical_ink_comparison_binding(&file_request).unwrap();
+        let file_selected = benchmark_selected_strokes_from_request(&file_request).unwrap();
+        assert_eq!(
+            generated_raster_origin_for_request(
+                &file_request,
+                Some(&file_raster),
+                &file_binding,
+                &file_selected,
+            )
+            .unwrap(),
+            None
+        );
+
+        let online_request = generated_raster_request(
+            &state,
+            &target,
+            "online-only-config",
+            vec![ProviderInputCapabilityV1::OnlineStrokes],
+            None,
+        );
+        let online_binding = canonical_ink_comparison_binding(&online_request).unwrap();
+        let online_selected = benchmark_selected_strokes_from_request(&online_request).unwrap();
+        assert_eq!(
+            generated_raster_origin_for_request(
+                &online_request,
+                Some(&generated),
+                &online_binding,
+                &online_selected,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            raster_provenance_for_request(
+                &online_request.requested_input_modalities,
+                Some(&generated)
+            )
+            .unwrap(),
+            (None, None)
+        );
+
+        fs::remove_file(raster_path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
     fn raster_provenance_is_attributed_only_to_requests_selecting_raster() {
         let raster_hash = "a".repeat(64);
         let raster = LoadedRasterInput {
@@ -3782,6 +4861,7 @@ mod tests {
             },
             byte_count: 1,
             sha256_hex: raster_hash.clone(),
+            generated_origin: None,
         };
         let online_only = [ProviderInputCapabilityV1::OnlineStrokes];
         let raster_only = [ProviderInputCapabilityV1::Raster];
