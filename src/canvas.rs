@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 use tiny_skia::{
-    Color, ColorSpace, FillRule, IntSize, LineCap, LineJoin, Paint, PathBuilder, Pixmap,
-    Stroke, Transform as RasterTransform,
+    Color, ColorSpace, FillRule, IntSize, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke,
+    Transform as RasterTransform,
 };
 
 use crate::journal::{
@@ -2610,8 +2610,8 @@ pub(crate) fn render_canonical_raster(
     pixels.resize(pixel_byte_count, 0);
     let pixmap_size = IntSize::from_wh(geometry.output_width_px, geometry.output_height_px)
         .ok_or(CanvasError::RasterAllocationFailed)?;
-    let mut pixmap = Pixmap::from_vec(pixels, pixmap_size)
-        .ok_or(CanvasError::RasterAllocationFailed)?;
+    let mut pixmap =
+        Pixmap::from_vec(pixels, pixmap_size).ok_or(CanvasError::RasterAllocationFailed)?;
     pixmap.fill(Color::from_rgba8(
         geometry.spec.background_rgba[0],
         geometry.spec.background_rgba[1],
@@ -2634,9 +2634,7 @@ pub(crate) fn render_canonical_raster(
     paint.colorspace = ColorSpace::FullSRGBGamma;
     paint.force_hq_pipeline = true;
 
-    let stroke_width = checked_q16_to_renderer_f32(i64::from(
-        geometry.spec.stroke_width_16_16,
-    ))?;
+    let stroke_width = checked_q16_to_renderer_f32(i64::from(geometry.spec.stroke_width_16_16))?;
     let mut stroke = Stroke::default();
     stroke.width = stroke_width;
     stroke.line_cap = match geometry.spec.stroke_cap {
@@ -2705,10 +2703,7 @@ pub(crate) fn render_canonical_raster(
 
 #[cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "used by the canonical raster renderer"
-    )
+    expect(dead_code, reason = "used by the canonical raster renderer")
 )]
 fn validate_canonical_raster_geometry_for_render(
     geometry: &CanonicalRasterOutputGeometryV1,
@@ -2800,9 +2795,9 @@ fn validate_canonical_raster_geometry_for_render(
                 geometry.caller_selection_order[..index].contains(stroke)
                     || !geometry.stroke_draw_order.contains(stroke)
             })
-        || counts.iter().any(|(stroke, count)| {
-            !geometry.stroke_draw_order.contains(stroke) || *count == 0
-        })
+        || counts
+            .iter()
+            .any(|(stroke, count)| !geometry.stroke_draw_order.contains(stroke) || *count == 0)
     {
         return Err(CanvasError::InvalidCanonicalRasterProjection(
             "raster stroke ordering or caller-selection provenance is inconsistent",
@@ -2827,10 +2822,7 @@ fn validate_canonical_raster_geometry_for_render(
 
 #[cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "used by the canonical raster renderer"
-    )
+    expect(dead_code, reason = "used by the canonical raster renderer")
 )]
 fn draw_canonical_raster_stroke(
     pixmap: &mut Pixmap,
@@ -2878,9 +2870,9 @@ fn draw_canonical_raster_stroke(
         // A one-sample tap and a quantized/repeated-point stroke use only the
         // observed point. This draws the explicitly specified opaque disc and
         // never manufactures or stores another sample.
-        let (x, y) = first_renderer_point.ok_or(
-            CanvasError::InvalidCanonicalRasterProjection("single-point center is missing"),
-        )?;
+        let (x, y) = first_renderer_point.ok_or(CanvasError::InvalidCanonicalRasterProjection(
+            "single-point center is missing",
+        ))?;
         let radius = stroke.width / 2.0;
         if !radius.is_finite() || radius <= 0.0 {
             return Err(CanvasError::InvalidCanonicalRasterProjection(
@@ -2889,13 +2881,17 @@ fn draw_canonical_raster_stroke(
         }
         let mut circle = PathBuilder::new();
         circle.push_circle(x, y, radius);
-        circle.finish().ok_or(CanvasError::InvalidCanonicalRasterProjection(
-            "canonical tap disc could not be represented",
-        ))?
+        circle
+            .finish()
+            .ok_or(CanvasError::InvalidCanonicalRasterProjection(
+                "canonical tap disc could not be represented",
+            ))?
     } else {
-        builder.finish().ok_or(CanvasError::InvalidCanonicalRasterProjection(
-            "canonical stroke path could not be represented",
-        ))?
+        builder
+            .finish()
+            .ok_or(CanvasError::InvalidCanonicalRasterProjection(
+                "canonical stroke path could not be represented",
+            ))?
     };
 
     if point_count == 1 || all_points_repeat {
@@ -2914,10 +2910,7 @@ fn draw_canonical_raster_stroke(
 
 #[cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "used by the canonical raster renderer"
-    )
+    expect(dead_code, reason = "used by the canonical raster renderer")
 )]
 fn checked_q16_to_renderer_f32(value: i64) -> Result<f32, CanvasError> {
     let coordinate = value as f64 / CANONICAL_RASTER_FIXED_ONE as f64;
@@ -3389,10 +3382,7 @@ fn hash_canonical_raster_geometry(geometry: &CanonicalRasterOutputGeometryV1) ->
 
 #[cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "used by the canonical raster renderer"
-    )
+    expect(dead_code, reason = "used by the canonical raster renderer")
 )]
 fn hash_canonical_raster_artifact(image: &CanonicalRasterImageV1) -> [u8; 32] {
     let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-artifact/v1\0");
@@ -4097,13 +4087,9 @@ mod tests {
         let frame = CanvasViewport::default()
             .stroke_view_frame(CanvasOrigin::default(), 1.0)
             .unwrap();
-        let state =
-            committed_projection_state(&target, frame, &[(4, 20, 60), (5, 40, 60)]);
-        let plan = build_canonical_raster_projection_plan(
-            &state,
-            std::slice::from_ref(&target),
-        )
-        .unwrap();
+        let state = committed_projection_state(&target, frame, &[(4, 20, 60), (5, 40, 60)]);
+        let plan =
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).unwrap();
         let spec = CanonicalRasterProjectionSpecV1::new(
             100,
             100,
@@ -4122,10 +4108,12 @@ mod tests {
         assert_eq!(rendered.output_height_px, 100);
         assert_eq!(rendered.row_stride_bytes, 400);
         assert_eq!(rendered.rgba8_premultiplied_srgb_top_down.len(), 40_000);
-        assert!(rendered
-            .rgba8_premultiplied_srgb_top_down
-            .chunks_exact(4)
-            .all(|pixel| pixel[3] == 255));
+        assert!(
+            rendered
+                .rgba8_premultiplied_srgb_top_down
+                .chunks_exact(4)
+                .all(|pixel| pixel[3] == 255)
+        );
         assert_eq!(
             rendered.pixel_layout,
             CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown
@@ -4134,8 +4122,14 @@ mod tests {
             rendered.renderer_version,
             "tiny-skia/0.12.0;canonical-raster-v1"
         );
-        assert_eq!(rendered.source_content_sha256, geometry.source_content_sha256);
-        assert_eq!(rendered.projection_spec_sha256, geometry.projection_spec_sha256);
+        assert_eq!(
+            rendered.source_content_sha256,
+            geometry.source_content_sha256
+        );
+        assert_eq!(
+            rendered.projection_spec_sha256,
+            geometry.projection_spec_sha256
+        );
         assert_eq!(rendered.geometry_sha256, geometry.geometry_sha256);
         assert_eq!(
             rendered.rgba8_premultiplied_srgb_top_down,
@@ -4151,10 +4145,7 @@ mod tests {
         let expected_pixel_hash: [u8; 32] =
             Sha256::digest(&rendered.rgba8_premultiplied_srgb_top_down).into();
         let expected_png_hash: [u8; 32] = Sha256::digest(&rendered.png_bytes).into();
-        assert_eq!(
-            rendered.pixel_bytes_sha256,
-            expected_pixel_hash
-        );
+        assert_eq!(rendered.pixel_bytes_sha256, expected_pixel_hash);
         assert_eq!(rendered.png_bytes_sha256, expected_png_hash);
         assert_eq!(
             rendered.raster_artifact_sha256,
@@ -4188,11 +4179,8 @@ mod tests {
             .stroke_view_frame(CanvasOrigin::default(), 1.0)
             .unwrap();
         let tap_state = committed_projection_state(&target, frame, &[(7, 30, 50)]);
-        let repeated_state = committed_projection_state(
-            &target,
-            frame,
-            &[(7, 30, 50), (9, 30, 50)],
-        );
+        let repeated_state =
+            committed_projection_state(&target, frame, &[(7, 30, 50), (9, 30, 50)]);
         let spec = CanonicalRasterProjectionSpecV1::new(
             100,
             100,
@@ -4203,23 +4191,21 @@ mod tests {
                 bottom_px_exclusive: 100,
             },
         );
-        let tap_plan = build_canonical_raster_projection_plan(
-            &tap_state,
-            std::slice::from_ref(&target),
-        )
-        .unwrap();
-        let repeated_plan = build_canonical_raster_projection_plan(
-            &repeated_state,
-            std::slice::from_ref(&target),
-        )
-        .unwrap();
+        let tap_plan =
+            build_canonical_raster_projection_plan(&tap_state, std::slice::from_ref(&target))
+                .unwrap();
+        let repeated_plan =
+            build_canonical_raster_projection_plan(&repeated_state, std::slice::from_ref(&target))
+                .unwrap();
         let tap_geometry = transform_canonical_raster_geometry(&tap_plan, &spec).unwrap();
         let repeated_geometry = transform_canonical_raster_geometry(&repeated_plan, &spec).unwrap();
         assert!(tap_geometry.points_in_journal_order[0].is_single_point_stroke);
-        assert!(repeated_geometry
-            .points_in_journal_order
-            .iter()
-            .all(|point| !point.is_single_point_stroke));
+        assert!(
+            repeated_geometry
+                .points_in_journal_order
+                .iter()
+                .all(|point| !point.is_single_point_stroke)
+        );
 
         let tap_image = render_canonical_raster(&tap_geometry).unwrap();
         let repeated_image = render_canonical_raster(&repeated_geometry).unwrap();
@@ -4244,13 +4230,9 @@ mod tests {
         let frame = CanvasViewport::default()
             .stroke_view_frame(CanvasOrigin::default(), 1.0)
             .unwrap();
-        let state =
-            committed_projection_state(&target, frame, &[(1, 10, 60), (2, 12, 62)]);
-        let plan = build_canonical_raster_projection_plan(
-            &state,
-            std::slice::from_ref(&target),
-        )
-        .unwrap();
+        let state = committed_projection_state(&target, frame, &[(1, 10, 60), (2, 12, 62)]);
+        let plan =
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).unwrap();
         let spec = CanonicalRasterProjectionSpecV1::new(
             80,
             80,
