@@ -3318,14 +3318,14 @@ mod tests {
         self, ApprovedBenchmarkProviderV1, BenchmarkAnnotationCaseV1, BenchmarkCaseManifestV1,
         BenchmarkCaseProvenanceV1, BenchmarkCaseSpecV1, BenchmarkClusterKeyV1,
         BenchmarkCorpusManifestV1, BenchmarkProviderManifestV1, BenchmarkRasterInputSpecV1,
-        BenchmarkSplitKeyV1,
-        BenchmarkSplitV1, BenchmarkStrokeRefV1, BenchmarkTimeoutsV1, BenchmarkTokenizationPolicyV1,
-        ProviderArtifactPathV1, ProviderArtifactRoleV1,
+        BenchmarkSplitKeyV1, BenchmarkSplitV1, BenchmarkStrokeRefV1, BenchmarkTimeoutsV1,
+        BenchmarkTokenizationPolicyV1, ProviderArtifactPathV1, ProviderArtifactRoleV1,
     };
     use crate::journal::{
         EditCommand, JournalHeader, JournalMetadata, JournalWriter, MetadataScope,
         StoredEditAction, StoredMetadata, StoredPhysicalSample, StoredStrokeStart,
     };
+    use sha2::{Digest, Sha256};
     use std::{
         collections::BTreeMap,
         fs,
@@ -3333,7 +3333,6 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
-    use sha2::{Digest, Sha256};
     #[cfg(windows)]
     use windows_sys::Win32::{
         Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, WAIT_OBJECT_0},
@@ -4647,9 +4646,7 @@ mod tests {
         for (
             provider_index,
             (configuration_id, mode_label, behavior, requested_modalities, advertised_inputs),
-        ) in
-            provider_configurations.iter().enumerate()
-        {
+        ) in provider_configurations.iter().enumerate() {
             let configuration = ProviderConfigurationV1 {
                 configuration_id: (*configuration_id).to_owned(),
                 values: BTreeMap::from([
@@ -4877,9 +4874,7 @@ mod tests {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         );
         let raster_input_view_id = success_b["input_view_id"].as_str().unwrap();
-        let raster_input_view_hash = raster_input_view_id
-            .strip_prefix("input-view-v1-")
-            .unwrap();
+        let raster_input_view_hash = raster_input_view_id.strip_prefix("input-view-v1-").unwrap();
         assert_eq!(raster_input_view_hash.len(), 16);
         assert!(
             raster_input_view_hash

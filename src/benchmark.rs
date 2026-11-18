@@ -22,13 +22,13 @@ use crate::{
     provider_protocol::{
         OperatorApprovedProviderConfig, ProviderCallTimeouts, ProviderCapabilitiesV1,
         ProviderConfigurationV1, ProviderErrorKind, ProviderExecution, ProviderExecutionError,
-        ProviderIdentityV1, ProviderInputCapabilityV1, ProviderProcessResourcesV1,
-        ProviderRasterInputV1, ProviderRasterPayloadContractV1, ProviderRawResponseFrameV1,
+        ProviderIdentityV1, ProviderInputCapabilityV1, ProviderNativeTimestampV1,
+        ProviderPositionV1, ProviderProcessResourcesV1, ProviderRasterInputV1,
+        ProviderRasterPayloadContractV1, ProviderRawResponseFrameV1,
         ProviderRawResponseTranscriptV1, ProviderSampleV1, ProviderSourceRevisionV1,
         ProviderStrokeRefV1, ProviderStrokeViewV1, ProviderSubmitError, ProviderViewFrameV1,
-        ProviderPositionV1, ProviderNativeTimestampV1, ProviderWorkerHandle, ProviderWorkerPoll,
-        RecognitionRequestBuildInput, RecognitionRequestV1, RecognitionResultV1,
-        build_recognition_request,
+        ProviderWorkerHandle, ProviderWorkerPoll, RecognitionRequestBuildInput,
+        RecognitionRequestV1, RecognitionResultV1, build_recognition_request,
     },
     session::publish_no_clobber,
 };
@@ -909,8 +909,11 @@ fn canonical_ink_comparison_binding(
         stroke_views: &request.stroke_views,
         samples: &request.samples,
     };
-    let fingerprint_bytes = serde_json::to_vec(&fingerprint)
-        .map_err(|error| invalid_data(format!("canonical-ink fingerprint serialization failed: {error}")))?;
+    let fingerprint_bytes = serde_json::to_vec(&fingerprint).map_err(|error| {
+        invalid_data(format!(
+            "canonical-ink fingerprint serialization failed: {error}"
+        ))
+    })?;
     if fingerprint_bytes.len() > MAX_CANONICAL_INK_COMPARISON_BINDING_BYTES {
         return Err(invalid_data(
             "canonical-ink comparison binding exceeds its fixed byte cap",
@@ -1397,9 +1400,9 @@ fn run_batch_cli_inner(
             selected_strokes.try_reserve_exact(case.selected_strokes.len())?;
             selected_strokes.extend(case.selected_strokes.iter().map(StrokeRef::from));
             let modalities_for_case = &provider_input_modalities_by_case[case_index];
-            let raster_is_selected = modalities_for_case.iter().any(|modalities| {
-                modalities.contains(&ProviderInputCapabilityV1::Raster)
-            });
+            let raster_is_selected = modalities_for_case
+                .iter()
+                .any(|modalities| modalities.contains(&ProviderInputCapabilityV1::Raster));
             let raster = if raster_is_selected {
                 case.raster.as_ref().map(read_raster_input).transpose()?
             } else {
@@ -1415,13 +1418,12 @@ fn run_batch_cli_inner(
                     case_manifest.batch_id
                 );
                 let requested_input_modalities = modalities_for_case[provider_index].clone();
-                let requested_raster = if requested_input_modalities
-                    .contains(&ProviderInputCapabilityV1::Raster)
-                {
-                    raster.as_ref().map(|value| value.request_input.clone())
-                } else {
-                    None
-                };
+                let requested_raster =
+                    if requested_input_modalities.contains(&ProviderInputCapabilityV1::Raster) {
+                        raster.as_ref().map(|value| value.request_input.clone())
+                    } else {
+                        None
+                    };
                 let request = build_recognition_request(RecognitionRequestBuildInput {
                     state: &journal.state,
                     request_id,
@@ -1443,8 +1445,7 @@ fn run_batch_cli_inner(
                         invalid_data("built request changed the exact source revision").into(),
                     );
                 }
-                let canonical_ink_comparison_binding =
-                    canonical_ink_comparison_binding(&request)?;
+                let canonical_ink_comparison_binding = canonical_ink_comparison_binding(&request)?;
                 if let Some(annotation) = annotation {
                     validate_delayed_mark_links(annotation, &request)?;
                 }
@@ -1486,11 +1487,10 @@ fn run_batch_cli_inner(
                         stroke_id: view.stroke.stroke_id.clone(),
                     }
                 }));
-                let (raster_input_byte_count, raster_input_sha256) =
-                    raster_provenance_for_request(
-                        &request.requested_input_modalities,
-                        raster.as_ref(),
-                    )?;
+                let (raster_input_byte_count, raster_input_sha256) = raster_provenance_for_request(
+                    &request.requested_input_modalities,
+                    raster.as_ref(),
+                )?;
                 let base = BenchmarkRunBase {
                     case,
                     region_id: case.region_id.clone(),
@@ -2110,9 +2110,7 @@ fn validate_case_manifest(manifest: &BenchmarkCaseManifestV1) -> io::Result<()> 
     Ok(())
 }
 
-fn validate_provider_input_modalities(
-    modalities: &[ProviderInputCapabilityV1],
-) -> io::Result<()> {
+fn validate_provider_input_modalities(modalities: &[ProviderInputCapabilityV1]) -> io::Result<()> {
     if modalities.is_empty() || modalities.len() > MAX_BENCHMARK_INPUT_MODALITIES {
         return Err(invalid_data(
             "provider input modality count is empty or exceeds 2",
@@ -2120,9 +2118,7 @@ fn validate_provider_input_modalities(
     }
     for (index, modality) in modalities.iter().enumerate() {
         if modalities[..index].contains(modality) {
-            return Err(invalid_data(
-                "provider input modalities must be unique",
-            ));
+            return Err(invalid_data("provider input modalities must be unique"));
         }
     }
     Ok(())
