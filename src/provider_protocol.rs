@@ -5448,7 +5448,11 @@ mod tests {
         );
         assert_eq!(producer["output_width_px"].as_u64(), Some(128));
         assert_eq!(producer["output_height_px"].as_u64(), Some(128));
-        assert_eq!(producer["row_stride_bytes"].as_u64(), Some(512));
+        assert_eq!(raster_row_stride_bytes, 512);
+        assert_eq!(
+            producer["row_stride_bytes"].as_u64(),
+            Some(u64::from(raster_row_stride_bytes))
+        );
         assert_eq!(producer["projection_schema_version"].as_u64(), Some(1));
         assert_eq!(
             producer["pixel_layout"],
