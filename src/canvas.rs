@@ -2635,13 +2635,15 @@ pub(crate) fn render_canonical_raster(
     paint.force_hq_pipeline = true;
 
     let stroke_width = checked_q16_to_renderer_f32(i64::from(geometry.spec.stroke_width_16_16))?;
-    let mut stroke = Stroke::default();
-    stroke.width = stroke_width;
-    stroke.line_cap = match geometry.spec.stroke_cap {
-        CanonicalRasterStrokeCapV1::Round => LineCap::Round,
-    };
-    stroke.line_join = match geometry.spec.stroke_join {
-        CanonicalRasterStrokeJoinV1::Round => LineJoin::Round,
+    let stroke = Stroke {
+        width: stroke_width,
+        line_cap: match geometry.spec.stroke_cap {
+            CanonicalRasterStrokeCapV1::Round => LineCap::Round,
+        },
+        line_join: match geometry.spec.stroke_join {
+            CanonicalRasterStrokeJoinV1::Round => LineJoin::Round,
+        },
+        ..Stroke::default()
     };
 
     for stroke_ref in &geometry.stroke_draw_order {
@@ -2658,10 +2660,8 @@ pub(crate) fn render_canonical_raster(
         .try_reserve_exact(pixel_byte_count)
         .map_err(|_| CanvasError::RasterAllocationFailed)?;
     rgba8_premultiplied_srgb_top_down.extend_from_slice(pixmap.data());
-    if rgba8_premultiplied_srgb_top_down
-        .chunks_exact(4)
-        .any(|pixel| pixel[3] != 255)
-    {
+    let (pixels, remainder) = rgba8_premultiplied_srgb_top_down.as_chunks::<4>();
+    if !remainder.is_empty() || pixels.iter().any(|pixel| pixel[3] != 255) {
         return Err(CanvasError::InvalidCanonicalRasterProjection(
             "opaque raster background or ink produced a non-opaque pixel",
         ));
@@ -2765,7 +2765,6 @@ fn validate_canonical_raster_geometry_for_render(
         }
         previous_sequence = Some(point.journal_sequence);
 
-        let point_xy = (point.x_subpixel_16_16, point.y_subpixel_16_16);
         if let Some(index) = counts
             .iter()
             .position(|(stroke_ref, _)| stroke_ref == &point.stroke_ref)
@@ -4108,12 +4107,11 @@ mod tests {
         assert_eq!(rendered.output_height_px, 100);
         assert_eq!(rendered.row_stride_bytes, 400);
         assert_eq!(rendered.rgba8_premultiplied_srgb_top_down.len(), 40_000);
-        assert!(
-            rendered
-                .rgba8_premultiplied_srgb_top_down
-                .chunks_exact(4)
-                .all(|pixel| pixel[3] == 255)
-        );
+        let (pixels, remainder) = rendered
+            .rgba8_premultiplied_srgb_top_down
+            .as_chunks::<4>();
+        assert!(remainder.is_empty());
+        assert!(pixels.iter().all(|pixel| pixel[3] == 255));
         assert_eq!(
             rendered.pixel_layout,
             CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown
