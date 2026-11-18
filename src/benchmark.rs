@@ -22,13 +22,12 @@ use crate::{
     provider_protocol::{
         OperatorApprovedProviderConfig, ProviderCallTimeouts, ProviderCapabilitiesV1,
         ProviderConfigurationV1, ProviderErrorKind, ProviderExecution, ProviderExecutionError,
-        ProviderIdentityV1, ProviderInputCapabilityV1, ProviderNativeTimestampV1,
-        ProviderPositionV1, ProviderProcessResourcesV1, ProviderRasterInputV1,
-        ProviderRasterPayloadContractV1, ProviderRawResponseFrameV1,
+        ProviderIdentityV1, ProviderInputCapabilityV1, ProviderProcessResourcesV1,
+        ProviderRasterInputV1, ProviderRasterPayloadContractV1, ProviderRawResponseFrameV1,
         ProviderRawResponseTranscriptV1, ProviderSampleV1, ProviderSourceRevisionV1,
-        ProviderStrokeRefV1, ProviderStrokeViewV1, ProviderSubmitError, ProviderViewFrameV1,
-        ProviderWorkerHandle, ProviderWorkerPoll, RecognitionRequestBuildInput,
-        RecognitionRequestV1, RecognitionResultV1, build_recognition_request,
+        ProviderStrokeViewV1, ProviderSubmitError, ProviderWorkerHandle, ProviderWorkerPoll,
+        RecognitionRequestBuildInput, RecognitionRequestV1, RecognitionResultV1,
+        build_recognition_request,
     },
     session::publish_no_clobber,
 };
@@ -939,7 +938,6 @@ struct PreparedBenchmarkProvider {
     provider_id: String,
     configuration: ProviderConfigurationV1,
     configuration_id: String,
-    requested_input_modalities: Option<Vec<ProviderInputCapabilityV1>>,
     approved: OperatorApprovedProviderConfig,
     timeouts: ProviderCallTimeouts,
     artifact_digests: Vec<ProviderArtifactDigestV1>,
@@ -1335,7 +1333,6 @@ fn run_batch_cli_inner(
             provider_id: provider.provider_id,
             configuration_id: provider.protocol_configuration.configuration_id.clone(),
             configuration: provider.protocol_configuration,
-            requested_input_modalities: provider.requested_input_modalities,
             approved,
             timeouts,
             artifact_digests,
@@ -3424,6 +3421,9 @@ fn nearest_rank(values: &[f64], percentile: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_protocol::{
+        ProviderNativeTimestampV1, ProviderPositionV1, ProviderStrokeRefV1, ProviderViewFrameV1,
+    };
 
     fn annotation(reference_text: &str) -> BenchmarkAnnotationCaseV1 {
         annotation_for("case-1", "annotation-1", reference_text)
