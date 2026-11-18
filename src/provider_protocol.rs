@@ -6021,7 +6021,9 @@ mod tests {
         let rgba = raster_image.rgba8_premultiplied_srgb_top_down();
         assert_eq!(rgba.len(), (stride * height) as usize);
         let mut canonical_rgb = Vec::with_capacity(width as usize * height as usize * 3);
-        for pixel in rgba.chunks_exact(4) {
+        let (rgba_pixels, rgba_remainder) = rgba.as_chunks::<4>();
+        assert!(rgba_remainder.is_empty());
+        for pixel in rgba_pixels {
             assert_eq!(pixel[3], 255);
             canonical_rgb.extend_from_slice(&pixel[..3]);
         }

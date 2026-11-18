@@ -2226,6 +2226,7 @@ impl CanonicalRasterImageV1 {
         &self.png_bytes
     }
 
+    #[cfg(all(test, windows))]
     pub(crate) fn rgba8_premultiplied_srgb_top_down(&self) -> &[u8] {
         &self.rgba8_premultiplied_srgb_top_down
     }
