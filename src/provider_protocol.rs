@@ -4353,20 +4353,28 @@ mod tests {
         let expected_head = std::env::var("LASSOINK_EXPECTED_HEAD_SHA")
             .expect("the guarded worker job provides its exact PR head");
         assert_eq!(expected_head.len(), 40, "expected a full PR head SHA");
-        assert!(expected_head
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
-        assert!(std::env::var("LASSOINK_CHECKED_OUT_HEAD_SHA")
-            .is_ok_and(|actual| actual == expected_head));
-        assert!(std::env::var("LASSOINK_EXPECTED_HEAD_REPOSITORY")
-            .is_ok_and(|actual| actual == "Herzchens/LassoInk"));
-        assert!(std::env::var("LASSOINK_EXPECTED_HEAD_REF")
-            .is_ok_and(|actual| actual == "feat/raster-reference-protocol"));
         assert!(
-            std::env::var("GITHUB_EVENT_NAME").is_ok_and(|actual| actual == "pull_request")
+            expected_head
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         );
-        assert!(std::env::var("GITHUB_HEAD_REF")
-            .is_ok_and(|actual| actual == "feat/raster-reference-protocol"));
+        assert!(
+            std::env::var("LASSOINK_CHECKED_OUT_HEAD_SHA")
+                .is_ok_and(|actual| actual == expected_head)
+        );
+        assert!(
+            std::env::var("LASSOINK_EXPECTED_HEAD_REPOSITORY")
+                .is_ok_and(|actual| actual == "Herzchens/LassoInk")
+        );
+        assert!(
+            std::env::var("LASSOINK_EXPECTED_HEAD_REF")
+                .is_ok_and(|actual| actual == "feat/raster-reference-protocol")
+        );
+        assert!(std::env::var("GITHUB_EVENT_NAME").is_ok_and(|actual| actual == "pull_request"));
+        assert!(
+            std::env::var("GITHUB_HEAD_REF")
+                .is_ok_and(|actual| actual == "feat/raster-reference-protocol")
+        );
         assert!(std::env::var("RUNNER_ARCH").is_ok_and(|actual| actual == "X64"));
     }
 
@@ -6003,11 +6011,8 @@ mod tests {
                 bottom_px_exclusive: 512,
             },
         );
-        let plan = crate::canvas::build_canonical_raster_projection_plan(
-            &journal.state,
-            &selected,
-        )
-        .unwrap();
+        let plan = crate::canvas::build_canonical_raster_projection_plan(&journal.state, &selected)
+            .unwrap();
         let geometry =
             crate::canvas::transform_canonical_raster_geometry(&plan, &generated_spec).unwrap();
         let raster_image = crate::canvas::render_canonical_raster(&geometry).unwrap();
@@ -6064,36 +6069,40 @@ mod tests {
         );
         assert!(python_executable.is_absolute() && worker_script.is_absolute());
         assert!(asset_root.is_absolute() && asset_root.is_dir());
-        let make_request = |request_id: &str,
-                            asset_root: &std::path::Path,
-                            requested_input_modalities: Vec<ProviderInputCapabilityV1>,
-                            raster_input: Option<ProviderRasterInputV1>| {
-            let configuration = ProviderConfigurationV1 {
-                configuration_id: "senocr-v1-fp32-local".to_owned(),
-                values: BTreeMap::from([
-                    ("asset_root".to_owned(), asset_root.to_string_lossy().into_owned()),
-                    ("model_id".to_owned(), "VietAlphaLabs/SenOCR-Vi".to_owned()),
-                    (
-                        "model_revision".to_owned(),
-                        "1e70dff4ef0429b0d88a2b873fb5d03300af1a41".to_owned(),
-                    ),
-                ]),
+        let make_request =
+            |request_id: &str,
+             asset_root: &std::path::Path,
+             requested_input_modalities: Vec<ProviderInputCapabilityV1>,
+             raster_input: Option<ProviderRasterInputV1>| {
+                let configuration = ProviderConfigurationV1 {
+                    configuration_id: "senocr-v1-fp32-local".to_owned(),
+                    values: BTreeMap::from([
+                        (
+                            "asset_root".to_owned(),
+                            asset_root.to_string_lossy().into_owned(),
+                        ),
+                        ("model_id".to_owned(), "VietAlphaLabs/SenOCR-Vi".to_owned()),
+                        (
+                            "model_revision".to_owned(),
+                            "1e70dff4ef0429b0d88a2b873fb5d03300af1a41".to_owned(),
+                        ),
+                    ]),
+                };
+                build_recognition_request(RecognitionRequestBuildInput {
+                    state: &journal.state,
+                    request_id: request_id.to_owned(),
+                    region_id: "synthetic-senocr-region".to_owned(),
+                    line_id: "synthetic-senocr-line".to_owned(),
+                    coordinate_space: "canonical-raster-output-v1".to_owned(),
+                    coordinate_units: "pixel".to_owned(),
+                    language_hints: vec!["vi-VN".to_owned()],
+                    requested_input_modalities,
+                    provider_configuration: configuration,
+                    selected_strokes: &selected,
+                    raster: raster_input,
+                })
+                .unwrap()
             };
-            build_recognition_request(RecognitionRequestBuildInput {
-                state: &journal.state,
-                request_id: request_id.to_owned(),
-                region_id: "synthetic-senocr-region".to_owned(),
-                line_id: "synthetic-senocr-line".to_owned(),
-                coordinate_space: "canonical-raster-output-v1".to_owned(),
-                coordinate_units: "pixel".to_owned(),
-                language_hints: vec!["vi-VN".to_owned()],
-                requested_input_modalities,
-                provider_configuration: configuration,
-                selected_strokes: &selected,
-                raster: raster_input,
-            })
-            .unwrap()
-        };
         let request = make_request(
             "senocr-m4-raster-e2e",
             &asset_root,
@@ -6115,12 +6124,11 @@ mod tests {
         );
         assert_eq!(request.samples.len(), 2);
 
-        let execution = run_senocr_worker_request(
-            &python_executable,
-            &worker_script,
-            request.clone(),
-        )
-        .unwrap_or_else(|_error| panic!("the guarded local Raster worker returned a failure"));
+        let execution =
+            run_senocr_worker_request(&python_executable, &worker_script, request.clone())
+                .unwrap_or_else(|_error| {
+                    panic!("the guarded local Raster worker returned a failure")
+                });
         let result = &execution.result;
         assert_eq!(result.request_id, request.request_id);
         assert_eq!(result.input_view_id, request.input_view_id);
@@ -6165,10 +6173,7 @@ mod tests {
         assert_eq!(sidecar["schema"], "senocr-processor-parity-v1");
         assert_eq!(sidecar["width"].as_u64(), Some(u64::from(width)));
         assert_eq!(sidecar["height"].as_u64(), Some(u64::from(height)));
-        assert_eq!(
-            sidecar["canonical_rgba_sha256"],
-            hex(&Sha256::digest(rgba))
-        );
+        assert_eq!(sidecar["canonical_rgba_sha256"], hex(&Sha256::digest(rgba)));
         let canonical_rgb_sha256 = hex(&Sha256::digest(&canonical_rgb));
         assert_eq!(sidecar["canonical_rgb_sha256"], canonical_rgb_sha256);
         assert_eq!(sidecar["decoded_png_rgb_sha256"], canonical_rgb_sha256);
@@ -6177,17 +6182,16 @@ mod tests {
             sidecar["direct_processor_inputs"]
         );
         assert!(sidecar["decoded_processor_inputs"]["input_ids"].is_object());
-        assert!(sidecar["decoded_processor_inputs"]
-            .as_object()
-            .is_some_and(|inputs| inputs.len() >= 2));
+        assert!(
+            sidecar["decoded_processor_inputs"]
+                .as_object()
+                .is_some_and(|inputs| inputs.len() >= 2)
+        );
         fs::remove_file(&sidecar_path).unwrap();
 
         let expect_worker_failure = |request: RecognitionRequestV1, expected_code: &str| {
-            let error = match run_senocr_worker_request(
-                &python_executable,
-                &worker_script,
-                request,
-            ) {
+            let error = match run_senocr_worker_request(&python_executable, &worker_script, request)
+            {
                 Ok(_execution) => panic!("invalid Raster request unexpectedly succeeded"),
                 Err(error) => error,
             };
@@ -6202,11 +6206,9 @@ mod tests {
             assert_eq!(failure["kind"], "failure");
             assert_eq!(failure["code"], expected_code);
         };
-        let raster_for_png = |payload: &[u8]| {
-            ProviderRasterInputV1 {
-                raw_payload_hex: hex(payload),
-                ..raster.clone()
-            }
+        let raster_for_png = |payload: &[u8]| ProviderRasterInputV1 {
+            raw_payload_hex: hex(payload),
+            ..raster.clone()
         };
 
         let truncated_png = &png[..png.len().saturating_sub(16)];
@@ -6269,20 +6271,24 @@ mod tests {
             vec![ProviderInputCapabilityV1::OnlineStrokes],
             None,
         );
-        let unsupported_mode_error = match run_senocr_worker_request(
-            &python_executable,
-            &worker_script,
-            unsupported_mode,
-        ) {
-            Ok(_execution) => panic!("unsupported mode unexpectedly received a result"),
-            Err(error) => error,
-        };
+        let unsupported_mode_error =
+            match run_senocr_worker_request(&python_executable, &worker_script, unsupported_mode) {
+                Ok(_execution) => panic!("unsupported mode unexpectedly received a result"),
+                Err(error) => error,
+            };
         assert!(matches!(
             unsupported_mode_error.kind,
             ProviderErrorKind::UnsupportedCapability(_)
         ));
-        assert_eq!(unsupported_mode_error.raw_response_transcript.frames.len(), 1);
-        assert!(!unsupported_mode_error.raw_response_transcript.capture_complete);
+        assert_eq!(
+            unsupported_mode_error.raw_response_transcript.frames.len(),
+            1
+        );
+        assert!(
+            !unsupported_mode_error
+                .raw_response_transcript
+                .capture_complete
+        );
 
         let missing_asset_root = shared_dir.join("missing-asset-root");
         assert!(!missing_asset_root.exists());
@@ -6292,16 +6298,13 @@ mod tests {
             vec![ProviderInputCapabilityV1::Raster],
             Some(raster.clone()),
         );
-        let missing = match run_senocr_worker_request(
-            &python_executable,
-            &worker_script,
-            missing_request,
-        ) {
-            Ok(_execution) => {
-                panic!("missing local model files must fail without an alternate provider")
-            }
-            Err(error) => error,
-        };
+        let missing =
+            match run_senocr_worker_request(&python_executable, &worker_script, missing_request) {
+                Ok(_execution) => {
+                    panic!("missing local model files must fail without an alternate provider")
+                }
+                Err(error) => error,
+            };
         assert!(matches!(
             missing.kind,
             ProviderErrorKind::ProviderFailure { code, .. } if code == "asset_directory_invalid"
