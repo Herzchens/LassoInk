@@ -2243,10 +2243,10 @@ fn validate_generated_raster_spec(spec: &BenchmarkGeneratedRasterSpecV1) -> io::
         ));
     }
 
-    let crop_width = i128::from(spec.source_crop.right_px_exclusive)
-        - i128::from(spec.source_crop.left_px);
-    let crop_height = i128::from(spec.source_crop.bottom_px_exclusive)
-        - i128::from(spec.source_crop.top_px);
+    let crop_width =
+        i128::from(spec.source_crop.right_px_exclusive) - i128::from(spec.source_crop.left_px);
+    let crop_height =
+        i128::from(spec.source_crop.bottom_px_exclusive) - i128::from(spec.source_crop.top_px);
     if crop_width <= 0
         || crop_height <= 0
         || crop_width > MAX_GENERATED_RASTER_CROP_DIMENSION
@@ -2640,9 +2640,12 @@ fn materialize_generated_raster(
         ));
     }
 
-    let plan = build_canonical_raster_projection_plan(state, selected_strokes).map_err(|error| {
-        invalid_data(format!("generated raster source projection failed: {error:?}"))
-    })?;
+    let plan =
+        build_canonical_raster_projection_plan(state, selected_strokes).map_err(|error| {
+            invalid_data(format!(
+                "generated raster source projection failed: {error:?}"
+            ))
+        })?;
     let projection_spec = CanonicalRasterProjectionSpecV1::new(
         generated_spec.output_width_px,
         generated_spec.output_height_px,
@@ -2653,9 +2656,12 @@ fn materialize_generated_raster(
             bottom_px_exclusive: generated_spec.source_crop.bottom_px_exclusive,
         },
     );
-    let geometry = transform_canonical_raster_geometry(&plan, &projection_spec).map_err(|error| {
-        invalid_data(format!("generated raster geometry transform failed: {error:?}"))
-    })?;
+    let geometry =
+        transform_canonical_raster_geometry(&plan, &projection_spec).map_err(|error| {
+            invalid_data(format!(
+                "generated raster geometry transform failed: {error:?}"
+            ))
+        })?;
     let (geometry_journal_id, geometry_logical_revision, geometry_last_sequence) =
         geometry.source_revision_parts();
     if geometry_journal_id != expected_source_revision.journal_id
@@ -2670,8 +2676,7 @@ fn materialize_generated_raster(
     }
 
     let mut selected_stroke_refs = Vec::new();
-    selected_stroke_refs
-        .try_reserve_exact(geometry.canonical_stroke_draw_order().len())?;
+    selected_stroke_refs.try_reserve_exact(geometry.canonical_stroke_draw_order().len())?;
     selected_stroke_refs.extend(
         geometry
             .canonical_stroke_draw_order()
@@ -2823,9 +2828,8 @@ fn generated_raster_origin_for_request(
     {
         return Ok(None);
     }
-    let raster = raster.ok_or_else(|| {
-        invalid_data("raster request has no materialized case raster input")
-    })?;
+    let raster = raster
+        .ok_or_else(|| invalid_data("raster request has no materialized case raster input"))?;
     let request_raster = request
         .raster
         .as_ref()
@@ -2871,14 +2875,19 @@ fn benchmark_selected_strokes_from_request(
 ) -> io::Result<Vec<BenchmarkStrokeRefV1>> {
     let mut selected_strokes = Vec::new();
     selected_strokes.try_reserve_exact(request.stroke_views.len())?;
-    selected_strokes.extend(request.stroke_views.iter().map(|view| BenchmarkStrokeRefV1 {
-        journal_id: view.stroke.journal_id.clone(),
-        session_id: view.stroke.session_id.clone(),
-        source_api: view.stroke.source_api.clone(),
-        device_id: view.stroke.device_id.clone(),
-        pointer_id: view.stroke.pointer_id,
-        stroke_id: view.stroke.stroke_id.clone(),
-    }));
+    selected_strokes.extend(
+        request
+            .stroke_views
+            .iter()
+            .map(|view| BenchmarkStrokeRefV1 {
+                journal_id: view.stroke.journal_id.clone(),
+                session_id: view.stroke.session_id.clone(),
+                source_api: view.stroke.source_api.clone(),
+                device_id: view.stroke.device_id.clone(),
+                pointer_id: view.stroke.pointer_id,
+                stroke_id: view.stroke.stroke_id.clone(),
+            }),
+    );
     Ok(selected_strokes)
 }
 
@@ -3860,7 +3869,9 @@ fn nearest_rank(values: &[f64], percentile: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::canvas::PROVISIONAL_DIRECT_SOURCE_API;
-    use crate::journal::{JournalHeader, JournalWriter, PhysicalSample, RawPosition, StrokeViewFrame};
+    use crate::journal::{
+        JournalHeader, JournalWriter, PhysicalSample, RawPosition, StrokeViewFrame,
+    };
     use crate::provider_protocol::{
         ProviderNativeTimestampV1, ProviderPositionV1, ProviderStrokeRefV1, ProviderViewFrameV1,
     };
@@ -4015,7 +4026,8 @@ mod tests {
         (state, target)
     }
 
-    fn interleaved_generated_raster_journal_fixture() -> (JournalReplayState, StrokeRef, StrokeRef) {
+    fn interleaved_generated_raster_journal_fixture() -> (JournalReplayState, StrokeRef, StrokeRef)
+    {
         let directory = temp_dir("generated-raster-interleaved");
         fs::create_dir(&directory).unwrap();
         let path = directory.join("source.lj");
@@ -4507,11 +4519,10 @@ mod tests {
             coordinate_space: "document".to_owned(),
             units: "px".to_owned(),
         };
-        assert!(validate_raster_source_declaration(
-            Some(&file_raster),
-            case.generated_raster.as_ref()
-        )
-        .is_err());
+        assert!(
+            validate_raster_source_declaration(Some(&file_raster), case.generated_raster.as_ref())
+                .is_err()
+        );
 
         case.generated_raster = None;
         assert!(resolve_provider_input_modalities(&case, Some(&explicit_raster)).is_err());
@@ -4601,10 +4612,7 @@ mod tests {
             origin_a.producer.pixel_layout,
             "rgba8_premultiplied_srgb_top_down"
         );
-        assert_eq!(
-            origin_a.producer.png_bytes_sha256,
-            materialized.sha256_hex
-        );
+        assert_eq!(origin_a.producer.png_bytes_sha256, materialized.sha256_hex);
         let serialized_origin = serde_json::to_string(&origin_a).unwrap();
         let raw_sample_payload_hex = "d3".repeat(128);
         assert!(!serialized_origin.contains(&materialized.request_input.raw_payload_hex));
@@ -4618,7 +4626,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             raster_provenance,
-            (Some(materialized.byte_count), Some(materialized.sha256_hex.clone()))
+            (
+                Some(materialized.byte_count),
+                Some(materialized.sha256_hex.clone())
+            )
         );
         assert!(materialized.byte_count <= MAX_RASTER_INPUT_BYTES);
     }
@@ -4706,16 +4717,16 @@ mod tests {
         let selected = [target.clone()];
         let spec = generated_raster_spec();
         assert_eq!(
-            validate_generated_raster_png_size(
-                usize::try_from(MAX_RASTER_INPUT_BYTES).unwrap()
-            )
-            .unwrap(),
+            validate_generated_raster_png_size(usize::try_from(MAX_RASTER_INPUT_BYTES).unwrap())
+                .unwrap(),
             MAX_RASTER_INPUT_BYTES
         );
-        assert!(validate_generated_raster_png_size(
-            usize::try_from(MAX_RASTER_INPUT_BYTES).unwrap() + 1
-        )
-        .is_err());
+        assert!(
+            validate_generated_raster_png_size(
+                usize::try_from(MAX_RASTER_INPUT_BYTES).unwrap() + 1
+            )
+            .is_err()
+        );
 
         let mut wrong_revision = source_revision.clone();
         wrong_revision.last_sequence += 1;
@@ -4723,9 +4734,13 @@ mod tests {
 
         let mut wrong_target = target.clone();
         wrong_target.stroke_id.push_str("-other");
-        assert!(
-            materialize_generated_raster(&state, &source_revision, &[wrong_target], &spec).is_err()
-        );
+        assert!(materialize_generated_raster(
+            &state,
+            &source_revision,
+            &[wrong_target],
+            &spec
+        )
+        .is_err());
 
         let materialized =
             materialize_generated_raster(&state, &source_revision, &selected, &spec).unwrap();
@@ -4742,25 +4757,32 @@ mod tests {
         let mut stale_request = request.clone();
         stale_request.source_revision.logical_revision += 1;
         let stale_strokes = benchmark_selected_strokes_from_request(&stale_request).unwrap();
-        assert!(generated_raster_origin_for_request(
-            &stale_request,
-            Some(&materialized),
-            &binding,
-            &stale_strokes,
-        )
-        .is_err());
+        assert!(
+            generated_raster_origin_for_request(
+                &stale_request,
+                Some(&materialized),
+                &binding,
+                &stale_strokes,
+            )
+            .is_err()
+        );
 
         let mut wrong_selection_request = request;
-        wrong_selection_request.stroke_views[0].stroke.stroke_id.push_str("-other");
+        wrong_selection_request.stroke_views[0]
+            .stroke
+            .stroke_id
+            .push_str("-other");
         let wrong_request_strokes =
             benchmark_selected_strokes_from_request(&wrong_selection_request).unwrap();
-        assert!(generated_raster_origin_for_request(
-            &wrong_selection_request,
-            Some(&materialized),
-            &binding,
-            &wrong_request_strokes,
-        )
-        .is_err());
+        assert!(
+            generated_raster_origin_for_request(
+                &wrong_selection_request,
+                Some(&materialized),
+                &binding,
+                &wrong_request_strokes,
+            )
+            .is_err()
+        );
         let expected_request_strokes = selected
             .iter()
             .map(BenchmarkStrokeRefV1::from)

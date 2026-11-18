@@ -3317,10 +3317,10 @@ mod tests {
     use crate::benchmark::{
         self, ApprovedBenchmarkProviderV1, BenchmarkAnnotationCaseV1, BenchmarkCaseManifestV1,
         BenchmarkCaseProvenanceV1, BenchmarkCaseSpecV1, BenchmarkClusterKeyV1,
-        BenchmarkCorpusManifestV1, BenchmarkGeneratedRasterCropV1,
-        BenchmarkGeneratedRasterSpecV1, BenchmarkProviderManifestV1, BenchmarkRasterInputSpecV1,
-        BenchmarkSplitKeyV1, BenchmarkSplitV1, BenchmarkStrokeRefV1, BenchmarkTimeoutsV1,
-        BenchmarkTokenizationPolicyV1, ProviderArtifactPathV1, ProviderArtifactRoleV1,
+        BenchmarkCorpusManifestV1, BenchmarkGeneratedRasterCropV1, BenchmarkGeneratedRasterSpecV1,
+        BenchmarkProviderManifestV1, BenchmarkRasterInputSpecV1, BenchmarkSplitKeyV1,
+        BenchmarkSplitV1, BenchmarkStrokeRefV1, BenchmarkTimeoutsV1, BenchmarkTokenizationPolicyV1,
+        ProviderArtifactPathV1, ProviderArtifactRoleV1,
     };
     use crate::journal::{
         EditCommand, JournalHeader, JournalMetadata, JournalWriter, MetadataScope,
@@ -5083,11 +5083,9 @@ mod tests {
             &selected_strokes,
         )
         .unwrap();
-        let raster_geometry = crate::canvas::transform_canonical_raster_geometry(
-            &raster_plan,
-            &projection_spec,
-        )
-        .unwrap();
+        let raster_geometry =
+            crate::canvas::transform_canonical_raster_geometry(&raster_plan, &projection_spec)
+                .unwrap();
         let raster_image = crate::canvas::render_canonical_raster(&raster_geometry).unwrap();
         let png_bytes = raster_image.png_bytes();
         assert!(!png_bytes.is_empty());
@@ -5099,6 +5097,10 @@ mod tests {
         assert!(decoded_remainder.is_empty());
         assert!(decoded_pixels.contains(&[32, 32, 32, 255]));
         assert!(decoded_pixels.contains(&[255, 255, 255, 255]));
+        assert_eq!(
+            bytes_hex(&Sha256::digest(decoded_png.data())),
+            bytes_hex(&raster_image.pixel_bytes_sha256())
+        );
 
         let raster_payload_hex = bytes_hex(png_bytes);
         let raster_pixel_hex = bytes_hex(decoded_png.data());
@@ -5319,9 +5321,11 @@ mod tests {
         ];
         for private_path in private_paths {
             let path_sentinel = private_path.to_string_lossy();
-            assert!(!rows.iter().any(|row| {
-                json_value_contains_string(row, path_sentinel.as_ref())
-            }));
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| { json_value_contains_string(row, path_sentinel.as_ref()) })
+            );
         }
         assert_eq!(rows.len(), 5);
         let run_rows = rows
@@ -5383,16 +5387,28 @@ mod tests {
             failed_raster["canonical_ink_comparison_binding"],
             raster["canonical_ink_comparison_binding"]
         );
-        assert_eq!(raster["canonical_ink_comparison_binding"]["raster_pixel_parity"], "unverified");
+        assert_eq!(
+            raster["canonical_ink_comparison_binding"]["raster_pixel_parity"],
+            "unverified"
+        );
         assert_eq!(online["source_revision"], raster["source_revision"]);
-        assert_eq!(online["source_sample_sequences"], raster["source_sample_sequences"]);
+        assert_eq!(
+            online["source_sample_sequences"],
+            raster["source_sample_sequences"]
+        );
         assert_eq!(
             online["source_sample_sequences"],
             serde_json::json!([first_sample_sequence, second_sample_sequence])
         );
         assert_eq!(online["selected_strokes"], raster["selected_strokes"]);
-        assert_eq!(raster["raster_input_byte_count"].as_u64(), Some(png_bytes.len() as u64));
-        assert_eq!(raster["raster_input_sha256"].as_str(), Some(raster_sha256_hex.as_str()));
+        assert_eq!(
+            raster["raster_input_byte_count"].as_u64(),
+            Some(png_bytes.len() as u64)
+        );
+        assert_eq!(
+            raster["raster_input_sha256"].as_str(),
+            Some(raster_sha256_hex.as_str())
+        );
 
         let origin = &raster["generated_raster_origin"];
         assert_eq!(origin["schema_version"].as_u64(), Some(1));
@@ -5414,12 +5430,18 @@ mod tests {
             producer["geometry_sha256"].as_str(),
             Some(raster_geometry_sha256.as_str())
         );
-        assert_eq!(producer["renderer_version"], raster_image.renderer_version());
+        assert_eq!(
+            producer["renderer_version"],
+            raster_image.renderer_version()
+        );
         assert_eq!(
             producer["pixel_bytes_sha256"].as_str(),
             Some(raster_pixel_sha256.as_str())
         );
-        assert_eq!(producer["png_bytes_sha256"].as_str(), Some(raster_sha256_hex.as_str()));
+        assert_eq!(
+            producer["png_bytes_sha256"].as_str(),
+            Some(raster_sha256_hex.as_str())
+        );
         assert_eq!(
             producer["raster_artifact_sha256"].as_str(),
             Some(raster_artifact_sha256.as_str())
@@ -5428,10 +5450,19 @@ mod tests {
         assert_eq!(producer["output_height_px"].as_u64(), Some(128));
         assert_eq!(producer["row_stride_bytes"].as_u64(), Some(512));
         assert_eq!(producer["projection_schema_version"].as_u64(), Some(1));
-        assert_eq!(producer["pixel_layout"], "rgba8_premultiplied_srgb_top_down");
+        assert_eq!(
+            producer["pixel_layout"],
+            "rgba8_premultiplied_srgb_top_down"
+        );
         assert_eq!(producer["selected_strokes"], raster["selected_strokes"]);
         assert_eq!(producer["stroke_draw_order"], raster["selected_strokes"]);
-        assert_eq!(producer["physical_sample_provenance"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            producer["physical_sample_provenance"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(
             producer["physical_sample_provenance"][0]["journal_sequence"],
             first_sample_sequence
@@ -5440,10 +5471,22 @@ mod tests {
             producer["physical_sample_provenance"][1]["journal_sequence"],
             second_sample_sequence
         );
-        assert_eq!(producer["physical_sample_provenance"][0]["source_sequence_raw"], 501);
-        assert_eq!(producer["physical_sample_provenance"][1]["source_sequence_raw"], 502);
-        assert_eq!(failed_raster["generated_raster_origin"], raster["generated_raster_origin"]);
-        assert_eq!(failed_raster["requested_input_modalities"], serde_json::json!(["raster"]));
+        assert_eq!(
+            producer["physical_sample_provenance"][0]["source_sequence_raw"],
+            501
+        );
+        assert_eq!(
+            producer["physical_sample_provenance"][1]["source_sequence_raw"],
+            502
+        );
+        assert_eq!(
+            failed_raster["generated_raster_origin"],
+            raster["generated_raster_origin"]
+        );
+        assert_eq!(
+            failed_raster["requested_input_modalities"],
+            serde_json::json!(["raster"])
+        );
 
         for configuration_id in ["cfg-generated-online", "cfg-generated-raster"] {
             let run = find_run(configuration_id);
@@ -5458,17 +5501,29 @@ mod tests {
                 assert_eq!(frames[ordinal]["length_prefix_be_hex"], bytes_hex(&prefix));
             }
         }
-        assert!(!failed_raster["raw_response_capture_complete"].as_bool().unwrap());
+        assert!(
+            !failed_raster["raw_response_capture_complete"]
+                .as_bool()
+                .unwrap()
+        );
         let failed_frames = failed_raster["raw_response_frames"].as_array().unwrap();
         assert_eq!(failed_frames.len(), 1);
         assert_eq!(failed_frames[0]["ordinal"].as_u64(), Some(0));
         assert_eq!(
             failed_frames[0]["payload_hex"],
-            bytes_hex(&expected_frames.get("cfg-generated-raster-failure").unwrap().0)
+            bytes_hex(
+                &expected_frames
+                    .get("cfg-generated-raster-failure")
+                    .unwrap()
+                    .0
+            )
         );
         assert_eq!(failed_raster["source_revision"], raster["source_revision"]);
         assert_eq!(failed_raster["input_view_id"], raster["input_view_id"]);
-        assert_eq!(failed_raster["raster_input_sha256"], raster["raster_input_sha256"]);
+        assert_eq!(
+            failed_raster["raster_input_sha256"],
+            raster["raster_input_sha256"]
+        );
 
         let footer = &rows
             .iter()
@@ -5483,9 +5538,7 @@ mod tests {
         assert_eq!(summaries.len(), 3);
         let failed_summary = summaries
             .iter()
-            .find(|summary| {
-                summary["configuration_id"] == "cfg-generated-raster-failure"
-            })
+            .find(|summary| summary["configuration_id"] == "cfg-generated-raster-failure")
             .unwrap();
         assert_eq!(failed_summary["attempted_run_count"].as_u64(), Some(1));
         assert_eq!(failed_summary["completed_run_count"].as_u64(), Some(0));
