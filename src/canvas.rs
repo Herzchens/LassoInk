@@ -2523,25 +2523,14 @@ pub(crate) fn transform_canonical_raster_geometry(
         .try_reserve_exact(plan.selected_strokes.len())
         .map_err(|_| CanvasError::StrokeCapacityReached)?;
     caller_selection_order.extend(plan.selected_strokes.iter().cloned());
-    let geometry_sha256 = hash_canonical_raster_geometry(
-        source_content_sha256,
-        projection_spec_sha256,
-        spec.output_width_px,
-        spec.output_height_px,
-        row_stride_bytes,
-        output_buffer_bytes,
-        &stroke_draw_order,
-        &points_in_journal_order,
-    );
-
-    Ok(CanonicalRasterOutputGeometryV1 {
+    let mut geometry = CanonicalRasterOutputGeometryV1 {
         schema_version: 1,
         source_journal_id: plan.journal_id.clone(),
         source_logical_revision: plan.logical_revision,
         source_last_sequence: plan.last_sequence,
         source_content_sha256,
         projection_spec_sha256,
-        geometry_sha256,
+        geometry_sha256: [0; 32],
         spec: spec.clone(),
         output_width_px: spec.output_width_px,
         output_height_px: spec.output_height_px,
@@ -2550,7 +2539,9 @@ pub(crate) fn transform_canonical_raster_geometry(
         stroke_draw_order,
         caller_selection_order,
         points_in_journal_order,
-    })
+    };
+    geometry.geometry_sha256 = hash_canonical_raster_geometry(&geometry);
+    Ok(geometry)
 }
 
 #[cfg_attr(
@@ -2978,29 +2969,20 @@ fn hash_canonical_raster_spec(
         reason = "consumed by the later raster pixel-rendering slice"
     )
 )]
-fn hash_canonical_raster_geometry(
-    source_content_sha256: [u8; 32],
-    projection_spec_sha256: [u8; 32],
-    output_width_px: u32,
-    output_height_px: u32,
-    row_stride_bytes: u32,
-    output_buffer_bytes: u32,
-    stroke_draw_order: &[StrokeRef],
-    points: &[CanonicalRasterOutputPointV1],
-) -> [u8; 32] {
+fn hash_canonical_raster_geometry(geometry: &CanonicalRasterOutputGeometryV1) -> [u8; 32] {
     let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-geometry/v1\0");
-    hash.bytes(&source_content_sha256);
-    hash.bytes(&projection_spec_sha256);
-    hash.u32(output_width_px);
-    hash.u32(output_height_px);
-    hash.u32(row_stride_bytes);
-    hash.u32(output_buffer_bytes);
-    hash.u64(stroke_draw_order.len() as u64);
-    for stroke in stroke_draw_order {
+    hash.bytes(&geometry.source_content_sha256);
+    hash.bytes(&geometry.projection_spec_sha256);
+    hash.u32(geometry.output_width_px);
+    hash.u32(geometry.output_height_px);
+    hash.u32(geometry.row_stride_bytes);
+    hash.u32(geometry.output_buffer_bytes);
+    hash.u64(geometry.stroke_draw_order.len() as u64);
+    for stroke in &geometry.stroke_draw_order {
         hash.stroke_ref(stroke);
     }
-    hash.u64(points.len() as u64);
-    for point in points {
+    hash.u64(geometry.points_in_journal_order.len() as u64);
+    for point in &geometry.points_in_journal_order {
         hash.u64(point.journal_sequence);
         hash.u64(point.source_sequence_raw);
         hash.stroke_ref(&point.stroke_ref);

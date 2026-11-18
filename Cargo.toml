@@ -13,7 +13,6 @@ serde_json = "=1.0.154"
 sha2 = { version = "=0.11.0", default-features = false }
 unicode-normalization = "=0.1.25"
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
-tiny-skia = { version = "=0.12.0", default-features = false, features = ["std", "png-format"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "=0.52.0", features = [
