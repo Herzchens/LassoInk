@@ -4107,9 +4107,7 @@ mod tests {
         assert_eq!(rendered.output_height_px, 100);
         assert_eq!(rendered.row_stride_bytes, 400);
         assert_eq!(rendered.rgba8_premultiplied_srgb_top_down.len(), 40_000);
-        let (pixels, remainder) = rendered
-            .rgba8_premultiplied_srgb_top_down
-            .as_chunks::<4>();
+        let (pixels, remainder) = rendered.rgba8_premultiplied_srgb_top_down.as_chunks::<4>();
         assert!(remainder.is_empty());
         assert!(pixels.iter().all(|pixel| pixel[3] == 255));
         assert_eq!(
