@@ -4734,13 +4734,9 @@ mod tests {
 
         let mut wrong_target = target.clone();
         wrong_target.stroke_id.push_str("-other");
-        assert!(materialize_generated_raster(
-            &state,
-            &source_revision,
-            &[wrong_target],
-            &spec
-        )
-        .is_err());
+        assert!(
+            materialize_generated_raster(&state, &source_revision, &[wrong_target], &spec).is_err()
+        );
 
         let materialized =
             materialize_generated_raster(&state, &source_revision, &selected, &spec).unwrap();
