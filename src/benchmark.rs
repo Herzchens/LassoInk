@@ -24,9 +24,10 @@ use crate::{
         ProviderConfigurationV1, ProviderErrorKind, ProviderExecution, ProviderExecutionError,
         ProviderIdentityV1, ProviderInputCapabilityV1, ProviderProcessResourcesV1,
         ProviderRasterInputV1, ProviderRasterPayloadContractV1, ProviderRawResponseFrameV1,
-        ProviderRawResponseTranscriptV1, ProviderSourceRevisionV1, ProviderSubmitError,
-        ProviderWorkerHandle, ProviderWorkerPoll, RecognitionRequestBuildInput,
-        RecognitionRequestV1, RecognitionResultV1, build_recognition_request,
+        ProviderRawResponseTranscriptV1, ProviderSampleV1, ProviderSourceRevisionV1,
+        ProviderStrokeViewV1, ProviderSubmitError, ProviderWorkerHandle, ProviderWorkerPoll,
+        RecognitionRequestBuildInput, RecognitionRequestV1, RecognitionResultV1,
+        build_recognition_request,
     },
     session::publish_no_clobber,
 };
@@ -37,6 +38,9 @@ const MAX_CASE_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PROVIDER_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_BENCHMARK_CASES: usize = 2048;
 const MAX_BENCHMARK_PROVIDERS: usize = 8;
+const MAX_BENCHMARK_INPUT_MODALITIES: usize = 2;
+const CANONICAL_INK_COMPARISON_BINDING_SCHEMA_VERSION: u32 = 1;
+const MAX_CANONICAL_INK_COMPARISON_BINDING_BYTES: usize = 8 * 1024 * 1024 + 1024;
 const MAX_PROVIDER_ARTIFACTS: usize = 16;
 const MAX_PROVIDER_ARTIFACT_HASH_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_TOTAL_PROVIDER_ARTIFACT_HASH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -241,6 +245,8 @@ pub(crate) struct ApprovedBenchmarkProviderV1 {
     pub provider_id: String,
     pub executable_path: PathBuf,
     pub arguments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_input_modalities: Option<Vec<ProviderInputCapabilityV1>>,
     pub protocol_configuration: ProviderConfigurationV1,
     pub artifacts: Vec<ProviderArtifactPathV1>,
     pub timeouts: Option<BenchmarkTimeoutsV1>,
@@ -316,6 +322,37 @@ pub(crate) struct BenchmarkRawResponseFrameHexV1 {
     pub payload_hex: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BenchmarkRasterPixelParityV1 {
+    Unverified,
+}
+
+/// Shared digest of canonical source-ordered ink and its document/view context.
+/// Equality excludes request modality/config/raster bytes and is not raster-pixel parity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkCanonicalInkComparisonBindingV1 {
+    pub schema_version: u32,
+    pub sha256_hex: String,
+    pub raster_pixel_parity: BenchmarkRasterPixelParityV1,
+}
+
+#[derive(Serialize)]
+struct CanonicalInkComparisonFingerprintV1<'a> {
+    schema_version: u32,
+    protocol_version: u32,
+    source_journal_id: &'a str,
+    logical_revision: u64,
+    region_id: &'a str,
+    line_id: &'a str,
+    coordinate_space: &'a str,
+    coordinate_units: &'a str,
+    language_hints: &'a [String],
+    stroke_views: &'a [ProviderStrokeViewV1],
+    samples: &'a [ProviderSampleV1],
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BenchmarkRunRecordV1 {
@@ -347,6 +384,9 @@ pub(crate) struct BenchmarkRunRecordV1 {
     pub declared_pressure_curve: Option<String>,
     pub source_revision: ProviderSourceRevisionV1,
     pub input_view_id: String,
+    /// Shared canonical-ink identity; the per-request M4 view ID remains separate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_ink_comparison_binding: Option<BenchmarkCanonicalInkComparisonBindingV1>,
     pub requested_input_modalities: Vec<ProviderInputCapabilityV1>,
     pub selected_strokes: Vec<BenchmarkStrokeRefV1>,
     pub source_sample_sequences: Vec<u64>,
@@ -852,6 +892,39 @@ fn hex_encode(bytes: &[u8]) -> Result<String, io::Error> {
     String::from_utf8(encoded).map_err(|error| io::Error::other(error.to_string()))
 }
 
+fn canonical_ink_comparison_binding(
+    request: &RecognitionRequestV1,
+) -> io::Result<BenchmarkCanonicalInkComparisonBindingV1> {
+    let fingerprint = CanonicalInkComparisonFingerprintV1 {
+        schema_version: CANONICAL_INK_COMPARISON_BINDING_SCHEMA_VERSION,
+        protocol_version: request.protocol_version,
+        source_journal_id: &request.source_revision.journal_id,
+        logical_revision: request.source_revision.logical_revision,
+        region_id: &request.region_id,
+        line_id: &request.line_id,
+        coordinate_space: &request.coordinate_space,
+        coordinate_units: &request.coordinate_units,
+        language_hints: &request.language_hints,
+        stroke_views: &request.stroke_views,
+        samples: &request.samples,
+    };
+    let fingerprint_bytes = serde_json::to_vec(&fingerprint).map_err(|error| {
+        invalid_data(format!(
+            "canonical-ink fingerprint serialization failed: {error}"
+        ))
+    })?;
+    if fingerprint_bytes.len() > MAX_CANONICAL_INK_COMPARISON_BINDING_BYTES {
+        return Err(invalid_data(
+            "canonical-ink comparison binding exceeds its fixed byte cap",
+        ));
+    }
+    Ok(BenchmarkCanonicalInkComparisonBindingV1 {
+        schema_version: CANONICAL_INK_COMPARISON_BINDING_SCHEMA_VERSION,
+        sha256_hex: hex_encode(&Sha256::digest(fingerprint_bytes))?,
+        raster_pixel_parity: BenchmarkRasterPixelParityV1::Unverified,
+    })
+}
+
 fn validate_sha256_hex(value: &str, label: &str) -> io::Result<()> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(invalid_data(format!(
@@ -1191,6 +1264,19 @@ fn run_batch_cli_inner(
     {
         return Err(invalid_data("case × provider run count exceeds artifact record cap").into());
     }
+    let mut provider_input_modalities_by_case = Vec::new();
+    provider_input_modalities_by_case.try_reserve_exact(case_manifest.cases.len())?;
+    for case in &case_manifest.cases {
+        let mut modalities_for_case = Vec::new();
+        modalities_for_case.try_reserve_exact(provider_manifest.providers.len())?;
+        for provider in &provider_manifest.providers {
+            modalities_for_case.push(resolve_provider_input_modalities(
+                case,
+                provider.requested_input_modalities.as_deref(),
+            )?);
+        }
+        provider_input_modalities_by_case.push(modalities_for_case);
+    }
 
     let annotations = match corpus_manifest.as_ref() {
         Some(corpus) => {
@@ -1283,7 +1369,13 @@ fn run_batch_cli_inner(
             evaluation_observations
                 .try_reserve(case_manifest.cases.len().saturating_mul(providers.len()))?;
         }
-        let mut request_views = BTreeMap::<String, (ProviderSourceRevisionV1, String)>::new();
+        let mut canonical_case_bindings = BTreeMap::<
+            String,
+            (
+                ProviderSourceRevisionV1,
+                BenchmarkCanonicalInkComparisonBindingV1,
+            ),
+        >::new();
         for (case_index, case) in case_manifest.cases.iter().enumerate() {
             let journal = read_journal(&case.journal_path)?;
             if journal.recovery.truncated_final_record {
@@ -1304,7 +1396,15 @@ fn run_batch_cli_inner(
             let mut selected_strokes = Vec::new();
             selected_strokes.try_reserve_exact(case.selected_strokes.len())?;
             selected_strokes.extend(case.selected_strokes.iter().map(StrokeRef::from));
-            let raster = case.raster.as_ref().map(read_raster_input).transpose()?;
+            let modalities_for_case = &provider_input_modalities_by_case[case_index];
+            let raster_is_selected = modalities_for_case
+                .iter()
+                .any(|modalities| modalities.contains(&ProviderInputCapabilityV1::Raster));
+            let raster = if raster_is_selected {
+                case.raster.as_ref().map(read_raster_input).transpose()?
+            } else {
+                None
+            };
             let annotation = annotations
                 .as_ref()
                 .and_then(|items| items.get(case.case_id.as_str()).copied());
@@ -1314,6 +1414,13 @@ fn run_batch_cli_inner(
                     "bench-{}-{case_index}-{provider_index}",
                     case_manifest.batch_id
                 );
+                let requested_input_modalities = modalities_for_case[provider_index].clone();
+                let requested_raster =
+                    if requested_input_modalities.contains(&ProviderInputCapabilityV1::Raster) {
+                        raster.as_ref().map(|value| value.request_input.clone())
+                    } else {
+                        None
+                    };
                 let request = build_recognition_request(RecognitionRequestBuildInput {
                     state: &journal.state,
                     request_id,
@@ -1322,10 +1429,10 @@ fn run_batch_cli_inner(
                     coordinate_space: case.coordinate_space.clone(),
                     coordinate_units: case.coordinate_units.clone(),
                     language_hints: case.language_hints.clone(),
-                    requested_input_modalities: case.requested_input_modalities.clone(),
+                    requested_input_modalities,
                     provider_configuration: provider.configuration.clone(),
                     selected_strokes: &selected_strokes,
-                    raster: raster.as_ref().map(|value| value.request_input.clone()),
+                    raster: requested_raster,
                 })
                 .map_err(|error| {
                     invalid_data(format!("case {} request invalid: {error}", case.case_id))
@@ -1335,27 +1442,28 @@ fn run_batch_cli_inner(
                         invalid_data("built request changed the exact source revision").into(),
                     );
                 }
+                let canonical_ink_comparison_binding = canonical_ink_comparison_binding(&request)?;
                 if let Some(annotation) = annotation {
                     validate_delayed_mark_links(annotation, &request)?;
                 }
-                match request_views.get(&case.case_id) {
-                    Some((known_revision, known_view))
+                match canonical_case_bindings.get(&case.case_id) {
+                    Some((known_revision, known_binding))
                         if known_revision != &request.source_revision
-                            || known_view != &request.input_view_id =>
+                            || known_binding != &canonical_ink_comparison_binding =>
                     {
                         return Err(invalid_data(format!(
-                            "provider inputs for case {} do not share one source view",
+                            "provider requests for case {} do not share one canonical-ink binding",
                             case.case_id
                         ))
                         .into());
                     }
                     Some(_) => {}
                     None => {
-                        request_views.insert(
+                        canonical_case_bindings.insert(
                             case.case_id.clone(),
                             (
                                 request.source_revision.clone(),
-                                request.input_view_id.clone(),
+                                canonical_ink_comparison_binding.clone(),
                             ),
                         );
                     }
@@ -1376,6 +1484,10 @@ fn run_batch_cli_inner(
                         stroke_id: view.stroke.stroke_id.clone(),
                     }
                 }));
+                let (raster_input_byte_count, raster_input_sha256) = raster_provenance_for_request(
+                    &request.requested_input_modalities,
+                    raster.as_ref(),
+                )?;
                 let base = BenchmarkRunBase {
                     case,
                     region_id: case.region_id.clone(),
@@ -1383,10 +1495,11 @@ fn run_batch_cli_inner(
                     coordinate_space: case.coordinate_space.clone(),
                     coordinate_units: case.coordinate_units.clone(),
                     language_hints: case.language_hints.clone(),
-                    raster_input_byte_count: raster.as_ref().map(|value| value.byte_count),
-                    raster_input_sha256: raster.as_ref().map(|value| value.sha256_hex.clone()),
+                    raster_input_byte_count,
+                    raster_input_sha256,
                     source_revision: request.source_revision.clone(),
                     input_view_id: request.input_view_id.clone(),
+                    canonical_ink_comparison_binding,
                     requested_input_modalities: request.requested_input_modalities.clone(),
                     selected_strokes,
                     source_sample_sequences,
@@ -1489,6 +1602,7 @@ struct BenchmarkRunBase<'a> {
     raster_input_sha256: Option<String>,
     source_revision: ProviderSourceRevisionV1,
     input_view_id: String,
+    canonical_ink_comparison_binding: BenchmarkCanonicalInkComparisonBindingV1,
     requested_input_modalities: Vec<ProviderInputCapabilityV1>,
     selected_strokes: Vec<BenchmarkStrokeRefV1>,
     source_sample_sequences: Vec<u64>,
@@ -1632,6 +1746,7 @@ fn successful_run_record(
         declared_pressure_curve: base.case.provenance.pressure_curve.clone(),
         source_revision: base.source_revision,
         input_view_id: base.input_view_id,
+        canonical_ink_comparison_binding: Some(base.canonical_ink_comparison_binding),
         requested_input_modalities: base.requested_input_modalities,
         selected_strokes: base.selected_strokes,
         source_sample_sequences: base.source_sample_sequences,
@@ -1715,6 +1830,7 @@ fn failed_run_record(
         declared_pressure_curve: base.case.provenance.pressure_curve.clone(),
         source_revision: base.source_revision,
         input_view_id: base.input_view_id,
+        canonical_ink_comparison_binding: Some(base.canonical_ink_comparison_binding),
         requested_input_modalities: base.requested_input_modalities,
         selected_strokes: base.selected_strokes,
         source_sample_sequences: base.source_sample_sequences,
@@ -1986,28 +2102,79 @@ fn validate_case_manifest(manifest: &BenchmarkCaseManifestV1) -> io::Result<()> 
             require_local_absolute_path(&raster.path, "raster input path")?;
             validate_bounded_text(&raster.coordinate_space, "raster coordinate space", 256)?;
             validate_bounded_text(&raster.units, "raster units", 256)?;
-            if !case
-                .requested_input_modalities
-                .contains(&ProviderInputCapabilityV1::Raster)
-            {
-                return Err(invalid_data(
-                    "raster input is present but raster modality was not requested",
-                ));
-            }
-        } else if case
-            .requested_input_modalities
-            .contains(&ProviderInputCapabilityV1::Raster)
-        {
-            return Err(invalid_data(
-                "raster modality was requested without an explicit raster input",
-            ));
         }
     }
     Ok(())
 }
 
+fn validate_provider_input_modalities(modalities: &[ProviderInputCapabilityV1]) -> io::Result<()> {
+    if modalities.is_empty() || modalities.len() > MAX_BENCHMARK_INPUT_MODALITIES {
+        return Err(invalid_data(
+            "provider input modality count is empty or exceeds 2",
+        ));
+    }
+    for (index, modality) in modalities.iter().enumerate() {
+        if modalities[..index].contains(modality) {
+            return Err(invalid_data("provider input modalities must be unique"));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the request modes solely from the case's available input data or
+/// the provider's explicit override. Provider capabilities never imply a
+/// fallback or change this selection.
+fn resolve_provider_input_modalities(
+    case: &BenchmarkCaseSpecV1,
+    provider_modalities: Option<&[ProviderInputCapabilityV1]>,
+) -> io::Result<Vec<ProviderInputCapabilityV1>> {
+    let has_provider_override = provider_modalities.is_some();
+    let resolved = provider_modalities.unwrap_or(&case.requested_input_modalities);
+    validate_provider_input_modalities(resolved)?;
+
+    if !has_provider_override {
+        let legacy_requests_raster = case
+            .requested_input_modalities
+            .contains(&ProviderInputCapabilityV1::Raster);
+        if case.raster.is_some() && !legacy_requests_raster {
+            return Err(invalid_data(
+                "raster input is present but raster modality was not requested",
+            ));
+        }
+        if case.raster.is_none() && legacy_requests_raster {
+            return Err(invalid_data(
+                "raster modality was requested without an explicit raster input",
+            ));
+        }
+    }
+
+    for modality in resolved {
+        match *modality {
+            ProviderInputCapabilityV1::OnlineStrokes if case.selected_strokes.is_empty() => {
+                return Err(invalid_data(
+                    "provider selected online strokes without case stroke data",
+                ));
+            }
+            ProviderInputCapabilityV1::Raster if case.raster.is_none() => {
+                return Err(invalid_data(
+                    "provider selected raster without case raster data",
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let mut modalities = Vec::new();
+    modalities.try_reserve_exact(resolved.len())?;
+    modalities.extend_from_slice(resolved);
+    Ok(modalities)
+}
+
 fn validate_provider_spec(provider: &ApprovedBenchmarkProviderV1) -> io::Result<()> {
     validate_local_id(&provider.provider_id, "provider ID")?;
+    if let Some(modalities) = &provider.requested_input_modalities {
+        validate_provider_input_modalities(modalities)?;
+    }
     require_local_absolute_path(&provider.executable_path, "provider executable path")?;
     if provider.arguments.len() > 64
         || provider
@@ -2280,6 +2447,20 @@ fn read_raster_input(spec: &BenchmarkRasterInputSpecV1) -> io::Result<LoadedRast
         byte_count: bytes.len() as u64,
         sha256_hex: hex_encode(&Sha256::digest(&bytes))?,
     })
+}
+
+fn raster_provenance_for_request(
+    requested_input_modalities: &[ProviderInputCapabilityV1],
+    raster: Option<&LoadedRasterInput>,
+) -> io::Result<(Option<u64>, Option<String>)> {
+    if requested_input_modalities.contains(&ProviderInputCapabilityV1::Raster) {
+        let raster = raster.ok_or_else(|| {
+            invalid_data("raster modality was requested without loaded raster input")
+        })?;
+        Ok((Some(raster.byte_count), Some(raster.sha256_hex.clone())))
+    } else {
+        Ok((None, None))
+    }
 }
 
 fn read_bounded_regular_file(path: &Path, maximum: u64) -> io::Result<Vec<u8>> {
@@ -3240,6 +3421,9 @@ fn nearest_rank(values: &[f64], percentile: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_protocol::{
+        ProviderNativeTimestampV1, ProviderPositionV1, ProviderStrokeRefV1, ProviderViewFrameV1,
+    };
 
     fn annotation(reference_text: &str) -> BenchmarkAnnotationCaseV1 {
         annotation_for("case-1", "annotation-1", reference_text)
@@ -3316,6 +3500,301 @@ mod tests {
             },
             raster: None,
         }
+    }
+
+    fn canonical_comparison_request_fixture() -> RecognitionRequestV1 {
+        let stroke = ProviderStrokeRefV1 {
+            journal_id: "journal-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            source_api: "direct".to_owned(),
+            device_id: Some("device-1".to_owned()),
+            pointer_id: Some(4),
+            stroke_id: "stroke-1".to_owned(),
+        };
+        let view = ProviderStrokeViewV1 {
+            stroke: stroke.clone(),
+            view_frame: Some(ProviderViewFrameV1 {
+                screen_origin_x_px: 10,
+                screen_origin_y_px: 20,
+                dpi_scale_factor_bits: 1.0f64.to_bits(),
+                canvas_zoom_bits: 1.0f64.to_bits(),
+                canvas_pan_x_bits: 0.0f64.to_bits(),
+                canvas_pan_y_bits: 0.0f64.to_bits(),
+                toolbar_height_px: 32,
+            }),
+        };
+        let sample = |sequence: u64, x_raw: i64| ProviderSampleV1 {
+            journal_sequence: sequence,
+            source_sequence_raw: sequence + 100,
+            stroke: stroke.clone(),
+            app_arrival_elapsed_ns_decimal: (sequence * 1000).to_string(),
+            config_id: Some("capture-config-1".to_owned()),
+            position: Some(ProviderPositionV1 {
+                coordinate_space: "screen_pixels".to_owned(),
+                units: "px".to_owned(),
+                x_raw,
+                y_raw: 200,
+            }),
+            effective_position: Some(ProviderPositionV1 {
+                coordinate_space: "document".to_owned(),
+                units: "px".to_owned(),
+                x_raw: x_raw + 5,
+                y_raw: 205,
+            }),
+            pressure: None,
+            native_timestamp: Some(ProviderNativeTimestampV1 {
+                clock_domain: "qpc".to_owned(),
+                units: "ticks".to_owned(),
+                count_raw: sequence * 10,
+                frequency_hz: Some(10_000_000),
+            }),
+            contact_range_state: Some("in_contact".to_owned()),
+            button_state_raw: None,
+            tilt_x_raw: None,
+            tilt_y_raw: None,
+            rotation_raw: None,
+            raw_payload_hex: format!("{sequence:04x}"),
+        };
+        RecognitionRequestV1 {
+            protocol_version: 1,
+            request_id: "request-a".to_owned(),
+            input_view_id: "input-view-v1-0000000000000001".to_owned(),
+            source_revision: ProviderSourceRevisionV1 {
+                journal_id: "journal-1".to_owned(),
+                logical_revision: 3,
+                last_sequence: 42,
+            },
+            region_id: "region-1".to_owned(),
+            line_id: "line-1".to_owned(),
+            coordinate_space: "document".to_owned(),
+            coordinate_units: "px".to_owned(),
+            language_hints: vec!["vi-VN".to_owned()],
+            requested_input_modalities: vec![ProviderInputCapabilityV1::OnlineStrokes],
+            provider_configuration: ProviderConfigurationV1 {
+                configuration_id: "provider-config-a".to_owned(),
+                values: BTreeMap::new(),
+            },
+            provider_configuration_fingerprint: "a".repeat(64),
+            stroke_views: vec![view],
+            samples: vec![sample(41, 100), sample(42, 110)],
+            raster: None,
+        }
+    }
+
+    #[test]
+    fn canonical_ink_binding_matches_across_modalities_and_provider_configs() {
+        let online = canonical_comparison_request_fixture();
+        let mut raster = online.clone();
+        raster.request_id = "request-b".to_owned();
+        raster.input_view_id = "input-view-v1-0000000000000002".to_owned();
+        raster.requested_input_modalities = vec![ProviderInputCapabilityV1::Raster];
+        raster.provider_configuration.configuration_id = "provider-config-b".to_owned();
+        raster
+            .provider_configuration
+            .values
+            .insert("setting".to_owned(), "different".to_owned());
+        raster.provider_configuration_fingerprint = "b".repeat(64);
+        raster.raster = Some(ProviderRasterInputV1 {
+            width: 1,
+            height: 1,
+            payload_contract: ProviderRasterPayloadContractV1::OpaqueBytes,
+            coordinate_space: "page".to_owned(),
+            units: "opaque".to_owned(),
+            raw_payload_hex: "ff00".to_owned(),
+        });
+
+        assert_ne!(online.input_view_id, raster.input_view_id);
+        assert_ne!(
+            online.requested_input_modalities,
+            raster.requested_input_modalities
+        );
+        let online_binding = canonical_ink_comparison_binding(&online).unwrap();
+        let raster_binding = canonical_ink_comparison_binding(&raster).unwrap();
+        assert_eq!(online_binding, raster_binding);
+        assert_eq!(
+            online_binding.schema_version,
+            CANONICAL_INK_COMPARISON_BINDING_SCHEMA_VERSION
+        );
+        assert_eq!(
+            online_binding.raster_pixel_parity,
+            BenchmarkRasterPixelParityV1::Unverified
+        );
+    }
+
+    #[test]
+    fn canonical_ink_binding_changes_with_samples_order_frames_source_or_context() {
+        let base = canonical_comparison_request_fixture();
+        let binding = canonical_ink_comparison_binding(&base).unwrap();
+
+        let mut changed_sample = base.clone();
+        changed_sample.samples[0]
+            .effective_position
+            .as_mut()
+            .unwrap()
+            .x_raw += 1;
+        assert_ne!(
+            binding,
+            canonical_ink_comparison_binding(&changed_sample).unwrap()
+        );
+
+        let mut changed_order = base.clone();
+        changed_order.samples.swap(0, 1);
+        assert_ne!(
+            binding,
+            canonical_ink_comparison_binding(&changed_order).unwrap()
+        );
+
+        let mut changed_frame = base.clone();
+        changed_frame.stroke_views[0]
+            .view_frame
+            .as_mut()
+            .unwrap()
+            .canvas_pan_x_bits = 1.0f64.to_bits();
+        assert_ne!(
+            binding,
+            canonical_ink_comparison_binding(&changed_frame).unwrap()
+        );
+
+        let mut changed_source = base.clone();
+        changed_source.samples[0].stroke.source_api = "wintab".to_owned();
+        assert_ne!(
+            binding,
+            canonical_ink_comparison_binding(&changed_source).unwrap()
+        );
+
+        let mut changed_context = base.clone();
+        changed_context.language_hints.push("en".to_owned());
+        assert_ne!(
+            binding,
+            canonical_ink_comparison_binding(&changed_context).unwrap()
+        );
+
+        let mut changed_revision = base;
+        changed_revision.source_revision.logical_revision += 1;
+        assert_ne!(
+            binding,
+            canonical_ink_comparison_binding(&changed_revision).unwrap()
+        );
+    }
+
+    #[test]
+    fn provider_input_modalities_inherit_legacy_case_vector_exactly() {
+        let mut case = case_with_split(
+            "case-1",
+            "writer-1",
+            "session-1",
+            "configuration-1",
+            BenchmarkSplitV1::Train,
+            "annotation-1",
+        );
+        case.requested_input_modalities = vec![
+            ProviderInputCapabilityV1::Raster,
+            ProviderInputCapabilityV1::OnlineStrokes,
+        ];
+        case.raster = Some(BenchmarkRasterInputSpecV1 {
+            path: PathBuf::from(r"C:\fixture\blank.png"),
+            width: 1,
+            height: 1,
+            coordinate_space: "document".to_owned(),
+            units: "px".to_owned(),
+        });
+
+        let resolved = resolve_provider_input_modalities(&case, None).unwrap();
+        assert_eq!(resolved, case.requested_input_modalities);
+    }
+
+    #[test]
+    fn provider_input_modalities_use_explicit_available_selection() {
+        let mut case = case_with_split(
+            "case-1",
+            "writer-1",
+            "session-1",
+            "configuration-1",
+            BenchmarkSplitV1::Train,
+            "annotation-1",
+        );
+        case.requested_input_modalities = vec![ProviderInputCapabilityV1::OnlineStrokes];
+        case.raster = Some(BenchmarkRasterInputSpecV1 {
+            path: PathBuf::from(r"C:\fixture\blank.png"),
+            width: 1,
+            height: 1,
+            coordinate_space: "document".to_owned(),
+            units: "px".to_owned(),
+        });
+        let explicit = [ProviderInputCapabilityV1::Raster];
+
+        assert_eq!(
+            resolve_provider_input_modalities(&case, Some(&explicit)).unwrap(),
+            explicit.to_vec()
+        );
+        assert!(resolve_provider_input_modalities(&case, None).is_err());
+    }
+
+    #[test]
+    fn provider_input_modalities_reject_invalid_and_unavailable_declarations() {
+        let case = case_with_split(
+            "case-1",
+            "writer-1",
+            "session-1",
+            "configuration-1",
+            BenchmarkSplitV1::Train,
+            "annotation-1",
+        );
+        let empty = [];
+        assert!(resolve_provider_input_modalities(&case, Some(&empty)).is_err());
+
+        let duplicate = [
+            ProviderInputCapabilityV1::OnlineStrokes,
+            ProviderInputCapabilityV1::OnlineStrokes,
+        ];
+        assert!(resolve_provider_input_modalities(&case, Some(&duplicate)).is_err());
+
+        let over_cap = [
+            ProviderInputCapabilityV1::OnlineStrokes,
+            ProviderInputCapabilityV1::Raster,
+            ProviderInputCapabilityV1::OnlineStrokes,
+        ];
+        assert!(resolve_provider_input_modalities(&case, Some(&over_cap)).is_err());
+
+        let unavailable_raster = [ProviderInputCapabilityV1::Raster];
+        assert!(resolve_provider_input_modalities(&case, Some(&unavailable_raster)).is_err());
+
+        let mut no_selected_strokes = case;
+        no_selected_strokes.selected_strokes.clear();
+        let unavailable_online = [ProviderInputCapabilityV1::OnlineStrokes];
+        assert!(
+            resolve_provider_input_modalities(&no_selected_strokes, Some(&unavailable_online))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn raster_provenance_is_attributed_only_to_requests_selecting_raster() {
+        let raster_hash = "a".repeat(64);
+        let raster = LoadedRasterInput {
+            request_input: ProviderRasterInputV1 {
+                width: 1,
+                height: 1,
+                payload_contract: ProviderRasterPayloadContractV1::OpaqueBytes,
+                coordinate_space: "document".to_owned(),
+                units: "px".to_owned(),
+                raw_payload_hex: "00".to_owned(),
+            },
+            byte_count: 1,
+            sha256_hex: raster_hash.clone(),
+        };
+        let online_only = [ProviderInputCapabilityV1::OnlineStrokes];
+        let raster_only = [ProviderInputCapabilityV1::Raster];
+
+        assert_eq!(
+            raster_provenance_for_request(&online_only, Some(&raster)).unwrap(),
+            (None, None)
+        );
+        assert_eq!(
+            raster_provenance_for_request(&raster_only, Some(&raster)).unwrap(),
+            (Some(1), Some(raster_hash))
+        );
+        assert!(raster_provenance_for_request(&raster_only, None).is_err());
     }
 
     fn temp_dir(label: &str) -> PathBuf {

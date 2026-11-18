@@ -3317,14 +3317,15 @@ mod tests {
     use crate::benchmark::{
         self, ApprovedBenchmarkProviderV1, BenchmarkAnnotationCaseV1, BenchmarkCaseManifestV1,
         BenchmarkCaseProvenanceV1, BenchmarkCaseSpecV1, BenchmarkClusterKeyV1,
-        BenchmarkCorpusManifestV1, BenchmarkProviderManifestV1, BenchmarkSplitKeyV1,
-        BenchmarkSplitV1, BenchmarkStrokeRefV1, BenchmarkTimeoutsV1, BenchmarkTokenizationPolicyV1,
-        ProviderArtifactPathV1, ProviderArtifactRoleV1,
+        BenchmarkCorpusManifestV1, BenchmarkProviderManifestV1, BenchmarkRasterInputSpecV1,
+        BenchmarkSplitKeyV1, BenchmarkSplitV1, BenchmarkStrokeRefV1, BenchmarkTimeoutsV1,
+        BenchmarkTokenizationPolicyV1, ProviderArtifactPathV1, ProviderArtifactRoleV1,
     };
     use crate::journal::{
         EditCommand, JournalHeader, JournalMetadata, JournalWriter, MetadataScope,
         StoredEditAction, StoredMetadata, StoredPhysicalSample, StoredStrokeStart,
     };
+    use sha2::{Digest, Sha256};
     use std::{
         collections::BTreeMap,
         fs,
@@ -3525,8 +3526,14 @@ mod tests {
     }
 
     fn fixture_capabilities() -> ProviderCapabilitiesV1 {
+        fixture_capabilities_with_inputs(vec![ProviderInputCapabilityV1::OnlineStrokes])
+    }
+
+    fn fixture_capabilities_with_inputs(
+        inputs: Vec<ProviderInputCapabilityV1>,
+    ) -> ProviderCapabilitiesV1 {
         ProviderCapabilitiesV1 {
-            inputs: vec![ProviderInputCapabilityV1::OnlineStrokes],
+            inputs,
             outputs: vec![
                 ProviderOutputCapabilityV1::Text,
                 ProviderOutputCapabilityV1::NativeScore,
@@ -4477,7 +4484,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     #[ignore = "CI-only end-to-end benchmark/provider test; see guarded hosted provider test job"]
-    fn benchmark_cli_journal_mock_provider_pipeline_writes_private_complete_artifact() {
+    fn benchmark_cli_cross_modal_mock_provider_pipeline_writes_private_complete_artifact() {
         require_provider_mock_test_opt_in();
         let mock = compile_mock_worker();
         let target = stroke_ref("cli-e2e-stroke", "cli-e2e-device");
@@ -4525,6 +4532,28 @@ mod tests {
         let case_id = "cli-e2e-case".to_owned();
         let corpus_id = "cli-e2e-corpus".to_owned();
         let annotation_id = "cli-e2e-annotation".to_owned();
+        let raster_bytes = b"synthetic cross-modal raster fixture";
+        let raster_path = mock.directory.join("synthetic-page.bin");
+        fs::write(&raster_path, raster_bytes).unwrap();
+        let bytes_hex = |bytes: &[u8]| {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+            for byte in bytes {
+                encoded.push(char::from(HEX[usize::from(*byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+            }
+            encoded
+        };
+        let raster_request_input = ProviderRasterInputV1 {
+            width: 2,
+            height: 2,
+            payload_contract: ProviderRasterPayloadContractV1::OpaqueBytes,
+            coordinate_space: "synthetic-page".to_owned(),
+            units: "opaque-bytes".to_owned(),
+            raw_payload_hex: bytes_hex(raster_bytes),
+        };
+        let raster_payload_hex = bytes_hex(raster_bytes);
+        let raster_sha256_hex = bytes_hex(&Sha256::digest(raster_bytes));
         let case = BenchmarkCaseSpecV1 {
             case_id: case_id.clone(),
             journal_path: journal_path.clone(),
@@ -4534,7 +4563,10 @@ mod tests {
             coordinate_space: "windows-screen-coordinates".to_owned(),
             coordinate_units: "screen-pixel".to_owned(),
             language_hints: vec!["vi-VN".to_owned(), "en-US".to_owned()],
-            requested_input_modalities: vec![ProviderInputCapabilityV1::OnlineStrokes],
+            requested_input_modalities: vec![
+                ProviderInputCapabilityV1::OnlineStrokes,
+                ProviderInputCapabilityV1::Raster,
+            ],
             selected_strokes: selected_stroke_refs,
             provenance: BenchmarkCaseProvenanceV1 {
                 corpus_id: Some(corpus_id.clone()),
@@ -4554,7 +4586,13 @@ mod tests {
                 display_mapping: None,
                 pressure_curve: None,
             },
-            raster: None,
+            raster: Some(BenchmarkRasterInputSpecV1 {
+                path: raster_path.clone(),
+                width: 2,
+                height: 2,
+                coordinate_space: "synthetic-page".to_owned(),
+                units: "opaque-bytes".to_owned(),
+            }),
         };
         let case_manifest = BenchmarkCaseManifestV1 {
             schema_version: 1,
@@ -4581,14 +4619,34 @@ mod tests {
         };
 
         let provider_configurations = [
-            ("cfg-success-a", "success-a", "ok"),
-            ("cfg-success-b", "success-b", "ok"),
-            ("cfg-visible-failure", "failure", "crash"),
+            (
+                "cfg-success-a",
+                "online-success",
+                "ok",
+                vec![ProviderInputCapabilityV1::OnlineStrokes],
+                vec![ProviderInputCapabilityV1::OnlineStrokes],
+            ),
+            (
+                "cfg-success-b",
+                "raster-success",
+                "ok",
+                vec![ProviderInputCapabilityV1::Raster],
+                vec![ProviderInputCapabilityV1::Raster],
+            ),
+            (
+                "cfg-visible-failure",
+                "raster-failure",
+                "crash",
+                vec![ProviderInputCapabilityV1::Raster],
+                vec![ProviderInputCapabilityV1::Raster],
+            ),
         ];
         let mut expected_frames = BTreeMap::<String, (Vec<u8>, Vec<u8>)>::new();
         let mut providers = Vec::new();
-        for (provider_index, (configuration_id, mode_label, behavior)) in
-            provider_configurations.iter().enumerate()
+        for (
+            provider_index,
+            (configuration_id, mode_label, behavior, requested_modalities, advertised_inputs),
+        ) in provider_configurations.iter().enumerate()
         {
             let configuration = ProviderConfigurationV1 {
                 configuration_id: (*configuration_id).to_owned(),
@@ -4608,10 +4666,12 @@ mod tests {
                 coordinate_space: case.coordinate_space.clone(),
                 coordinate_units: case.coordinate_units.clone(),
                 language_hints: case.language_hints.clone(),
-                requested_input_modalities: case.requested_input_modalities.clone(),
+                requested_input_modalities: requested_modalities.to_vec(),
                 provider_configuration: configuration.clone(),
                 selected_strokes: &selected_strokes,
-                raster: None,
+                raster: requested_modalities
+                    .contains(&ProviderInputCapabilityV1::Raster)
+                    .then(|| raster_request_input.clone()),
             })
             .unwrap();
             assert_eq!(request.source_revision, source_revision);
@@ -4620,12 +4680,21 @@ mod tests {
                 provider: fixture_provider(),
                 configuration_id: configuration.configuration_id.clone(),
                 configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
-                capabilities: fixture_capabilities(),
+                capabilities: fixture_capabilities_with_inputs(advertised_inputs.to_vec()),
             })
             .unwrap();
+            let mut mock_result = fixture_result(&request, source_revision.clone());
+            if !request
+                .requested_input_modalities
+                .contains(&ProviderInputCapabilityV1::OnlineStrokes)
+            {
+                for candidate in &mut mock_result.candidates {
+                    candidate.stroke_ranges.clear();
+                }
+            }
             let recognition = serde_json::to_string(&WorkerResponseFrameV1::Recognition {
                 protocol_version: PROVIDER_PROTOCOL_VERSION,
-                result: fixture_result(&request, source_revision.clone()),
+                result: mock_result,
             })
             .unwrap();
             expected_frames.insert(
@@ -4639,6 +4708,7 @@ mod tests {
                 provider_id: "mock-provider".to_owned(),
                 executable_path: mock.executable.clone(),
                 arguments: vec![(*behavior).to_owned(), handshake, recognition],
+                requested_input_modalities: Some(requested_modalities.to_vec()),
                 protocol_configuration: configuration,
                 artifacts: vec![ProviderArtifactPathV1 {
                     artifact_id: "mock-executable".to_owned(),
@@ -4691,6 +4761,7 @@ mod tests {
         let artifact_text = String::from_utf8(artifact_bytes).unwrap();
         assert!(!artifact_text.contains("PRIVATE_PROVIDER_SETTING_SENTINEL"));
         assert!(!artifact_text.contains("PRIVATE_REFERENCE_TEXT_SENTINEL"));
+        assert!(!artifact_text.contains(&raster_payload_hex));
 
         let rows = artifact_text
             .lines()
@@ -4714,6 +4785,7 @@ mod tests {
             &case_manifest_path,
             &provider_manifest_path,
             &corpus_manifest_path,
+            &raster_path,
         ] {
             let path_text = private_path.to_string_lossy();
             assert!(
@@ -4761,6 +4833,30 @@ mod tests {
         assert_eq!(success_b["status"], "completed");
         assert_eq!(success_a["case_id"], case_id);
         assert_eq!(success_a["provider_id"], "mock-provider");
+        assert_eq!(
+            success_a["requested_input_modalities"],
+            serde_json::json!(["online_strokes"])
+        );
+        assert_eq!(
+            success_b["requested_input_modalities"],
+            serde_json::json!(["raster"])
+        );
+        assert_eq!(
+            success_a["result"]["consumed_input_modalities"],
+            serde_json::json!(["online_strokes"])
+        );
+        assert_eq!(
+            success_b["result"]["consumed_input_modalities"],
+            serde_json::json!(["raster"])
+        );
+        assert_eq!(
+            success_a["provider_capabilities"]["inputs"],
+            serde_json::json!(["online_strokes"])
+        );
+        assert_eq!(
+            success_b["provider_capabilities"]["inputs"],
+            serde_json::json!(["raster"])
+        );
         assert_eq!(success_a["source_revision"], success_b["source_revision"]);
         assert_eq!(
             success_a["source_revision"],
@@ -4778,7 +4874,37 @@ mod tests {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         );
-        assert_eq!(success_a["input_view_id"], success_b["input_view_id"]);
+        let raster_input_view_id = success_b["input_view_id"].as_str().unwrap();
+        let raster_input_view_hash = raster_input_view_id.strip_prefix("input-view-v1-").unwrap();
+        assert_eq!(raster_input_view_hash.len(), 16);
+        assert!(
+            raster_input_view_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_ne!(success_a["input_view_id"], success_b["input_view_id"]);
+        let canonical_binding = &success_a["canonical_ink_comparison_binding"];
+        assert_eq!(
+            canonical_binding,
+            &success_b["canonical_ink_comparison_binding"]
+        );
+        assert_eq!(canonical_binding["schema_version"].as_u64(), Some(1));
+        assert_eq!(canonical_binding["raster_pixel_parity"], "unverified");
+        assert!(
+            canonical_binding["sha256_hex"]
+                .as_str()
+                .is_some_and(|value| value.len() == 64)
+        );
+        assert!(success_a["raster_input_byte_count"].is_null());
+        assert!(success_a["raster_input_sha256"].is_null());
+        assert_eq!(
+            success_b["raster_input_byte_count"].as_u64(),
+            Some(raster_bytes.len() as u64)
+        );
+        assert_eq!(
+            success_b["raster_input_sha256"].as_str(),
+            Some(raster_sha256_hex.as_str())
+        );
         assert_eq!(
             success_a["source_sample_sequences"],
             serde_json::json!([first_sample_sequence, second_sample_sequence])
@@ -4788,16 +4914,15 @@ mod tests {
             success_b["source_sample_sequences"]
         );
         assert_eq!(success_a["selected_strokes"], success_b["selected_strokes"]);
+        assert_eq!(
+            success_a["selected_strokes"],
+            serde_json::to_value(vec![BenchmarkStrokeRefV1::from(&target)]).unwrap()
+        );
+        assert_eq!(
+            success_b["result"]["candidates"][0]["stroke_ranges"],
+            serde_json::json!([])
+        );
 
-        let bytes_hex = |bytes: &[u8]| {
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
-            for byte in bytes {
-                encoded.push(char::from(HEX[usize::from(*byte >> 4)]));
-                encoded.push(char::from(HEX[usize::from(*byte & 0x0f)]));
-            }
-            encoded
-        };
         for configuration_id in ["cfg-success-a", "cfg-success-b"] {
             let run = find_run(configuration_id);
             assert!(run["raw_response_capture_complete"].as_bool().unwrap());
@@ -4820,8 +4945,24 @@ mod tests {
         assert_eq!(failed["status"], "failed");
         assert!(failed["result"].is_null());
         assert!(failed["provider_identity"].is_null());
+        assert_eq!(
+            failed["requested_input_modalities"],
+            serde_json::json!(["raster"])
+        );
         assert_eq!(failed["source_revision"], success_a["source_revision"]);
-        assert_eq!(failed["input_view_id"], success_a["input_view_id"]);
+        assert_eq!(failed["input_view_id"], success_b["input_view_id"]);
+        assert_eq!(
+            failed["canonical_ink_comparison_binding"],
+            success_b["canonical_ink_comparison_binding"]
+        );
+        assert_eq!(
+            failed["raster_input_byte_count"].as_u64(),
+            Some(raster_bytes.len() as u64)
+        );
+        assert_eq!(
+            failed["raster_input_sha256"].as_str(),
+            Some(raster_sha256_hex.as_str())
+        );
         assert_eq!(
             failed["source_sample_sequences"],
             success_a["source_sample_sequences"]
