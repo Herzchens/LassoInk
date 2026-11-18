@@ -2225,6 +2225,10 @@ impl CanonicalRasterImageV1 {
     pub(crate) fn png_bytes(&self) -> &[u8] {
         &self.png_bytes
     }
+
+    pub(crate) fn rgba8_premultiplied_srgb_top_down(&self) -> &[u8] {
+        &self.rgba8_premultiplied_srgb_top_down
+    }
 }
 
 /// Build a strict, immutable geometry view from the current append-only

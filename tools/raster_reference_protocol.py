@@ -56,6 +56,35 @@ class ProtocolError(ValueError):
     """A bounded framing, JSON, envelope, or configuration error."""
 
 
+_WORKER_FAILURE_MESSAGES = {
+    "invalid_provider_configuration": "the selected local provider configuration is unsupported",
+    "unsupported_model_revision": "the selected local model revision is unsupported",
+    "asset_directory_invalid": "the allowlisted local model directory is unavailable or invalid",
+    "asset_inventory_mismatch": "the local model files do not match the pinned allowlist",
+    "asset_read_failed": "an allowlisted local model file could not be read",
+    "asset_hash_mismatch": "an allowlisted local model file failed its pinned hash check",
+    "safetensors_index_invalid": "the local safetensors index is invalid",
+    "unsupported_platform": "the local CPU reference runtime requires Windows x64",
+    "insufficient_memory": "available physical memory is below the reference-worker requirement",
+    "insufficient_temp_disk": "available temporary disk space is below the reference-worker requirement",
+    "raster_decode_failed": "the bounded Raster PNG could not be decoded in the supported format",
+    "runtime_version_mismatch": "the local CPU reference runtime versions are unsupported",
+    "model_load_failed": "the pinned local model or processor could not be loaded strictly",
+    "inference_failed": "the bounded local CPU inference failed",
+}
+
+
+class WorkerFailure(Exception):
+    """A typed, path-free worker failure safe to return in an M4 failure frame."""
+
+    def __init__(self, code: str) -> None:
+        if code not in _WORKER_FAILURE_MESSAGES:
+            raise ValueError("unsupported worker failure code")
+        self.code = code
+        self.message = _WORKER_FAILURE_MESSAGES[code]
+        super().__init__(code)
+
+
 @dataclass(frozen=True, slots=True)
 class HandshakeClaims:
     """Provisional identity values claimed by the app's handshake frame."""
@@ -1056,7 +1085,20 @@ def run_one_shot_raster_session(
 
     # The processor receives a bounded detached copy; it cannot rewrite the
     # request provenance that is echoed into the response.
-    raw_text = processor(copy.deepcopy(request))
+    try:
+        raw_text = processor(copy.deepcopy(request))
+    except WorkerFailure as failure:
+        write_json_frame(
+            output_stream,
+            {
+                "kind": "failure",
+                "protocol_version": PROTOCOL_VERSION,
+                "code": failure.code,
+                "message": failure.message,
+            },
+            MAX_RESPONSE_FRAME_BYTES,
+        )
+        return
     response = build_text_response_frame(
         request,
         provider,
