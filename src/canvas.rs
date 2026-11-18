@@ -3869,11 +3869,7 @@ mod tests {
         );
 
         let target = projection_target("missing-position-proof", "device-a");
-        let mut state = committed_projection_state(
-            &target,
-            frame,
-            &[(1, 10, 60), (2, 20, 70)],
-        );
+        let mut state = committed_projection_state(&target, frame, &[(1, 10, 60), (2, 20, 70)]);
         state.physical_samples[0].sample.position = None;
         assert!(
             build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).is_err()
