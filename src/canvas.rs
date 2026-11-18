@@ -6,6 +6,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use sha2::{Digest, Sha256};
+use tiny_skia::{
+    Color, ColorSpace, FillRule, IntSize, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke,
+    Transform as RasterTransform,
+};
+
 use crate::journal::{
     EditCommand, JournalError, JournalMetadata, JournalReplayState, MetadataScope, NativeTimestamp,
     PhysicalSample, RawPosition, RawPressure, StrokeRef, StrokeViewFrame,
@@ -23,6 +29,23 @@ const MAX_CANVAS_STROKES: usize = 16_384;
 const MAX_POINTS_PER_STROKE: usize = 131_072;
 const MAX_VISIBLE_POINTS: usize = 131_072;
 const MAX_ACTIVE_DIRECT_STROKES: usize = 256;
+// Keep the projection plan within the current bounded provider-view limits.
+const MAX_CANONICAL_RASTER_STROKES: usize = 512;
+const MAX_CANONICAL_RASTER_SAMPLES: usize = 4096;
+const MAX_CANONICAL_RASTER_RAW_SAMPLE_BYTES: usize = 1024 * 1024;
+const MAX_CANONICAL_RASTER_SINGLE_SAMPLE_BYTES: usize = 8192;
+const MAX_CANONICAL_RASTER_OUTPUT_DIMENSION: u32 = 2048;
+const MAX_CANONICAL_RASTER_OUTPUT_PIXELS: u64 = 262_144;
+const MAX_CANONICAL_RASTER_OUTPUT_BYTES: u64 = 1024 * 1024;
+const MAX_CANONICAL_RASTER_PNG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CANONICAL_RASTER_CROP_DIMENSION: u64 = 1_048_576;
+const MAX_CANONICAL_RASTER_CROP_AREA: u64 = 67_108_864;
+const CANONICAL_RASTER_FIXED_ONE: i128 = 1 << 16;
+const CANONICAL_RASTER_BYTES_PER_PIXEL: u32 = 4;
+const CANONICAL_RASTER_BACKGROUND_RGBA: [u8; 4] = [255, 255, 255, 255];
+const CANONICAL_RASTER_INK_RGBA: [u8; 4] = [32, 32, 32, 255];
+const CANONICAL_RASTER_INK_WIDTH_16_16: u32 = 2 << 16;
+const CANONICAL_RASTER_RENDERER_VERSION: &str = "tiny-skia/0.12.0;canonical-raster-v1";
 const TOOLBAR_HEIGHT: i32 = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,6 +298,9 @@ pub(crate) enum CanvasError {
     StrokeSequenceExhausted,
     MissingStrokeViewFrame,
     StrokeViewFrameMismatch,
+    InvalidCanonicalRasterProjection(&'static str),
+    RasterAllocationFailed,
+    RasterEncodingFailed,
     Journal(JournalErrorKindForCanvas),
 }
 
@@ -1858,6 +1884,1482 @@ impl CanvasScene {
     }
 }
 
+/// A validated geometry-only projection of the selected, committed Direct
+/// samples. `samples_in_journal_order` is never sorted by source clock or
+/// `StrokeRef`; `source_sample` preserves the exact immutable journal payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRasterProjectionPlanV1 {
+    journal_id: String,
+    logical_revision: u64,
+    last_sequence: u64,
+    /// The caller's selection order is kept separately from physical sample order.
+    selected_strokes: Vec<StrokeRef>,
+    samples_in_journal_order: Vec<CanonicalRasterProjectionSampleV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRasterProjectionSampleV1 {
+    journal_sequence: u64,
+    source_sequence_raw: u64,
+    stroke_ref: StrokeRef,
+    view_frame: StrokeViewFrame,
+    /// Exact source values are copied as evidence and are never rewritten by
+    /// the derived mapping below.
+    source_sample: PhysicalSample,
+    effective_position: RawPosition,
+    /// Position mapped through the captured stroke frame into the default
+    /// canvas view. This is geometry only; no raster pixels are generated here.
+    canonical_canvas_position_px: CanvasPointPx,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRasterProjectionCropV1 {
+    /// Inclusive bounds in the plan's default-canvas pixel coordinates.
+    pub left_px: i32,
+    pub top_px: i32,
+    /// Exclusive bounds. A point on the right or bottom edge is rejected.
+    pub right_px_exclusive: i32,
+    pub bottom_px_exclusive: i32,
+}
+
+macro_rules! raster_spec_enum {
+    ($name:ident, $variant:ident) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub(crate) enum $name {
+            $variant,
+        }
+    };
+}
+
+raster_spec_enum!(CanonicalRasterAspectRatioPolicyV1, FitContainCentered);
+raster_spec_enum!(CanonicalRasterPixelLayoutV1, Rgba8PremultipliedSrgbTopDown);
+raster_spec_enum!(CanonicalRasterCoveragePolicyV1, Antialiased);
+raster_spec_enum!(CanonicalRasterStrokeCapV1, Round);
+raster_spec_enum!(CanonicalRasterStrokeJoinV1, Round);
+raster_spec_enum!(CanonicalRasterRoundingPolicyV1, NearestTiesAwayQ16);
+raster_spec_enum!(
+    CanonicalRasterClippingPolicyV1,
+    RejectPointsOutsideSourceCropClipCoverageAtOutputBounds
+);
+raster_spec_enum!(
+    CanonicalRasterSinglePointPolicyV1,
+    OpaqueDiscAtObservedPoint
+);
+raster_spec_enum!(CanonicalRasterStrokeOrderPolicyV1, JournalFirstOccurrence);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRasterProjectionSpecV1 {
+    schema_version: u32,
+    output_width_px: u32,
+    output_height_px: u32,
+    source_crop: CanonicalRasterProjectionCropV1,
+    aspect_ratio_policy: CanonicalRasterAspectRatioPolicyV1,
+    pixel_layout: CanonicalRasterPixelLayoutV1,
+    coverage_policy: CanonicalRasterCoveragePolicyV1,
+    background_rgba: [u8; 4],
+    committed_ink_rgba: [u8; 4],
+    stroke_width_16_16: u32,
+    stroke_cap: CanonicalRasterStrokeCapV1,
+    stroke_join: CanonicalRasterStrokeJoinV1,
+    rounding_policy: CanonicalRasterRoundingPolicyV1,
+    clipping_policy: CanonicalRasterClippingPolicyV1,
+    single_point_policy: CanonicalRasterSinglePointPolicyV1,
+    stroke_order_policy: CanonicalRasterStrokeOrderPolicyV1,
+}
+
+impl CanonicalRasterProjectionSpecV1 {
+    pub(crate) fn new(
+        output_width_px: u32,
+        output_height_px: u32,
+        source_crop: CanonicalRasterProjectionCropV1,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            output_width_px,
+            output_height_px,
+            source_crop,
+            aspect_ratio_policy: CanonicalRasterAspectRatioPolicyV1::FitContainCentered,
+            pixel_layout: CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown,
+            coverage_policy: CanonicalRasterCoveragePolicyV1::Antialiased,
+            background_rgba: CANONICAL_RASTER_BACKGROUND_RGBA,
+            committed_ink_rgba: CANONICAL_RASTER_INK_RGBA,
+            stroke_width_16_16: CANONICAL_RASTER_INK_WIDTH_16_16,
+            stroke_cap: CanonicalRasterStrokeCapV1::Round,
+            stroke_join: CanonicalRasterStrokeJoinV1::Round,
+            rounding_policy: CanonicalRasterRoundingPolicyV1::NearestTiesAwayQ16,
+            clipping_policy:
+                CanonicalRasterClippingPolicyV1::RejectPointsOutsideSourceCropClipCoverageAtOutputBounds,
+            single_point_policy: CanonicalRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint,
+            stroke_order_policy: CanonicalRasterStrokeOrderPolicyV1::JournalFirstOccurrence,
+        }
+    }
+
+    fn validate(&self) -> Result<(i128, i128, u32, u32), CanvasError> {
+        if self.schema_version != 1
+            || self.output_width_px == 0
+            || self.output_height_px == 0
+            || self.output_width_px > MAX_CANONICAL_RASTER_OUTPUT_DIMENSION
+            || self.output_height_px > MAX_CANONICAL_RASTER_OUTPUT_DIMENSION
+            || self.background_rgba != CANONICAL_RASTER_BACKGROUND_RGBA
+            || self.committed_ink_rgba != CANONICAL_RASTER_INK_RGBA
+            || self.stroke_width_16_16 != CANONICAL_RASTER_INK_WIDTH_16_16
+        {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "raster projection spec has unsupported version, bounds, or ink style",
+            ));
+        }
+
+        let output_pixels = u64::from(self.output_width_px)
+            .checked_mul(u64::from(self.output_height_px))
+            .ok_or(CanvasError::InvalidTransform)?;
+        let row_stride_bytes = self
+            .output_width_px
+            .checked_mul(CANONICAL_RASTER_BYTES_PER_PIXEL)
+            .ok_or(CanvasError::InvalidTransform)?;
+        let output_buffer_bytes = row_stride_bytes
+            .checked_mul(self.output_height_px)
+            .ok_or(CanvasError::InvalidTransform)?;
+        if output_pixels > MAX_CANONICAL_RASTER_OUTPUT_PIXELS
+            || u64::from(output_buffer_bytes) > MAX_CANONICAL_RASTER_OUTPUT_BYTES
+        {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "raster output pixel or byte cap exceeded",
+            ));
+        }
+
+        let crop_width =
+            i128::from(self.source_crop.right_px_exclusive) - i128::from(self.source_crop.left_px);
+        let crop_height =
+            i128::from(self.source_crop.bottom_px_exclusive) - i128::from(self.source_crop.top_px);
+        if crop_width <= 0
+            || crop_height <= 0
+            || crop_width > i128::from(MAX_CANONICAL_RASTER_CROP_DIMENSION)
+            || crop_height > i128::from(MAX_CANONICAL_RASTER_CROP_DIMENSION)
+        {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "source crop is empty, reversed, or exceeds its dimension cap",
+            ));
+        }
+        let crop_area = crop_width
+            .checked_mul(crop_height)
+            .ok_or(CanvasError::InvalidTransform)?;
+        if crop_area > i128::from(MAX_CANONICAL_RASTER_CROP_AREA) {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "source crop area cap exceeded",
+            ));
+        }
+        Ok((
+            crop_width,
+            crop_height,
+            row_stride_bytes,
+            output_buffer_bytes,
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRasterOutputPointV1 {
+    journal_sequence: u64,
+    source_sequence_raw: u64,
+    stroke_ref: StrokeRef,
+    /// Fixed-point pixel coordinates with 16 fractional bits.
+    x_subpixel_16_16: i64,
+    y_subpixel_16_16: i64,
+    /// A tap remains one source point; the later backend paints the declared disc.
+    is_single_point_stroke: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRasterOutputGeometryV1 {
+    schema_version: u32,
+    source_journal_id: String,
+    source_logical_revision: u64,
+    source_last_sequence: u64,
+    /// Fingerprints are computed from actual owned plan data and spec fields.
+    source_content_sha256: [u8; 32],
+    projection_spec_sha256: [u8; 32],
+    geometry_sha256: [u8; 32],
+    spec: CanonicalRasterProjectionSpecV1,
+    output_width_px: u32,
+    output_height_px: u32,
+    row_stride_bytes: u32,
+    output_buffer_bytes: u32,
+    /// Canonical render order derives from first physical journal occurrence.
+    stroke_draw_order: Vec<StrokeRef>,
+    /// Original caller selection metadata is retained outside the render identity.
+    caller_selection_order: Vec<StrokeRef>,
+    points_in_journal_order: Vec<CanonicalRasterOutputPointV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalRasterImageV1 {
+    schema_version: u32,
+    renderer_version: &'static str,
+    source_journal_id: String,
+    source_logical_revision: u64,
+    source_last_sequence: u64,
+    source_content_sha256: [u8; 32],
+    projection_spec_sha256: [u8; 32],
+    geometry_sha256: [u8; 32],
+    output_width_px: u32,
+    output_height_px: u32,
+    row_stride_bytes: u32,
+    pixel_layout: CanonicalRasterPixelLayoutV1,
+    /// Owned, top-down, premultiplied RGBA8 pixel bytes.
+    rgba8_premultiplied_srgb_top_down: Vec<u8>,
+    /// Encoded PNG bytes, retained separately from the canonical pixel buffer.
+    png_bytes: Vec<u8>,
+    pixel_bytes_sha256: [u8; 32],
+    png_bytes_sha256: [u8; 32],
+    /// Binds source/spec/geometry, renderer identity, layout and both byte hashes.
+    raster_artifact_sha256: [u8; 32],
+}
+
+impl CanonicalRasterOutputGeometryV1 {
+    pub(crate) fn source_revision_parts(&self) -> (&str, u64, u64) {
+        (
+            &self.source_journal_id,
+            self.source_logical_revision,
+            self.source_last_sequence,
+        )
+    }
+
+    pub(crate) fn source_content_sha256(&self) -> [u8; 32] {
+        self.source_content_sha256
+    }
+
+    pub(crate) fn projection_spec_sha256(&self) -> [u8; 32] {
+        self.projection_spec_sha256
+    }
+
+    pub(crate) fn geometry_sha256(&self) -> [u8; 32] {
+        self.geometry_sha256
+    }
+
+    pub(crate) fn geometry_schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub(crate) fn projection_schema_version(&self) -> u32 {
+        self.spec.schema_version
+    }
+
+    pub(crate) fn canonical_stroke_draw_order(&self) -> &[StrokeRef] {
+        &self.stroke_draw_order
+    }
+
+    pub(crate) fn caller_selection_order(&self) -> &[StrokeRef] {
+        &self.caller_selection_order
+    }
+
+    pub(crate) fn physical_sample_sequence_provenance(
+        &self,
+    ) -> impl Iterator<Item = (&StrokeRef, u64, u64)> + '_ {
+        self.points_in_journal_order.iter().map(|point| {
+            (
+                &point.stroke_ref,
+                point.journal_sequence,
+                point.source_sequence_raw,
+            )
+        })
+    }
+}
+
+impl CanonicalRasterImageV1 {
+    pub(crate) fn source_revision_parts(&self) -> (&str, u64, u64) {
+        (
+            &self.source_journal_id,
+            self.source_logical_revision,
+            self.source_last_sequence,
+        )
+    }
+
+    pub(crate) fn source_content_sha256(&self) -> [u8; 32] {
+        self.source_content_sha256
+    }
+
+    pub(crate) fn projection_spec_sha256(&self) -> [u8; 32] {
+        self.projection_spec_sha256
+    }
+
+    pub(crate) fn geometry_sha256(&self) -> [u8; 32] {
+        self.geometry_sha256
+    }
+
+    pub(crate) fn renderer_version(&self) -> &'static str {
+        self.renderer_version
+    }
+
+    pub(crate) fn output_dimensions_and_stride(&self) -> (u32, u32, u32) {
+        (
+            self.output_width_px,
+            self.output_height_px,
+            self.row_stride_bytes,
+        )
+    }
+
+    pub(crate) fn pixel_layout(&self) -> CanonicalRasterPixelLayoutV1 {
+        self.pixel_layout
+    }
+
+    pub(crate) fn pixel_layout_name(&self) -> &'static str {
+        match self.pixel_layout {
+            CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown => {
+                "rgba8_premultiplied_srgb_top_down"
+            }
+        }
+    }
+
+    pub(crate) fn pixel_bytes_sha256(&self) -> [u8; 32] {
+        self.pixel_bytes_sha256
+    }
+
+    pub(crate) fn png_bytes_sha256(&self) -> [u8; 32] {
+        self.png_bytes_sha256
+    }
+
+    pub(crate) fn raster_artifact_sha256(&self) -> [u8; 32] {
+        self.raster_artifact_sha256
+    }
+
+    pub(crate) fn png_bytes(&self) -> &[u8] {
+        &self.png_bytes
+    }
+}
+
+/// Build a strict, immutable geometry view from the current append-only
+/// journal projection. No session-origin/default-frame fallback is used here:
+/// every selected stroke must have exactly one valid captured start frame.
+pub(crate) fn build_canonical_raster_projection_plan(
+    state: &JournalReplayState,
+    selected_strokes: &[StrokeRef],
+) -> Result<CanonicalRasterProjectionPlanV1, CanvasError> {
+    if state.journal_id.is_empty()
+        || selected_strokes.is_empty()
+        || selected_strokes.len() > MAX_CANONICAL_RASTER_STROKES
+    {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "journal ID or selected stroke count is invalid",
+        ));
+    }
+
+    let mut stroke_frames = Vec::<(&StrokeRef, StrokeViewFrame)>::new();
+    stroke_frames
+        .try_reserve_exact(selected_strokes.len())
+        .map_err(|_| CanvasError::StrokeCapacityReached)?;
+    for (index, target) in selected_strokes.iter().enumerate() {
+        if selected_strokes[..index].contains(target) {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "selected StrokeRefs must be unique",
+            ));
+        }
+        if target.journal_id != state.journal_id
+            || target.source_api != PROVISIONAL_DIRECT_SOURCE_API
+            || target.stroke_id.is_empty()
+        {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "selected stroke is outside this journal or unsupported Direct source",
+            ));
+        }
+
+        let mut matching_starts = state
+            .stroke_starts
+            .iter()
+            .filter(|start| &start.target == target);
+        let start = matching_starts
+            .next()
+            .ok_or(CanvasError::MissingStrokeViewFrame)?;
+        if matching_starts.next().is_some() {
+            return Err(CanvasError::StrokeViewFrameMismatch);
+        }
+        if !start.view_frame.is_valid()
+            || i32::try_from(start.view_frame.screen_origin_x_px).is_err()
+            || i32::try_from(start.view_frame.screen_origin_y_px).is_err()
+        {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "selected stroke has an invalid captured view frame or screen origin",
+            ));
+        }
+        // The initial header epoch intentionally keeps marker-less legacy
+        // strokes visible. A typed started stroke is stricter: it needs a
+        // durable commit in history and an active visible logical state.
+        let has_durable_commit = state.edit_actions.iter().any(|action| {
+            matches!(
+                &action.command,
+                EditCommand::StrokeVisibility { targets, visible: true }
+                    if targets.contains(target)
+            )
+        });
+        if !has_durable_commit {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "selected started stroke has no durable commit history",
+            ));
+        }
+        let mut explicit_visibility = None;
+        for action in state.edit_actions.iter().filter(|action| action.active) {
+            match &action.command {
+                EditCommand::Tombstone { targets } if targets.contains(target) => {
+                    explicit_visibility = Some(false);
+                }
+                EditCommand::Restore { targets } if targets.contains(target) => {
+                    explicit_visibility = Some(true);
+                }
+                EditCommand::StrokeVisibility { targets, visible } if targets.contains(target) => {
+                    explicit_visibility = Some(*visible);
+                }
+                _ => {}
+            }
+        }
+        if explicit_visibility != Some(true) {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "selected started stroke is not currently visible",
+            ));
+        }
+        stroke_frames.push((target, start.view_frame));
+    }
+
+    let projected = state.projected_samples()?;
+    let mut samples_in_journal_order = Vec::new();
+    let mut selected_sample_counts = Vec::new();
+    selected_sample_counts
+        .try_reserve_exact(selected_strokes.len())
+        .map_err(|_| CanvasError::StrokeCapacityReached)?;
+    selected_sample_counts.resize(selected_strokes.len(), 0usize);
+
+    let mut previous_journal_sequence = None;
+    let mut total_raw_sample_bytes = 0usize;
+    for projected_sample in projected {
+        if previous_journal_sequence.is_some_and(|previous| projected_sample.sequence <= previous) {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "projected samples are not in strict journal sequence order",
+            ));
+        }
+        previous_journal_sequence = Some(projected_sample.sequence);
+        if projected_sample.sequence > state.last_sequence {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "projected sample sequence exceeds the journal revision",
+            ));
+        }
+
+        let Some(sample_stroke) = projected_sample.stroke_ref.as_ref() else {
+            continue;
+        };
+        let Some(selected_index) = stroke_frames
+            .iter()
+            .position(|(target, _)| *target == sample_stroke)
+        else {
+            continue;
+        };
+        let Some(raw_position) = projected_sample.sample.position.as_ref() else {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "selected sample has no raw position",
+            ));
+        };
+        let Some(effective_position) = projected_sample.effective_position.as_ref() else {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "selected sample has no derived position",
+            ));
+        };
+        if raw_position.coordinate_space != SCREEN_POSITION_SPACE
+            || raw_position.units != SCREEN_POSITION_UNITS
+            || effective_position.coordinate_space != SCREEN_POSITION_SPACE
+            || effective_position.units != SCREEN_POSITION_UNITS
+        {
+            return Err(CanvasError::UnsupportedCoordinateSpace {
+                coordinate_space: effective_position.coordinate_space.clone(),
+                units: effective_position.units.clone(),
+            });
+        }
+        if i32::try_from(raw_position.x_raw).is_err() || i32::try_from(raw_position.y_raw).is_err()
+        {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "raw Direct screen position is outside the native POINT range",
+            ));
+        }
+
+        let (stroke_ref, view_frame) = stroke_frames[selected_index];
+        if projected_sample.sample.source_api != PROVISIONAL_DIRECT_SOURCE_API
+            || sample_stroke.source_api != PROVISIONAL_DIRECT_SOURCE_API
+        {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "selected sample source does not match the supported Direct source",
+            ));
+        }
+        let canonical_canvas_position_px = CanvasViewport::default()
+            .map_raw_point_in_stroke_frame(effective_position, view_frame)?;
+        if projected_sample.sample.raw_payload.len() > MAX_CANONICAL_RASTER_SINGLE_SAMPLE_BYTES {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "selected raw sample payload exceeds its fixed byte cap",
+            ));
+        }
+        total_raw_sample_bytes = total_raw_sample_bytes
+            .checked_add(projected_sample.sample.raw_payload.len())
+            .ok_or(CanvasError::PointCapacityReached)?;
+        if total_raw_sample_bytes > MAX_CANONICAL_RASTER_RAW_SAMPLE_BYTES {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "selected raw sample payload total exceeds its fixed byte cap",
+            ));
+        }
+        if samples_in_journal_order.len() >= MAX_CANONICAL_RASTER_SAMPLES {
+            return Err(CanvasError::PointCapacityReached);
+        }
+        samples_in_journal_order
+            .try_reserve(1)
+            .map_err(|_| CanvasError::PointCapacityReached)?;
+        samples_in_journal_order.push(CanonicalRasterProjectionSampleV1 {
+            journal_sequence: projected_sample.sequence,
+            source_sequence_raw: projected_sample.sample.source_sequence,
+            stroke_ref: stroke_ref.to_owned(),
+            view_frame,
+            source_sample: (*projected_sample.sample).clone(),
+            effective_position: effective_position.to_owned(),
+            canonical_canvas_position_px,
+        });
+        selected_sample_counts[selected_index] = selected_sample_counts[selected_index]
+            .checked_add(1)
+            .ok_or(CanvasError::PointCapacityReached)?;
+    }
+
+    if selected_sample_counts.contains(&0) {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "selected stroke has no visible committed sample in this journal revision",
+        ));
+    }
+
+    let mut selected_stroke_snapshot = Vec::new();
+    selected_stroke_snapshot
+        .try_reserve_exact(selected_strokes.len())
+        .map_err(|_| CanvasError::StrokeCapacityReached)?;
+    selected_stroke_snapshot.extend(selected_strokes.iter().cloned());
+
+    Ok(CanonicalRasterProjectionPlanV1 {
+        journal_id: state.journal_id.to_owned(),
+        logical_revision: state.logical_revision,
+        last_sequence: state.last_sequence,
+        selected_strokes: selected_stroke_snapshot,
+        samples_in_journal_order,
+    })
+}
+
+pub(crate) fn transform_canonical_raster_geometry(
+    plan: &CanonicalRasterProjectionPlanV1,
+    spec: &CanonicalRasterProjectionSpecV1,
+) -> Result<CanonicalRasterOutputGeometryV1, CanvasError> {
+    let (crop_width, crop_height, row_stride_bytes, output_buffer_bytes) = spec.validate()?;
+    if plan.journal_id.is_empty()
+        || plan.selected_strokes.is_empty()
+        || plan.selected_strokes.len() > MAX_CANONICAL_RASTER_STROKES
+        || plan.samples_in_journal_order.is_empty()
+        || plan.samples_in_journal_order.len() > MAX_CANONICAL_RASTER_SAMPLES
+    {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "owned source plan is empty or exceeds its fixed item caps",
+        ));
+    }
+
+    let mut frame_by_selected_stroke = Vec::new();
+    frame_by_selected_stroke
+        .try_reserve_exact(plan.selected_strokes.len())
+        .map_err(|_| CanvasError::StrokeCapacityReached)?;
+    let mut sample_counts = Vec::new();
+    sample_counts
+        .try_reserve_exact(plan.selected_strokes.len())
+        .map_err(|_| CanvasError::StrokeCapacityReached)?;
+    sample_counts.resize(plan.selected_strokes.len(), 0usize);
+    for (index, stroke) in plan.selected_strokes.iter().enumerate() {
+        if plan.selected_strokes[..index].contains(stroke)
+            || stroke.journal_id != plan.journal_id
+            || stroke.source_api != PROVISIONAL_DIRECT_SOURCE_API
+            || stroke.stroke_id.is_empty()
+        {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "output stroke order contains a duplicate or unsupported StrokeRef",
+            ));
+        }
+        frame_by_selected_stroke.push(None::<StrokeViewFrame>);
+    }
+
+    let mut previous_journal_sequence = None;
+    let mut total_raw_sample_bytes = 0usize;
+    for point in &plan.samples_in_journal_order {
+        if previous_journal_sequence.is_some_and(|sequence| point.journal_sequence <= sequence)
+            || point.journal_sequence > plan.last_sequence
+            || point.source_sequence_raw != point.source_sample.source_sequence
+        {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "output plan points are not a valid physical journal sequence",
+            ));
+        }
+        previous_journal_sequence = Some(point.journal_sequence);
+
+        let selected_index = plan
+            .selected_strokes
+            .iter()
+            .position(|stroke| stroke == &point.stroke_ref)
+            .ok_or(CanvasError::InvalidCanonicalRasterProjection(
+                "output point refers to an unselected stroke",
+            ))?;
+        if point.stroke_ref.journal_id != plan.journal_id
+            || point.stroke_ref.source_api != PROVISIONAL_DIRECT_SOURCE_API
+            || point.source_sample.source_api != PROVISIONAL_DIRECT_SOURCE_API
+            || point.source_sample.session_id != point.stroke_ref.session_id
+            || point.source_sample.source_device_id != point.stroke_ref.device_id
+            || point.source_sample.pointer_id != point.stroke_ref.pointer_id
+            || point.source_sample.stroke_id.as_deref() != Some(point.stroke_ref.stroke_id.as_str())
+        {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "output point raw provenance does not match its selected StrokeRef",
+            ));
+        }
+
+        let raw_position = point.source_sample.position.as_ref().ok_or(
+            CanvasError::InvalidCanonicalRasterProjection("output point has no raw position"),
+        )?;
+        if raw_position.coordinate_space != SCREEN_POSITION_SPACE
+            || raw_position.units != SCREEN_POSITION_UNITS
+            || i32::try_from(raw_position.x_raw).is_err()
+            || i32::try_from(raw_position.y_raw).is_err()
+            || point.effective_position.coordinate_space != SCREEN_POSITION_SPACE
+            || point.effective_position.units != SCREEN_POSITION_UNITS
+            || !point.view_frame.is_valid()
+            || i32::try_from(point.view_frame.screen_origin_x_px).is_err()
+            || i32::try_from(point.view_frame.screen_origin_y_px).is_err()
+        {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "output point position or captured frame is unsupported",
+            ));
+        }
+        if frame_by_selected_stroke[selected_index].is_some_and(|frame| frame != point.view_frame) {
+            return Err(CanvasError::StrokeViewFrameMismatch);
+        }
+        frame_by_selected_stroke[selected_index] = Some(point.view_frame);
+        let expected_canvas_position = CanvasViewport::default()
+            .map_raw_point_in_stroke_frame(&point.effective_position, point.view_frame)?;
+        if expected_canvas_position != point.canonical_canvas_position_px {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "stored canonical canvas position does not match its source frame",
+            ));
+        }
+        if point.source_sample.raw_payload.len() > MAX_CANONICAL_RASTER_SINGLE_SAMPLE_BYTES {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "output point raw payload exceeds its fixed byte cap",
+            ));
+        }
+        total_raw_sample_bytes = total_raw_sample_bytes
+            .checked_add(point.source_sample.raw_payload.len())
+            .ok_or(CanvasError::PointCapacityReached)?;
+        if total_raw_sample_bytes > MAX_CANONICAL_RASTER_RAW_SAMPLE_BYTES {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "output point raw payload total exceeds its fixed byte cap",
+            ));
+        }
+        sample_counts[selected_index] = sample_counts[selected_index]
+            .checked_add(1)
+            .ok_or(CanvasError::PointCapacityReached)?;
+    }
+    if frame_by_selected_stroke.iter().any(Option::is_none) || sample_counts.contains(&0) {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "output plan contains a selected stroke without visible committed geometry",
+        ));
+    }
+
+    let stroke_draw_order = journal_first_occurrence_stroke_order(plan)?;
+    let source_content_sha256 = hash_canonical_raster_source(plan, &stroke_draw_order);
+    let projection_spec_sha256 =
+        hash_canonical_raster_spec(spec, row_stride_bytes, output_buffer_bytes);
+    let mut points_in_journal_order = Vec::new();
+    points_in_journal_order
+        .try_reserve_exact(plan.samples_in_journal_order.len())
+        .map_err(|_| CanvasError::PointCapacityReached)?;
+    for point in &plan.samples_in_journal_order {
+        let selected_index = plan
+            .selected_strokes
+            .iter()
+            .position(|stroke| stroke == &point.stroke_ref)
+            .ok_or(CanvasError::InvalidCanonicalRasterProjection(
+                "output point refers to an unselected stroke",
+            ))?;
+        let (x_subpixel_16_16, y_subpixel_16_16) = map_canonical_point_to_output(
+            point.canonical_canvas_position_px,
+            spec,
+            crop_width,
+            crop_height,
+        )?;
+        points_in_journal_order.push(CanonicalRasterOutputPointV1 {
+            journal_sequence: point.journal_sequence,
+            source_sequence_raw: point.source_sequence_raw,
+            stroke_ref: point.stroke_ref.clone(),
+            x_subpixel_16_16,
+            y_subpixel_16_16,
+            is_single_point_stroke: sample_counts[selected_index] == 1,
+        });
+    }
+
+    let mut caller_selection_order = Vec::new();
+    caller_selection_order
+        .try_reserve_exact(plan.selected_strokes.len())
+        .map_err(|_| CanvasError::StrokeCapacityReached)?;
+    caller_selection_order.extend(plan.selected_strokes.iter().cloned());
+    let mut geometry = CanonicalRasterOutputGeometryV1 {
+        schema_version: 1,
+        source_journal_id: plan.journal_id.clone(),
+        source_logical_revision: plan.logical_revision,
+        source_last_sequence: plan.last_sequence,
+        source_content_sha256,
+        projection_spec_sha256,
+        geometry_sha256: [0; 32],
+        spec: spec.clone(),
+        output_width_px: spec.output_width_px,
+        output_height_px: spec.output_height_px,
+        row_stride_bytes,
+        output_buffer_bytes,
+        stroke_draw_order,
+        caller_selection_order,
+        points_in_journal_order,
+    };
+    geometry.geometry_sha256 = hash_canonical_raster_geometry(&geometry);
+    Ok(geometry)
+}
+
+/// Render the already-validated canonical geometry with the pinned CPU
+/// backend. This creates a projection artifact only; it does not claim parity
+/// with an external rasterizer, UI frame, or recognition model preprocessing.
+pub(crate) fn render_canonical_raster(
+    geometry: &CanonicalRasterOutputGeometryV1,
+) -> Result<CanonicalRasterImageV1, CanvasError> {
+    validate_canonical_raster_geometry_for_render(geometry)?;
+
+    let pixel_byte_count = usize::try_from(geometry.output_buffer_bytes)
+        .map_err(|_| CanvasError::RasterAllocationFailed)?;
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(pixel_byte_count)
+        .map_err(|_| CanvasError::RasterAllocationFailed)?;
+    pixels.resize(pixel_byte_count, 0);
+    let pixmap_size = IntSize::from_wh(geometry.output_width_px, geometry.output_height_px)
+        .ok_or(CanvasError::RasterAllocationFailed)?;
+    let mut pixmap =
+        Pixmap::from_vec(pixels, pixmap_size).ok_or(CanvasError::RasterAllocationFailed)?;
+    pixmap.fill(Color::from_rgba8(
+        geometry.spec.background_rgba[0],
+        geometry.spec.background_rgba[1],
+        geometry.spec.background_rgba[2],
+        geometry.spec.background_rgba[3],
+    ));
+
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(
+        geometry.spec.committed_ink_rgba[0],
+        geometry.spec.committed_ink_rgba[1],
+        geometry.spec.committed_ink_rgba[2],
+        geometry.spec.committed_ink_rgba[3],
+    );
+    paint.anti_alias = match geometry.spec.coverage_policy {
+        CanonicalRasterCoveragePolicyV1::Antialiased => true,
+    };
+    // The projection's declared byte interpretation is sRGB. Pin the blend
+    // behavior too; the output remains premultiplied RGBA8 as tiny-skia stores it.
+    paint.colorspace = ColorSpace::FullSRGBGamma;
+    paint.force_hq_pipeline = true;
+
+    let stroke_width = checked_q16_to_renderer_f32(i64::from(geometry.spec.stroke_width_16_16))?;
+    let stroke = Stroke {
+        width: stroke_width,
+        line_cap: match geometry.spec.stroke_cap {
+            CanonicalRasterStrokeCapV1::Round => LineCap::Round,
+        },
+        line_join: match geometry.spec.stroke_join {
+            CanonicalRasterStrokeJoinV1::Round => LineJoin::Round,
+        },
+        ..Stroke::default()
+    };
+
+    for stroke_ref in &geometry.stroke_draw_order {
+        draw_canonical_raster_stroke(&mut pixmap, &paint, &stroke, geometry, stroke_ref)?;
+    }
+
+    if pixmap.data().len() != pixel_byte_count {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "renderer pixel buffer does not match the bounded RGBA8 layout",
+        ));
+    }
+    let mut rgba8_premultiplied_srgb_top_down = Vec::new();
+    rgba8_premultiplied_srgb_top_down
+        .try_reserve_exact(pixel_byte_count)
+        .map_err(|_| CanvasError::RasterAllocationFailed)?;
+    rgba8_premultiplied_srgb_top_down.extend_from_slice(pixmap.data());
+    let (pixels, remainder) = rgba8_premultiplied_srgb_top_down.as_chunks::<4>();
+    if !remainder.is_empty() || pixels.iter().any(|pixel| pixel[3] != 255) {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "opaque raster background or ink produced a non-opaque pixel",
+        ));
+    }
+
+    let png_bytes = pixmap
+        .encode_png()
+        .map_err(|_| CanvasError::RasterEncodingFailed)?;
+    if png_bytes.is_empty() || png_bytes.len() > MAX_CANONICAL_RASTER_PNG_BYTES {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "encoded PNG is empty or exceeds its fixed byte cap",
+        ));
+    }
+
+    let pixel_bytes_sha256 = Sha256::digest(&rgba8_premultiplied_srgb_top_down).into();
+    let png_bytes_sha256 = Sha256::digest(&png_bytes).into();
+    let mut image = CanonicalRasterImageV1 {
+        schema_version: 1,
+        renderer_version: CANONICAL_RASTER_RENDERER_VERSION,
+        source_journal_id: geometry.source_journal_id.clone(),
+        source_logical_revision: geometry.source_logical_revision,
+        source_last_sequence: geometry.source_last_sequence,
+        source_content_sha256: geometry.source_content_sha256,
+        projection_spec_sha256: geometry.projection_spec_sha256,
+        geometry_sha256: geometry.geometry_sha256,
+        output_width_px: geometry.output_width_px,
+        output_height_px: geometry.output_height_px,
+        row_stride_bytes: geometry.row_stride_bytes,
+        pixel_layout: geometry.spec.pixel_layout,
+        rgba8_premultiplied_srgb_top_down,
+        png_bytes,
+        pixel_bytes_sha256,
+        png_bytes_sha256,
+        raster_artifact_sha256: [0; 32],
+    };
+    image.raster_artifact_sha256 = hash_canonical_raster_artifact(&image);
+    Ok(image)
+}
+
+fn validate_canonical_raster_geometry_for_render(
+    geometry: &CanonicalRasterOutputGeometryV1,
+) -> Result<(), CanvasError> {
+    let (_, _, expected_stride, expected_buffer_bytes) = geometry.spec.validate()?;
+    let expected_spec_hash =
+        hash_canonical_raster_spec(&geometry.spec, expected_stride, expected_buffer_bytes);
+    if geometry.schema_version != 1
+        || geometry.source_journal_id.is_empty()
+        || geometry.output_width_px != geometry.spec.output_width_px
+        || geometry.output_height_px != geometry.spec.output_height_px
+        || geometry.row_stride_bytes != expected_stride
+        || geometry.output_buffer_bytes != expected_buffer_bytes
+        || geometry.projection_spec_sha256 != expected_spec_hash
+        || geometry.geometry_sha256 != hash_canonical_raster_geometry(geometry)
+        || geometry.stroke_draw_order.is_empty()
+        || geometry.stroke_draw_order.len() > MAX_CANONICAL_RASTER_STROKES
+        || geometry.points_in_journal_order.is_empty()
+        || geometry.points_in_journal_order.len() > MAX_CANONICAL_RASTER_SAMPLES
+        || geometry.caller_selection_order.len() != geometry.stroke_draw_order.len()
+    {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "raster geometry identity, dimensions, order, or item bounds are invalid",
+        ));
+    }
+
+    let q16_fixed_one = i64::from(1_u32 << 16);
+    let max_x_q16 = i64::from(geometry.output_width_px)
+        .checked_mul(q16_fixed_one)
+        .ok_or(CanvasError::InvalidTransform)?;
+    let max_y_q16 = i64::from(geometry.output_height_px)
+        .checked_mul(q16_fixed_one)
+        .ok_or(CanvasError::InvalidTransform)?;
+
+    let mut derived_order = Vec::<StrokeRef>::new();
+    derived_order
+        .try_reserve_exact(geometry.stroke_draw_order.len())
+        .map_err(|_| CanvasError::RasterAllocationFailed)?;
+    let mut counts = Vec::<(StrokeRef, usize)>::new();
+    counts
+        .try_reserve_exact(geometry.stroke_draw_order.len())
+        .map_err(|_| CanvasError::RasterAllocationFailed)?;
+    let mut previous_sequence = None;
+    for point in &geometry.points_in_journal_order {
+        if point.journal_sequence == 0
+            || point.journal_sequence > geometry.source_last_sequence
+            || previous_sequence.is_some_and(|previous| point.journal_sequence <= previous)
+            || point.stroke_ref.journal_id != geometry.source_journal_id
+            || point.stroke_ref.source_api != PROVISIONAL_DIRECT_SOURCE_API
+            || point.stroke_ref.stroke_id.is_empty()
+            || point.x_subpixel_16_16 < 0
+            || point.y_subpixel_16_16 < 0
+            || point.x_subpixel_16_16 > max_x_q16
+            || point.y_subpixel_16_16 > max_y_q16
+        {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "raster points are not bounded physical-order Direct geometry",
+            ));
+        }
+        previous_sequence = Some(point.journal_sequence);
+
+        if let Some(index) = counts
+            .iter()
+            .position(|(stroke_ref, _)| stroke_ref == &point.stroke_ref)
+        {
+            let entry = &mut counts[index];
+            entry.1 = entry
+                .1
+                .checked_add(1)
+                .ok_or(CanvasError::PointCapacityReached)?;
+        } else {
+            if derived_order.len() >= geometry.stroke_draw_order.len() {
+                return Err(CanvasError::InvalidCanonicalRasterProjection(
+                    "raster point references a stroke outside canonical draw order",
+                ));
+            }
+            derived_order.push(point.stroke_ref.clone());
+            counts.push((point.stroke_ref.clone(), 1));
+        }
+    }
+    if derived_order != geometry.stroke_draw_order
+        || counts.len() != geometry.stroke_draw_order.len()
+        || geometry
+            .caller_selection_order
+            .iter()
+            .enumerate()
+            .any(|(index, stroke)| {
+                geometry.caller_selection_order[..index].contains(stroke)
+                    || !geometry.stroke_draw_order.contains(stroke)
+            })
+        || counts
+            .iter()
+            .any(|(stroke, count)| !geometry.stroke_draw_order.contains(stroke) || *count == 0)
+    {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "raster stroke ordering or caller-selection provenance is inconsistent",
+        ));
+    }
+    for point in &geometry.points_in_journal_order {
+        let count = counts
+            .iter()
+            .find(|(stroke, _)| stroke == &point.stroke_ref)
+            .map(|(_, count)| *count)
+            .ok_or(CanvasError::InvalidCanonicalRasterProjection(
+                "raster stroke count is missing",
+            ))?;
+        if point.is_single_point_stroke != (count == 1) {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "single-sample marker disagrees with physical stroke sample count",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn draw_canonical_raster_stroke(
+    pixmap: &mut Pixmap,
+    paint: &Paint<'_>,
+    stroke: &Stroke,
+    geometry: &CanonicalRasterOutputGeometryV1,
+    stroke_ref: &StrokeRef,
+) -> Result<(), CanvasError> {
+    let mut builder = PathBuilder::new();
+    let mut first_renderer_point = None;
+    let mut first_q16 = None;
+    let mut all_points_repeat = true;
+    let mut point_count = 0usize;
+    for point in geometry
+        .points_in_journal_order
+        .iter()
+        .filter(|point| &point.stroke_ref == stroke_ref)
+    {
+        let q16 = (point.x_subpixel_16_16, point.y_subpixel_16_16);
+        let renderer_point = (
+            checked_q16_to_renderer_f32(q16.0)?,
+            checked_q16_to_renderer_f32(q16.1)?,
+        );
+        if let Some(first) = first_q16 {
+            if q16 != first {
+                all_points_repeat = false;
+            }
+            builder.line_to(renderer_point.0, renderer_point.1);
+        } else {
+            first_q16 = Some(q16);
+            first_renderer_point = Some(renderer_point);
+            builder.move_to(renderer_point.0, renderer_point.1);
+        }
+        point_count = point_count
+            .checked_add(1)
+            .ok_or(CanvasError::PointCapacityReached)?;
+    }
+    if point_count == 0 {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "canonical draw order contains a stroke with no points",
+        ));
+    }
+
+    let path = if point_count == 1 || all_points_repeat {
+        // A one-sample tap and a quantized/repeated-point stroke use only the
+        // observed point. This draws the explicitly specified opaque disc and
+        // never manufactures or stores another sample.
+        let (x, y) = first_renderer_point.ok_or(CanvasError::InvalidCanonicalRasterProjection(
+            "single-point center is missing",
+        ))?;
+        let radius = stroke.width / 2.0;
+        if !radius.is_finite() || radius <= 0.0 {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "canonical stroke radius is invalid",
+            ));
+        }
+        let mut circle = PathBuilder::new();
+        circle.push_circle(x, y, radius);
+        circle
+            .finish()
+            .ok_or(CanvasError::InvalidCanonicalRasterProjection(
+                "canonical tap disc could not be represented",
+            ))?
+    } else {
+        builder
+            .finish()
+            .ok_or(CanvasError::InvalidCanonicalRasterProjection(
+                "canonical stroke path could not be represented",
+            ))?
+    };
+
+    if point_count == 1 || all_points_repeat {
+        pixmap.fill_path(
+            &path,
+            paint,
+            FillRule::Winding,
+            RasterTransform::identity(),
+            None,
+        );
+    } else {
+        pixmap.stroke_path(&path, paint, stroke, RasterTransform::identity(), None);
+    }
+    Ok(())
+}
+
+fn checked_q16_to_renderer_f32(value: i64) -> Result<f32, CanvasError> {
+    let coordinate = value as f64 / CANONICAL_RASTER_FIXED_ONE as f64;
+    if !coordinate.is_finite() || coordinate.abs() > f64::from(f32::MAX) {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "Q16 coordinate cannot be represented by the renderer",
+        ));
+    }
+    let rendered = coordinate as f32;
+    if !rendered.is_finite() {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "Q16 coordinate conversion overflowed renderer precision",
+        ));
+    }
+    Ok(rendered)
+}
+
+fn journal_first_occurrence_stroke_order(
+    plan: &CanonicalRasterProjectionPlanV1,
+) -> Result<Vec<StrokeRef>, CanvasError> {
+    let mut order = Vec::new();
+    order
+        .try_reserve_exact(plan.selected_strokes.len())
+        .map_err(|_| CanvasError::StrokeCapacityReached)?;
+    for point in &plan.samples_in_journal_order {
+        if !order.contains(&point.stroke_ref) {
+            if !plan.selected_strokes.contains(&point.stroke_ref) {
+                return Err(CanvasError::InvalidCanonicalRasterProjection(
+                    "journal point is outside the selected stroke set",
+                ));
+            }
+            order.push(point.stroke_ref.clone());
+        }
+    }
+    if order.len() != plan.selected_strokes.len() {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "journal first-occurrence order does not cover the selected stroke set",
+        ));
+    }
+    Ok(order)
+}
+
+fn map_canonical_point_to_output(
+    point: CanvasPointPx,
+    spec: &CanonicalRasterProjectionSpecV1,
+    crop_width: i128,
+    crop_height: i128,
+) -> Result<(i64, i64), CanvasError> {
+    if point.x < spec.source_crop.left_px
+        || point.x >= spec.source_crop.right_px_exclusive
+        || point.y < spec.source_crop.top_px
+        || point.y >= spec.source_crop.bottom_px_exclusive
+    {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "projected point falls outside the declared source crop",
+        ));
+    }
+    let relative_x = i128::from(point.x) - i128::from(spec.source_crop.left_px);
+    let relative_y = i128::from(point.y) - i128::from(spec.source_crop.top_px);
+    let output_width = i128::from(spec.output_width_px);
+    let output_height = i128::from(spec.output_height_px);
+    let width_scale_cross = output_width
+        .checked_mul(crop_height)
+        .ok_or(CanvasError::InvalidTransform)?;
+    let height_scale_cross = output_height
+        .checked_mul(crop_width)
+        .ok_or(CanvasError::InvalidTransform)?;
+
+    let (x_numerator, x_denominator, y_numerator, y_denominator) =
+        if width_scale_cross <= height_scale_cross {
+            let vertical_padding_numerator = height_scale_cross - width_scale_cross;
+            let x_numerator = relative_x
+                .checked_mul(output_width)
+                .and_then(|value| value.checked_mul(CANONICAL_RASTER_FIXED_ONE))
+                .ok_or(CanvasError::InvalidTransform)?;
+            let y_numerator = relative_y
+                .checked_mul(output_width)
+                .and_then(|value| value.checked_mul(2))
+                .and_then(|value| value.checked_add(vertical_padding_numerator))
+                .and_then(|value| value.checked_mul(CANONICAL_RASTER_FIXED_ONE))
+                .ok_or(CanvasError::InvalidTransform)?;
+            (
+                x_numerator,
+                crop_width,
+                y_numerator,
+                crop_width
+                    .checked_mul(2)
+                    .ok_or(CanvasError::InvalidTransform)?,
+            )
+        } else {
+            let horizontal_padding_numerator = width_scale_cross - height_scale_cross;
+            let x_numerator = relative_x
+                .checked_mul(output_height)
+                .and_then(|value| value.checked_mul(2))
+                .and_then(|value| value.checked_add(horizontal_padding_numerator))
+                .and_then(|value| value.checked_mul(CANONICAL_RASTER_FIXED_ONE))
+                .ok_or(CanvasError::InvalidTransform)?;
+            let y_numerator = relative_y
+                .checked_mul(output_height)
+                .and_then(|value| value.checked_mul(CANONICAL_RASTER_FIXED_ONE))
+                .ok_or(CanvasError::InvalidTransform)?;
+            (
+                x_numerator,
+                crop_height
+                    .checked_mul(2)
+                    .ok_or(CanvasError::InvalidTransform)?,
+                y_numerator,
+                crop_height,
+            )
+        };
+    let x_subpixel_16_16 = round_nonnegative_ratio_ties_away(x_numerator, x_denominator)?;
+    let y_subpixel_16_16 = round_nonnegative_ratio_ties_away(y_numerator, y_denominator)?;
+    let output_x_limit = output_width
+        .checked_mul(CANONICAL_RASTER_FIXED_ONE)
+        .ok_or(CanvasError::InvalidTransform)?;
+    let output_y_limit = output_height
+        .checked_mul(CANONICAL_RASTER_FIXED_ONE)
+        .ok_or(CanvasError::InvalidTransform)?;
+    if x_subpixel_16_16 < 0
+        || y_subpixel_16_16 < 0
+        || i128::from(x_subpixel_16_16) > output_x_limit
+        || i128::from(y_subpixel_16_16) > output_y_limit
+    {
+        return Err(CanvasError::InvalidCanonicalRasterProjection(
+            "transformed center falls outside bounded output geometry",
+        ));
+    }
+    Ok((x_subpixel_16_16, y_subpixel_16_16))
+}
+
+fn round_nonnegative_ratio_ties_away(
+    numerator: i128,
+    denominator: i128,
+) -> Result<i64, CanvasError> {
+    if numerator < 0 || denominator <= 0 {
+        return Err(CanvasError::InvalidTransform);
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    let round_up = remainder
+        .checked_mul(2)
+        .ok_or(CanvasError::InvalidTransform)?
+        >= denominator;
+    let rounded = if round_up {
+        quotient
+            .checked_add(1)
+            .ok_or(CanvasError::InvalidTransform)?
+    } else {
+        quotient
+    };
+    i64::try_from(rounded).map_err(|_| CanvasError::InvalidTransform)
+}
+
+struct CanonicalRasterHashWriter(Sha256);
+
+impl CanonicalRasterHashWriter {
+    fn new(domain: &[u8]) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(domain);
+        Self(hash)
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.0.update([value]);
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.0.update(value.to_le_bytes());
+    }
+
+    fn i32(&mut self, value: i32) {
+        self.0.update(value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.0.update(value.to_le_bytes());
+    }
+
+    fn i64(&mut self, value: i64) {
+        self.0.update(value.to_le_bytes());
+    }
+
+    fn u128(&mut self, value: u128) {
+        self.0.update(value.to_le_bytes());
+    }
+
+    fn bytes(&mut self, value: &[u8]) {
+        self.u64(value.len() as u64);
+        self.0.update(value);
+    }
+
+    fn string(&mut self, value: &str) {
+        self.bytes(value.as_bytes());
+    }
+
+    fn optional_string(&mut self, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                self.string(value);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn optional_u64(&mut self, value: Option<u64>) {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                self.u64(value);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn optional_i32(&mut self, value: Option<i32>) {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                self.i32(value);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn stroke_ref(&mut self, stroke: &StrokeRef) {
+        self.string(&stroke.journal_id);
+        self.string(&stroke.session_id);
+        self.string(&stroke.source_api);
+        self.optional_string(stroke.device_id.as_deref());
+        self.optional_u64(stroke.pointer_id);
+        self.string(&stroke.stroke_id);
+    }
+
+    fn frame(&mut self, frame: StrokeViewFrame) {
+        self.i64(frame.screen_origin_x_px);
+        self.i64(frame.screen_origin_y_px);
+        self.u64(frame.dpi_scale_factor_bits);
+        self.u64(frame.canvas_zoom_bits);
+        self.u64(frame.canvas_pan_x_bits);
+        self.u64(frame.canvas_pan_y_bits);
+        self.u32(frame.toolbar_height_px);
+    }
+
+    fn position(&mut self, position: &RawPosition) {
+        self.string(&position.coordinate_space);
+        self.string(&position.units);
+        self.i64(position.x_raw);
+        self.i64(position.y_raw);
+    }
+
+    fn optional_position(&mut self, position: Option<&RawPosition>) {
+        match position {
+            Some(position) => {
+                self.u8(1);
+                self.position(position);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn optional_pressure(&mut self, pressure: Option<&RawPressure>) {
+        match pressure {
+            Some(pressure) => {
+                self.u8(1);
+                self.string(&pressure.representation);
+                self.string(&pressure.units);
+                self.u64(pressure.value_raw);
+                self.optional_u64(pressure.mask_raw);
+                self.optional_u64(pressure.minimum_raw);
+                self.optional_u64(pressure.maximum_raw);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn optional_timestamp(&mut self, timestamp: Option<&NativeTimestamp>) {
+        match timestamp {
+            Some(timestamp) => {
+                self.u8(1);
+                self.string(&timestamp.clock_domain);
+                self.string(&timestamp.units);
+                self.u64(timestamp.count_raw);
+                self.optional_u64(timestamp.frequency_hz);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn physical_sample(&mut self, sample: &PhysicalSample) {
+        self.string(&sample.session_id);
+        self.string(&sample.source_api);
+        self.optional_string(sample.source_device_id.as_deref());
+        self.optional_u64(sample.pointer_id);
+        self.optional_string(sample.stroke_id.as_deref());
+        self.u64(sample.source_sequence);
+        self.optional_string(sample.config_id.as_deref());
+        self.u128(sample.app_arrival_elapsed_ns);
+        self.optional_position(sample.position.as_ref());
+        self.optional_pressure(sample.pressure.as_ref());
+        self.optional_timestamp(sample.native_timestamp.as_ref());
+        self.optional_string(sample.contact_range_state.as_deref());
+        self.optional_u64(sample.button_state_raw);
+        self.optional_i32(sample.tilt_x_raw);
+        self.optional_i32(sample.tilt_y_raw);
+        self.optional_u64(sample.rotation_raw);
+        self.bytes(&sample.raw_payload);
+    }
+
+    fn finish(self) -> [u8; 32] {
+        self.0.finalize().into()
+    }
+}
+
+fn hash_canonical_raster_source(
+    plan: &CanonicalRasterProjectionPlanV1,
+    stroke_draw_order: &[StrokeRef],
+) -> [u8; 32] {
+    let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-source/v1\0");
+    hash.string(&plan.journal_id);
+    hash.u64(plan.logical_revision);
+    hash.u64(plan.last_sequence);
+    hash.u64(stroke_draw_order.len() as u64);
+    for stroke in stroke_draw_order {
+        hash.stroke_ref(stroke);
+    }
+    hash.u64(plan.samples_in_journal_order.len() as u64);
+    for point in &plan.samples_in_journal_order {
+        hash.u64(point.journal_sequence);
+        hash.u64(point.source_sequence_raw);
+        hash.stroke_ref(&point.stroke_ref);
+        hash.frame(point.view_frame);
+        hash.physical_sample(&point.source_sample);
+        hash.position(&point.effective_position);
+        hash.i32(point.canonical_canvas_position_px.x);
+        hash.i32(point.canonical_canvas_position_px.y);
+    }
+    hash.finish()
+}
+
+fn hash_canonical_raster_spec(
+    spec: &CanonicalRasterProjectionSpecV1,
+    row_stride_bytes: u32,
+    output_buffer_bytes: u32,
+) -> [u8; 32] {
+    let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-spec/v1\0");
+    hash.u32(spec.schema_version);
+    hash.u32(spec.output_width_px);
+    hash.u32(spec.output_height_px);
+    hash.i32(spec.source_crop.left_px);
+    hash.i32(spec.source_crop.top_px);
+    hash.i32(spec.source_crop.right_px_exclusive);
+    hash.i32(spec.source_crop.bottom_px_exclusive);
+    hash.u8(match spec.aspect_ratio_policy {
+        CanonicalRasterAspectRatioPolicyV1::FitContainCentered => 1,
+    });
+    hash.u8(match spec.pixel_layout {
+        CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown => 1,
+    });
+    hash.u8(match spec.coverage_policy {
+        CanonicalRasterCoveragePolicyV1::Antialiased => 1,
+    });
+    hash.bytes(&spec.background_rgba);
+    hash.bytes(&spec.committed_ink_rgba);
+    hash.u32(spec.stroke_width_16_16);
+    hash.u8(match spec.stroke_cap {
+        CanonicalRasterStrokeCapV1::Round => 1,
+    });
+    hash.u8(match spec.stroke_join {
+        CanonicalRasterStrokeJoinV1::Round => 1,
+    });
+    hash.u8(match spec.rounding_policy {
+        CanonicalRasterRoundingPolicyV1::NearestTiesAwayQ16 => 1,
+    });
+    hash.u8(match spec.clipping_policy {
+        CanonicalRasterClippingPolicyV1::RejectPointsOutsideSourceCropClipCoverageAtOutputBounds =>
+            1,
+    });
+    hash.u8(match spec.single_point_policy {
+        CanonicalRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint => 1,
+    });
+    hash.u8(match spec.stroke_order_policy {
+        CanonicalRasterStrokeOrderPolicyV1::JournalFirstOccurrence => 1,
+    });
+    hash.u32(row_stride_bytes);
+    hash.u32(output_buffer_bytes);
+    hash.finish()
+}
+
+fn hash_canonical_raster_geometry(geometry: &CanonicalRasterOutputGeometryV1) -> [u8; 32] {
+    let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-geometry/v1\0");
+    hash.bytes(&geometry.source_content_sha256);
+    hash.bytes(&geometry.projection_spec_sha256);
+    hash.u32(geometry.output_width_px);
+    hash.u32(geometry.output_height_px);
+    hash.u32(geometry.row_stride_bytes);
+    hash.u32(geometry.output_buffer_bytes);
+    hash.u64(geometry.stroke_draw_order.len() as u64);
+    for stroke in &geometry.stroke_draw_order {
+        hash.stroke_ref(stroke);
+    }
+    hash.u64(geometry.points_in_journal_order.len() as u64);
+    for point in &geometry.points_in_journal_order {
+        hash.u64(point.journal_sequence);
+        hash.u64(point.source_sequence_raw);
+        hash.stroke_ref(&point.stroke_ref);
+        hash.i64(point.x_subpixel_16_16);
+        hash.i64(point.y_subpixel_16_16);
+        hash.u8(u8::from(point.is_single_point_stroke));
+    }
+    hash.finish()
+}
+
+fn hash_canonical_raster_artifact(image: &CanonicalRasterImageV1) -> [u8; 32] {
+    let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-artifact/v1\0");
+    hash.u32(image.schema_version);
+    hash.string(image.renderer_version);
+    hash.string(&image.source_journal_id);
+    hash.u64(image.source_logical_revision);
+    hash.u64(image.source_last_sequence);
+    hash.bytes(&image.source_content_sha256);
+    hash.bytes(&image.projection_spec_sha256);
+    hash.bytes(&image.geometry_sha256);
+    hash.u32(image.output_width_px);
+    hash.u32(image.output_height_px);
+    hash.u32(image.row_stride_bytes);
+    hash.u8(match image.pixel_layout {
+        CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown => 1,
+    });
+    hash.bytes(&image.pixel_bytes_sha256);
+    hash.bytes(&image.png_bytes_sha256);
+    hash.finish()
+}
+
 fn polyline_distance_squared(points: &[CanvasPointPx], x: f64, y: f64) -> f64 {
     match points {
         [] => f64::INFINITY,
@@ -2132,6 +3634,843 @@ mod tests {
             rotation_raw: None,
             raw_payload: vec![source_sequence as u8, x as u8, y as u8],
         }
+    }
+
+    fn projection_target(stroke_id: &str, device_id: &str) -> StrokeRef {
+        StrokeRef {
+            journal_id: "canvas-project".to_owned(),
+            session_id: "session-canvas".to_owned(),
+            source_api: PROVISIONAL_DIRECT_SOURCE_API.to_owned(),
+            device_id: Some(device_id.to_owned()),
+            pointer_id: Some(12),
+            stroke_id: stroke_id.to_owned(),
+        }
+    }
+
+    fn projection_sample(
+        target: &StrokeRef,
+        source_sequence: u64,
+        x: i64,
+        y: i64,
+        app_arrival_elapsed_ns: u128,
+    ) -> PhysicalSample {
+        let mut physical = sample(source_sequence, x, y);
+        physical.session_id.clone_from(&target.session_id);
+        physical.source_api.clone_from(&target.source_api);
+        physical.source_device_id.clone_from(&target.device_id);
+        physical.pointer_id = target.pointer_id;
+        physical.stroke_id = Some(target.stroke_id.clone());
+        physical.app_arrival_elapsed_ns = app_arrival_elapsed_ns;
+        physical
+    }
+
+    fn append_projection_stroke(
+        writer: &mut JournalWriter,
+        target: &StrokeRef,
+        view_frame: StrokeViewFrame,
+        points: &[(u64, i64, i64)],
+        app_arrival_start: u128,
+    ) {
+        writer
+            .start_stroke(target.clone(), view_frame, app_arrival_start)
+            .unwrap();
+        for (index, (source_sequence, x, y)) in points.iter().copied().enumerate() {
+            writer
+                .append_sample(projection_sample(
+                    target,
+                    source_sequence,
+                    x,
+                    y,
+                    app_arrival_start + index as u128 + 1,
+                ))
+                .unwrap();
+        }
+        writer
+            .commit_stroke(target.clone(), app_arrival_start + points.len() as u128 + 1)
+            .unwrap();
+    }
+
+    fn committed_projection_fixture(
+        target: &StrokeRef,
+        view_frame: StrokeViewFrame,
+        points: &[(u64, i64, i64)],
+    ) -> (PathBuf, JournalWriter) {
+        let path = temp_path();
+        let mut writer = JournalWriter::create(path.clone(), header()).unwrap();
+        append_projection_stroke(&mut writer, target, view_frame, points, 1);
+        (path, writer)
+    }
+
+    fn committed_projection_state(
+        target: &StrokeRef,
+        view_frame: StrokeViewFrame,
+        points: &[(u64, i64, i64)],
+    ) -> JournalReplayState {
+        let (path, mut writer) = committed_projection_fixture(target, view_frame, points);
+        writer.flush().unwrap();
+        let state = writer.replay_state().clone();
+        drop(writer);
+        let _ = fs::remove_file(path);
+        state
+    }
+
+    #[test]
+    fn canonical_raster_projection_preserves_physical_order_and_mixed_stroke_frames() {
+        let first = projection_target("z-first-in-journal", "device-a");
+        let second = projection_target("a-second-in-journal", "device-b");
+        let first_frame = CanvasViewport::default()
+            .stroke_view_frame(
+                CanvasOrigin {
+                    x_screen_px: 100,
+                    y_screen_px: 200,
+                },
+                1.0,
+            )
+            .unwrap();
+        let second_frame = StrokeViewFrame {
+            screen_origin_x_px: 500,
+            screen_origin_y_px: 600,
+            dpi_scale_factor_bits: 1.5f64.to_bits(),
+            canvas_zoom_bits: 2.0f64.to_bits(),
+            canvas_pan_x_bits: 4.0f64.to_bits(),
+            canvas_pan_y_bits: 6.0f64.to_bits(),
+            toolbar_height_px: TOOLBAR_HEIGHT as u32,
+        };
+        let path = temp_path();
+        let mut writer = JournalWriter::create(path.clone(), header()).unwrap();
+        writer.start_stroke(first.clone(), first_frame, 1).unwrap();
+        writer
+            .append_sample(projection_sample(&first, 90, 110, 220, 2))
+            .unwrap();
+        writer
+            .start_stroke(second.clone(), second_frame, 3)
+            .unwrap();
+        writer
+            .append_sample(projection_sample(&second, 501, 540, 680, 4))
+            .unwrap();
+        writer
+            .append_sample(projection_sample(&first, 7, 120, 230, 5))
+            .unwrap();
+        writer.commit_stroke(first.clone(), 6).unwrap();
+        writer.commit_stroke(second.clone(), 7).unwrap();
+        let state = writer.replay_state().clone();
+        let selected = [second.clone(), first.clone()];
+
+        let plan = build_canonical_raster_projection_plan(&state, &selected).unwrap();
+        let journal_order = state
+            .physical_samples
+            .iter()
+            .map(|stored| stored.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            plan.samples_in_journal_order
+                .iter()
+                .map(|point| point.journal_sequence)
+                .collect::<Vec<_>>(),
+            journal_order
+        );
+        assert_eq!(
+            plan.samples_in_journal_order
+                .iter()
+                .map(|point| point.source_sequence_raw)
+                .collect::<Vec<_>>(),
+            vec![90, 501, 7]
+        );
+        assert_eq!(plan.selected_strokes.as_slice(), selected.as_slice());
+        assert_eq!(
+            plan.samples_in_journal_order
+                .iter()
+                .map(|point| point.stroke_ref.clone())
+                .collect::<Vec<_>>(),
+            vec![first.clone(), second.clone(), first.clone()]
+        );
+        assert_eq!(
+            plan.samples_in_journal_order[0].canonical_canvas_position_px,
+            CanvasPointPx { x: 10, y: 20 }
+        );
+        assert_eq!(
+            plan.samples_in_journal_order[1].canonical_canvas_position_px,
+            CanvasPointPx { x: 18, y: 57 }
+        );
+        assert_eq!(
+            plan.samples_in_journal_order[2].canonical_canvas_position_px,
+            CanvasPointPx { x: 20, y: 30 }
+        );
+        assert_eq!(plan.samples_in_journal_order[1].view_frame, second_frame);
+        assert_eq!(
+            plan.samples_in_journal_order[0]
+                .source_sample
+                .position
+                .as_ref(),
+            state.physical_samples[0].sample.position.as_ref()
+        );
+        let spec = CanonicalRasterProjectionSpecV1::new(
+            200,
+            100,
+            CanonicalRasterProjectionCropV1 {
+                left_px: 0,
+                top_px: 0,
+                right_px_exclusive: 40,
+                bottom_px_exclusive: 80,
+            },
+        );
+        let geometry = transform_canonical_raster_geometry(&plan, &spec).unwrap();
+        let repeated_geometry = transform_canonical_raster_geometry(&plan, &spec).unwrap();
+        assert_eq!(geometry, repeated_geometry);
+        assert_eq!(geometry.output_width_px, 200);
+        assert_eq!(geometry.output_height_px, 100);
+        assert_eq!(geometry.row_stride_bytes, 800);
+        assert_eq!(geometry.output_buffer_bytes, 80_000);
+        assert_eq!(
+            geometry.spec.pixel_layout,
+            CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown
+        );
+        assert_eq!(geometry.spec.background_rgba, [255, 255, 255, 255]);
+        assert_eq!(geometry.spec.committed_ink_rgba, [32, 32, 32, 255]);
+        assert_eq!(geometry.spec.stroke_width_16_16, 2 << 16);
+        assert_eq!(
+            geometry.spec.single_point_policy,
+            CanonicalRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint
+        );
+        assert_eq!(
+            geometry.stroke_draw_order,
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(geometry.caller_selection_order, selected);
+        assert_eq!(
+            geometry
+                .points_in_journal_order
+                .iter()
+                .map(|point| point.journal_sequence)
+                .collect::<Vec<_>>(),
+            journal_order
+        );
+        assert_eq!(
+            geometry
+                .points_in_journal_order
+                .iter()
+                .map(|point| point.source_sequence_raw)
+                .collect::<Vec<_>>(),
+            vec![90, 501, 7]
+        );
+        assert_eq!(
+            geometry.points_in_journal_order[0].x_subpixel_16_16,
+            5_734_400
+        );
+        assert_eq!(
+            geometry.points_in_journal_order[0].y_subpixel_16_16,
+            1_638_400
+        );
+        assert_eq!(
+            geometry.points_in_journal_order[1].x_subpixel_16_16,
+            6_389_760
+        );
+        assert_eq!(
+            geometry.points_in_journal_order[1].y_subpixel_16_16,
+            4_669_440
+        );
+        assert_eq!(
+            geometry.points_in_journal_order[2].x_subpixel_16_16,
+            6_553_600
+        );
+        assert_eq!(
+            geometry.points_in_journal_order[2].y_subpixel_16_16,
+            2_457_600
+        );
+        assert_eq!(
+            geometry
+                .points_in_journal_order
+                .iter()
+                .map(|point| point.is_single_point_stroke)
+                .collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
+
+        let forward_selection = [first.clone(), second.clone()];
+        let forward_plan =
+            build_canonical_raster_projection_plan(&state, &forward_selection).unwrap();
+        let forward_geometry = transform_canonical_raster_geometry(&forward_plan, &spec).unwrap();
+        assert_eq!(
+            forward_plan
+                .samples_in_journal_order
+                .iter()
+                .map(|point| point.journal_sequence)
+                .collect::<Vec<_>>(),
+            plan.samples_in_journal_order
+                .iter()
+                .map(|point| point.journal_sequence)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            forward_geometry.stroke_draw_order,
+            geometry.stroke_draw_order
+        );
+        assert_eq!(
+            forward_geometry.source_content_sha256,
+            geometry.source_content_sha256
+        );
+        assert_eq!(
+            forward_geometry.projection_spec_sha256,
+            geometry.projection_spec_sha256
+        );
+        assert_eq!(forward_geometry.geometry_sha256, geometry.geometry_sha256);
+        assert_ne!(
+            forward_geometry.caller_selection_order,
+            geometry.caller_selection_order
+        );
+        let selected_raster = render_canonical_raster(&geometry).unwrap();
+        let forward_raster = render_canonical_raster(&forward_geometry).unwrap();
+        assert_eq!(
+            selected_raster.rgba8_premultiplied_srgb_top_down,
+            forward_raster.rgba8_premultiplied_srgb_top_down
+        );
+        assert_eq!(selected_raster.png_bytes, forward_raster.png_bytes);
+        assert_eq!(
+            selected_raster.raster_artifact_sha256,
+            forward_raster.raster_artifact_sha256
+        );
+
+        let mut changed_source = plan.clone();
+        changed_source.samples_in_journal_order[0]
+            .source_sample
+            .raw_payload[0] ^= 0xff;
+        let changed_source_geometry =
+            transform_canonical_raster_geometry(&changed_source, &spec).unwrap();
+        assert_eq!(changed_source.journal_id, plan.journal_id);
+        assert_eq!(changed_source.logical_revision, plan.logical_revision);
+        assert_eq!(changed_source.last_sequence, plan.last_sequence);
+        assert_ne!(
+            geometry.source_content_sha256,
+            changed_source_geometry.source_content_sha256
+        );
+        assert_ne!(
+            geometry.geometry_sha256,
+            changed_source_geometry.geometry_sha256
+        );
+
+        let mut changed_spec = spec.clone();
+        changed_spec.output_width_px = 180;
+        let changed_spec_geometry =
+            transform_canonical_raster_geometry(&plan, &changed_spec).unwrap();
+        assert_ne!(
+            geometry.projection_spec_sha256,
+            changed_spec_geometry.projection_spec_sha256
+        );
+        assert_ne!(
+            geometry.geometry_sha256,
+            changed_spec_geometry.geometry_sha256
+        );
+        writer.flush().unwrap();
+        drop(writer);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn canonical_raster_spec_checks_crop_output_caps_rounding_and_single_taps() {
+        let target = projection_target("spec-bounds-proof", "device-a");
+        let frame = CanvasViewport::default()
+            .stroke_view_frame(CanvasOrigin::default(), 1.0)
+            .unwrap();
+        let state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
+        let plan =
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).unwrap();
+        let valid_crop = CanonicalRasterProjectionCropV1 {
+            left_px: 0,
+            top_px: 0,
+            right_px_exclusive: 100,
+            bottom_px_exclusive: 100,
+        };
+        let valid_spec = CanonicalRasterProjectionSpecV1::new(80, 80, valid_crop);
+        let output = transform_canonical_raster_geometry(&plan, &valid_spec).unwrap();
+        assert_eq!(output.points_in_journal_order.len(), 1);
+        assert!(output.points_in_journal_order[0].is_single_point_stroke);
+        assert_eq!(output.row_stride_bytes, 320);
+        assert_eq!(output.output_buffer_bytes, 25_600);
+        assert_eq!(output.points_in_journal_order[0].x_subpixel_16_16, 8 << 16);
+        assert_eq!(output.points_in_journal_order[0].y_subpixel_16_16, 48 << 16);
+        let mut mismatched_buffer = output.clone();
+        mismatched_buffer.output_buffer_bytes += 4;
+        assert!(render_canonical_raster(&mismatched_buffer).is_err());
+        assert_eq!(round_nonnegative_ratio_ties_away(1, 2).unwrap(), 1);
+        assert_eq!(round_nonnegative_ratio_ties_away(5, 2).unwrap(), 3);
+        assert!(round_nonnegative_ratio_ties_away(1, 0).is_err());
+        assert!(round_nonnegative_ratio_ties_away(i128::MAX, 1).is_err());
+
+        let mut zero_width = valid_spec.clone();
+        zero_width.output_width_px = 0;
+        assert!(transform_canonical_raster_geometry(&plan, &zero_width).is_err());
+        let mut dimension_overflow = valid_spec.clone();
+        dimension_overflow.output_width_px = u32::MAX;
+        assert!(transform_canonical_raster_geometry(&plan, &dimension_overflow).is_err());
+        let area_over_cap = CanonicalRasterProjectionSpecV1::new(1024, 512, valid_crop);
+        assert!(transform_canonical_raster_geometry(&plan, &area_over_cap).is_err());
+
+        let empty_crop = CanonicalRasterProjectionSpecV1::new(
+            80,
+            80,
+            CanonicalRasterProjectionCropV1 {
+                right_px_exclusive: 0,
+                ..valid_crop
+            },
+        );
+        assert!(transform_canonical_raster_geometry(&plan, &empty_crop).is_err());
+        let crop_area_over_cap = CanonicalRasterProjectionSpecV1::new(
+            80,
+            80,
+            CanonicalRasterProjectionCropV1 {
+                left_px: -4096,
+                top_px: -4096,
+                right_px_exclusive: 4097,
+                bottom_px_exclusive: 4096,
+            },
+        );
+        assert!(transform_canonical_raster_geometry(&plan, &crop_area_over_cap).is_err());
+        let crop_excludes_sample = CanonicalRasterProjectionSpecV1::new(
+            80,
+            80,
+            CanonicalRasterProjectionCropV1 {
+                left_px: 11,
+                ..valid_crop
+            },
+        );
+        assert!(transform_canonical_raster_geometry(&plan, &crop_excludes_sample).is_err());
+    }
+
+    #[test]
+    fn canonical_raster_cpu_backend_emits_bounded_rgba_and_png_round_trip() {
+        let target = projection_target("pixel-contract", "device-a");
+        let frame = CanvasViewport::default()
+            .stroke_view_frame(CanvasOrigin::default(), 1.0)
+            .unwrap();
+        let state = committed_projection_state(&target, frame, &[(4, 20, 60), (5, 40, 60)]);
+        let plan =
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).unwrap();
+        let spec = CanonicalRasterProjectionSpecV1::new(
+            100,
+            100,
+            CanonicalRasterProjectionCropV1 {
+                left_px: 0,
+                top_px: 0,
+                right_px_exclusive: 200,
+                bottom_px_exclusive: 200,
+            },
+        );
+        let geometry = transform_canonical_raster_geometry(&plan, &spec).unwrap();
+        let rendered = render_canonical_raster(&geometry).unwrap();
+        let repeated = render_canonical_raster(&geometry).unwrap();
+
+        assert_eq!(rendered.output_width_px, 100);
+        assert_eq!(rendered.output_height_px, 100);
+        assert_eq!(rendered.row_stride_bytes, 400);
+        assert_eq!(rendered.rgba8_premultiplied_srgb_top_down.len(), 40_000);
+        let (pixels, remainder) = rendered.rgba8_premultiplied_srgb_top_down.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        assert!(pixels.iter().all(|pixel| pixel[3] == 255));
+        assert_eq!(
+            rendered.pixel_layout,
+            CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown
+        );
+        assert_eq!(
+            rendered.renderer_version,
+            "tiny-skia/0.12.0;canonical-raster-v1"
+        );
+        assert_eq!(
+            rendered.source_content_sha256,
+            geometry.source_content_sha256
+        );
+        assert_eq!(
+            rendered.projection_spec_sha256,
+            geometry.projection_spec_sha256
+        );
+        assert_eq!(rendered.geometry_sha256, geometry.geometry_sha256);
+        assert_eq!(
+            rendered.rgba8_premultiplied_srgb_top_down,
+            repeated.rgba8_premultiplied_srgb_top_down
+        );
+        assert_eq!(rendered.png_bytes, repeated.png_bytes);
+        assert_eq!(rendered.pixel_bytes_sha256, repeated.pixel_bytes_sha256);
+        assert_eq!(rendered.png_bytes_sha256, repeated.png_bytes_sha256);
+        assert_eq!(
+            rendered.raster_artifact_sha256,
+            repeated.raster_artifact_sha256
+        );
+        let expected_pixel_hash: [u8; 32] =
+            Sha256::digest(&rendered.rgba8_premultiplied_srgb_top_down).into();
+        let expected_png_hash: [u8; 32] = Sha256::digest(&rendered.png_bytes).into();
+        assert_eq!(rendered.pixel_bytes_sha256, expected_pixel_hash);
+        assert_eq!(rendered.png_bytes_sha256, expected_png_hash);
+        assert_eq!(
+            rendered.raster_artifact_sha256,
+            hash_canonical_raster_artifact(&rendered)
+        );
+
+        let pixel_index = (30 * rendered.row_stride_bytes + 15 * 4) as usize;
+        assert_eq!(
+            &rendered.rgba8_premultiplied_srgb_top_down[pixel_index..pixel_index + 4],
+            &[32, 32, 32, 255]
+        );
+        assert_eq!(
+            &rendered.rgba8_premultiplied_srgb_top_down[0..4],
+            &[255, 255, 255, 255]
+        );
+
+        let decoded = Pixmap::decode_png(&rendered.png_bytes).unwrap();
+        assert_eq!(decoded.width(), rendered.output_width_px);
+        assert_eq!(decoded.height(), rendered.output_height_px);
+        assert_eq!(
+            decoded.data(),
+            rendered.rgba8_premultiplied_srgb_top_down.as_slice()
+        );
+        assert!(rendered.png_bytes.len() <= MAX_CANONICAL_RASTER_PNG_BYTES);
+    }
+
+    #[test]
+    fn canonical_raster_cpu_backend_treats_repeated_observations_as_an_observed_tap() {
+        let target = projection_target("repeated-point-tap", "device-a");
+        let frame = CanvasViewport::default()
+            .stroke_view_frame(CanvasOrigin::default(), 1.0)
+            .unwrap();
+        let tap_state = committed_projection_state(&target, frame, &[(7, 30, 50)]);
+        let repeated_state =
+            committed_projection_state(&target, frame, &[(7, 30, 50), (9, 30, 50)]);
+        let spec = CanonicalRasterProjectionSpecV1::new(
+            100,
+            100,
+            CanonicalRasterProjectionCropV1 {
+                left_px: 0,
+                top_px: 0,
+                right_px_exclusive: 100,
+                bottom_px_exclusive: 100,
+            },
+        );
+        let tap_plan =
+            build_canonical_raster_projection_plan(&tap_state, std::slice::from_ref(&target))
+                .unwrap();
+        let repeated_plan =
+            build_canonical_raster_projection_plan(&repeated_state, std::slice::from_ref(&target))
+                .unwrap();
+        let tap_geometry = transform_canonical_raster_geometry(&tap_plan, &spec).unwrap();
+        let repeated_geometry = transform_canonical_raster_geometry(&repeated_plan, &spec).unwrap();
+        assert!(tap_geometry.points_in_journal_order[0].is_single_point_stroke);
+        assert!(
+            repeated_geometry
+                .points_in_journal_order
+                .iter()
+                .all(|point| !point.is_single_point_stroke)
+        );
+
+        let tap_image = render_canonical_raster(&tap_geometry).unwrap();
+        let repeated_image = render_canonical_raster(&repeated_geometry).unwrap();
+        assert_eq!(
+            tap_image.rgba8_premultiplied_srgb_top_down,
+            repeated_image.rgba8_premultiplied_srgb_top_down
+        );
+        assert_eq!(tap_image.png_bytes, repeated_image.png_bytes);
+        assert_ne!(
+            tap_image.source_content_sha256,
+            repeated_image.source_content_sha256
+        );
+        assert_ne!(
+            tap_image.raster_artifact_sha256,
+            repeated_image.raster_artifact_sha256
+        );
+    }
+
+    #[test]
+    fn canonical_raster_cpu_backend_rejects_invalid_geometry_before_allocation() {
+        let target = projection_target("invalid-render-geometry", "device-a");
+        let frame = CanvasViewport::default()
+            .stroke_view_frame(CanvasOrigin::default(), 1.0)
+            .unwrap();
+        let state = committed_projection_state(&target, frame, &[(1, 10, 60), (2, 12, 62)]);
+        let plan =
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).unwrap();
+        let spec = CanonicalRasterProjectionSpecV1::new(
+            80,
+            80,
+            CanonicalRasterProjectionCropV1 {
+                left_px: 0,
+                top_px: 0,
+                right_px_exclusive: 100,
+                bottom_px_exclusive: 100,
+            },
+        );
+        let geometry = transform_canonical_raster_geometry(&plan, &spec).unwrap();
+
+        let mut invalid_dimension = geometry.clone();
+        invalid_dimension.output_width_px = MAX_CANONICAL_RASTER_OUTPUT_DIMENSION + 1;
+        assert!(render_canonical_raster(&invalid_dimension).is_err());
+
+        let mut invalid_point = geometry;
+        invalid_point.points_in_journal_order[0].x_subpixel_16_16 = i64::MAX;
+        assert!(render_canonical_raster(&invalid_point).is_err());
+    }
+
+    #[test]
+    fn canonical_raster_projection_moves_only_derived_geometry() {
+        let target = projection_target("move-proof", "device-a");
+        let frame = CanvasViewport::default()
+            .stroke_view_frame(
+                CanvasOrigin {
+                    x_screen_px: 100,
+                    y_screen_px: 200,
+                },
+                1.0,
+            )
+            .unwrap();
+        let (path, mut writer) = committed_projection_fixture(&target, frame, &[(73, 110, 220)]);
+        let before_state = writer.replay_state().clone();
+        let before =
+            build_canonical_raster_projection_plan(&before_state, std::slice::from_ref(&target))
+                .unwrap();
+        let raw_before = before.samples_in_journal_order[0]
+            .source_sample
+            .position
+            .clone()
+            .unwrap();
+        let journal_sequence = before.samples_in_journal_order[0].journal_sequence;
+        let source_sequence = before.samples_in_journal_order[0].source_sequence_raw;
+        let position_before = before.samples_in_journal_order[0].canonical_canvas_position_px;
+        let render_spec = CanonicalRasterProjectionSpecV1::new(
+            100,
+            100,
+            CanonicalRasterProjectionCropV1 {
+                left_px: 0,
+                top_px: 0,
+                right_px_exclusive: 100,
+                bottom_px_exclusive: 100,
+            },
+        );
+        let before_geometry = transform_canonical_raster_geometry(&before, &render_spec).unwrap();
+        let before_image = render_canonical_raster(&before_geometry).unwrap();
+        drop(before);
+
+        writer
+            .apply_edit_action(
+                20,
+                EditCommand::Move {
+                    target: target.clone(),
+                    delta_x_raw: 5,
+                    delta_y_raw: 7,
+                    coordinate_space: SCREEN_POSITION_SPACE.to_owned(),
+                    units: SCREEN_POSITION_UNITS.to_owned(),
+                },
+            )
+            .unwrap();
+        let moved_state = writer.replay_state().clone();
+        let after =
+            build_canonical_raster_projection_plan(&moved_state, std::slice::from_ref(&target))
+                .unwrap();
+        let after_geometry = transform_canonical_raster_geometry(&after, &render_spec).unwrap();
+        let after_image = render_canonical_raster(&after_geometry).unwrap();
+        assert_eq!(
+            after.samples_in_journal_order[0].journal_sequence,
+            journal_sequence
+        );
+        assert_eq!(
+            after.samples_in_journal_order[0].source_sequence_raw,
+            source_sequence
+        );
+        assert_eq!(
+            after.samples_in_journal_order[0]
+                .source_sample
+                .position
+                .as_ref(),
+            Some(&raw_before)
+        );
+        assert_eq!(
+            moved_state.physical_samples[0].sample.position.as_ref(),
+            Some(&raw_before)
+        );
+        assert_eq!(
+            moved_state.physical_samples[0].sample,
+            before_state.physical_samples[0].sample
+        );
+        assert_eq!(
+            after.samples_in_journal_order[0].canonical_canvas_position_px,
+            CanvasPointPx {
+                x: position_before.x + 5,
+                y: position_before.y + 7,
+            }
+        );
+        assert_ne!(
+            before_image.rgba8_premultiplied_srgb_top_down,
+            after_image.rgba8_premultiplied_srgb_top_down
+        );
+        assert_ne!(before_image.png_bytes, after_image.png_bytes);
+        assert_ne!(
+            before_image.source_content_sha256,
+            after_image.source_content_sha256
+        );
+        assert_ne!(before_image.geometry_sha256, after_image.geometry_sha256);
+        writer.flush().unwrap();
+        drop(writer);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn canonical_raster_projection_respects_commit_undo_tombstone_restore_visibility() {
+        let target = projection_target("visibility-proof", "device-a");
+        let frame = CanvasViewport::default()
+            .stroke_view_frame(CanvasOrigin::default(), 1.0)
+            .unwrap();
+        let (path, mut writer) =
+            committed_projection_fixture(&target, frame, &[(1, 10, 60), (2, 20, 70)]);
+        assert!(
+            build_canonical_raster_projection_plan(
+                writer.replay_state(),
+                std::slice::from_ref(&target)
+            )
+            .is_ok()
+        );
+
+        writer.undo_last_edit(10).unwrap();
+        assert!(
+            build_canonical_raster_projection_plan(
+                writer.replay_state(),
+                std::slice::from_ref(&target)
+            )
+            .is_err()
+        );
+        writer.redo_last_edit(11).unwrap();
+        assert!(
+            build_canonical_raster_projection_plan(
+                writer.replay_state(),
+                std::slice::from_ref(&target)
+            )
+            .is_ok()
+        );
+
+        writer
+            .apply_edit_action(
+                12,
+                EditCommand::Tombstone {
+                    targets: vec![target.clone()],
+                },
+            )
+            .unwrap();
+        assert!(
+            build_canonical_raster_projection_plan(
+                writer.replay_state(),
+                std::slice::from_ref(&target)
+            )
+            .is_err()
+        );
+        writer
+            .apply_edit_action(
+                13,
+                EditCommand::Restore {
+                    targets: vec![target.clone()],
+                },
+            )
+            .unwrap();
+        assert!(
+            build_canonical_raster_projection_plan(
+                writer.replay_state(),
+                std::slice::from_ref(&target)
+            )
+            .is_ok()
+        );
+        writer.flush().unwrap();
+        drop(writer);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn canonical_raster_projection_rejects_uncommitted_and_unsupported_inputs() {
+        let target = projection_target("uncommitted-proof", "device-a");
+        let frame = CanvasViewport::default()
+            .stroke_view_frame(CanvasOrigin::default(), 1.0)
+            .unwrap();
+        let path = temp_path();
+        let mut writer = JournalWriter::create(path.clone(), header()).unwrap();
+        writer.start_stroke(target.clone(), frame, 1).unwrap();
+        writer
+            .append_sample(projection_sample(&target, 1, 10, 60, 2))
+            .unwrap();
+        assert!(
+            build_canonical_raster_projection_plan(
+                writer.replay_state(),
+                std::slice::from_ref(&target)
+            )
+            .is_err()
+        );
+        writer.flush().unwrap();
+        drop(writer);
+        let _ = fs::remove_file(path);
+
+        let target = projection_target("missing-frame-proof", "device-a");
+        let mut state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
+        state.stroke_starts.clear();
+        assert!(
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).is_err()
+        );
+
+        let target = projection_target("invalid-frame-proof", "device-a");
+        let mut state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
+        state.stroke_starts[0].view_frame.canvas_zoom_bits = f64::NAN.to_bits();
+        assert!(
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).is_err()
+        );
+
+        let target = projection_target("unsupported-units-proof", "device-a");
+        let mut state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
+        state.physical_samples[0]
+            .sample
+            .position
+            .as_mut()
+            .unwrap()
+            .units = "himetric".to_owned();
+        assert!(
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).is_err()
+        );
+
+        let target = projection_target("missing-position-proof", "device-a");
+        let mut state = committed_projection_state(&target, frame, &[(1, 10, 60), (2, 20, 70)]);
+        state.physical_samples[0].sample.position = None;
+        assert!(
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).is_err()
+        );
+
+        let target = projection_target("unsupported-space-proof", "device-a");
+        let mut state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
+        state.physical_samples[0]
+            .sample
+            .position
+            .as_mut()
+            .unwrap()
+            .coordinate_space = "windows-client-coordinates".to_owned();
+        assert!(
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).is_err()
+        );
+
+        let target = projection_target("unrepresentable-transform-proof", "device-a");
+        let mut state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
+        state.stroke_starts[0].view_frame.screen_origin_x_px = i64::from(i32::MIN);
+        state.stroke_starts[0].view_frame.canvas_zoom_bits = 0.2f64.to_bits();
+        state.physical_samples[0]
+            .sample
+            .position
+            .as_mut()
+            .unwrap()
+            .x_raw = i64::from(i32::MAX);
+        assert!(
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).is_err()
+        );
+
+        let target = projection_target("unsupported-source-proof", "device-a");
+        let state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
+        let unsupported_target = StrokeRef {
+            source_api: "wintab".to_owned(),
+            ..target
+        };
+        assert!(
+            build_canonical_raster_projection_plan(
+                &state,
+                std::slice::from_ref(&unsupported_target)
+            )
+            .is_err()
+        );
     }
 
     #[test]

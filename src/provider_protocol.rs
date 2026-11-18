@@ -3317,9 +3317,10 @@ mod tests {
     use crate::benchmark::{
         self, ApprovedBenchmarkProviderV1, BenchmarkAnnotationCaseV1, BenchmarkCaseManifestV1,
         BenchmarkCaseProvenanceV1, BenchmarkCaseSpecV1, BenchmarkClusterKeyV1,
-        BenchmarkCorpusManifestV1, BenchmarkProviderManifestV1, BenchmarkRasterInputSpecV1,
-        BenchmarkSplitKeyV1, BenchmarkSplitV1, BenchmarkStrokeRefV1, BenchmarkTimeoutsV1,
-        BenchmarkTokenizationPolicyV1, ProviderArtifactPathV1, ProviderArtifactRoleV1,
+        BenchmarkCorpusManifestV1, BenchmarkGeneratedRasterCropV1, BenchmarkGeneratedRasterSpecV1,
+        BenchmarkProviderManifestV1, BenchmarkRasterInputSpecV1, BenchmarkSplitKeyV1,
+        BenchmarkSplitV1, BenchmarkStrokeRefV1, BenchmarkTimeoutsV1, BenchmarkTokenizationPolicyV1,
+        ProviderArtifactPathV1, ProviderArtifactRoleV1,
     };
     use crate::journal::{
         EditCommand, JournalHeader, JournalMetadata, JournalWriter, MetadataScope,
@@ -4593,6 +4594,7 @@ mod tests {
                 coordinate_space: "synthetic-page".to_owned(),
                 units: "opaque-bytes".to_owned(),
             }),
+            generated_raster: None,
         };
         let case_manifest = BenchmarkCaseManifestV1 {
             schema_version: 1,
@@ -5001,6 +5003,550 @@ mod tests {
             assert_eq!(summary["completed_run_count"].as_u64(), Some(completed));
             assert_eq!(summary["failed_run_count"].as_u64(), Some(failed_count));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "CI-only generated-raster E2E; guarded hosted provider job"]
+    fn benchmark_cli_generated_raster_mock_pipeline_records_exact_origin_and_no_fallback() {
+        require_provider_mock_test_opt_in();
+        let mock = compile_mock_worker();
+        let bytes_hex = |bytes: &[u8]| {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+            for byte in bytes {
+                encoded.push(char::from(HEX[usize::from(*byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+            }
+            encoded
+        };
+        let target = stroke_ref("generated-cli-e2e-stroke", "generated-cli-e2e-device");
+        let journal_path = mock.directory.join("frozen-generated-cli-e2e.journal");
+        let mut journal_writer = JournalWriter::create(
+            journal_path.clone(),
+            JournalHeader {
+                journal_id: target.journal_id.clone(),
+                session_id: target.session_id.clone(),
+                config_id: Some("generated-raster-fixture-config".to_owned()),
+                device_model_declared: Some("synthetic fixture device".to_owned()),
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        journal_writer
+            .start_stroke(target.clone(), StrokeViewFrame::default(), 10)
+            .unwrap();
+        let mut first_sample = physical_sample(&target, 501, 110);
+        first_sample.app_arrival_elapsed_ns = 11;
+        first_sample.raw_payload = b"GENERATED_E2E_RAW_SAMPLE_A_PRIVATE_SENTINEL".to_vec();
+        let first_sample_sequence = journal_writer.append_sample(first_sample.clone()).unwrap();
+        let mut second_sample = physical_sample(&target, 502, 250);
+        second_sample.app_arrival_elapsed_ns = 12;
+        second_sample.raw_payload = b"GENERATED_E2E_RAW_SAMPLE_B_PRIVATE_SENTINEL".to_vec();
+        let second_sample_sequence = journal_writer.append_sample(second_sample.clone()).unwrap();
+        journal_writer.commit_stroke(target.clone(), 13).unwrap();
+        journal_writer.flush().unwrap();
+        drop(journal_writer);
+
+        let journal = crate::journal::read_journal(&journal_path).unwrap();
+        assert!(!journal.recovery.truncated_final_record);
+        assert_eq!(journal.state.physical_samples.len(), 2);
+        assert_eq!(first_sample_sequence, 2);
+        assert_eq!(second_sample_sequence, 3);
+        let source_revision = ProviderSourceRevisionV1::from_journal(&journal.state);
+        let selected_strokes = vec![target.clone()];
+        let selected_stroke_refs = vec![BenchmarkStrokeRefV1::from(&target)];
+        let generated_raster_spec = BenchmarkGeneratedRasterSpecV1 {
+            projection_schema_version: 1,
+            output_width_px: 128,
+            output_height_px: 128,
+            source_crop: BenchmarkGeneratedRasterCropV1 {
+                left_px: 0,
+                top_px: 0,
+                right_px_exclusive: 512,
+                bottom_px_exclusive: 512,
+            },
+        };
+        let projection_spec = crate::canvas::CanonicalRasterProjectionSpecV1::new(
+            generated_raster_spec.output_width_px,
+            generated_raster_spec.output_height_px,
+            crate::canvas::CanonicalRasterProjectionCropV1 {
+                left_px: generated_raster_spec.source_crop.left_px,
+                top_px: generated_raster_spec.source_crop.top_px,
+                right_px_exclusive: generated_raster_spec.source_crop.right_px_exclusive,
+                bottom_px_exclusive: generated_raster_spec.source_crop.bottom_px_exclusive,
+            },
+        );
+        let raster_plan = crate::canvas::build_canonical_raster_projection_plan(
+            &journal.state,
+            &selected_strokes,
+        )
+        .unwrap();
+        let raster_geometry =
+            crate::canvas::transform_canonical_raster_geometry(&raster_plan, &projection_spec)
+                .unwrap();
+        let raster_image = crate::canvas::render_canonical_raster(&raster_geometry).unwrap();
+        let png_bytes = raster_image.png_bytes();
+        assert!(!png_bytes.is_empty());
+        assert!(png_bytes.len() <= 1024 * 1024);
+        let decoded_png = tiny_skia::Pixmap::decode_png(png_bytes).unwrap();
+        assert_eq!(decoded_png.width(), 128);
+        assert_eq!(decoded_png.height(), 128);
+        let (decoded_pixels, decoded_remainder) = decoded_png.data().as_chunks::<4>();
+        assert!(decoded_remainder.is_empty());
+        assert!(decoded_pixels.contains(&[32, 32, 32, 255]));
+        assert!(decoded_pixels.contains(&[255, 255, 255, 255]));
+        assert_eq!(
+            bytes_hex(&Sha256::digest(decoded_png.data())),
+            bytes_hex(&raster_image.pixel_bytes_sha256())
+        );
+
+        let raster_payload_hex = bytes_hex(png_bytes);
+        let raster_pixel_hex = bytes_hex(decoded_png.data());
+        let raster_sha256_hex = bytes_hex(&Sha256::digest(png_bytes));
+        let raster_source_sha256 = bytes_hex(&raster_image.source_content_sha256());
+        let raster_projection_spec_sha256 = bytes_hex(&raster_image.projection_spec_sha256());
+        let raster_geometry_sha256 = bytes_hex(&raster_image.geometry_sha256());
+        let raster_pixel_sha256 = bytes_hex(&raster_image.pixel_bytes_sha256());
+        let raster_artifact_sha256 = bytes_hex(&raster_image.raster_artifact_sha256());
+        let (raster_width_px, raster_height_px, raster_row_stride_bytes) =
+            raster_image.output_dimensions_and_stride();
+        let raster_request_input = ProviderRasterInputV1 {
+            width: raster_width_px,
+            height: raster_height_px,
+            payload_contract: ProviderRasterPayloadContractV1::OpaqueBytes,
+            coordinate_space: "canonical-raster-output-v1".to_owned(),
+            units: "pixel".to_owned(),
+            raw_payload_hex: raster_payload_hex.clone(),
+        };
+
+        let batch_id = format!(
+            "provider-generated-raster-e2e-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let case_id = "generated-raster-e2e-case".to_owned();
+        let case = BenchmarkCaseSpecV1 {
+            case_id: case_id.clone(),
+            journal_path: journal_path.clone(),
+            expected_source_revision: source_revision.clone(),
+            region_id: "generated-region-e2e".to_owned(),
+            line_id: "generated-line-e2e".to_owned(),
+            coordinate_space: "document".to_owned(),
+            coordinate_units: "px".to_owned(),
+            language_hints: vec!["vi-VN".to_owned()],
+            requested_input_modalities: vec![ProviderInputCapabilityV1::OnlineStrokes],
+            selected_strokes: selected_stroke_refs.clone(),
+            provenance: BenchmarkCaseProvenanceV1 {
+                corpus_id: None,
+                annotation_id: None,
+                writer_key: "synthetic-generated-raster-writer".to_owned(),
+                session_key: target.session_id.clone(),
+                session_start_unix_ns: None,
+                configuration_key: "synthetic-generated-raster-config".to_owned(),
+                split: None,
+                capture_api: Some(target.source_api.clone()),
+                capture_api_version: Some("synthetic-direct-fixture-v1".to_owned()),
+                tablet_model: None,
+                driver_version: None,
+                windows_build: None,
+                windows_ink_state: None,
+                active_area: None,
+                display_mapping: None,
+                pressure_curve: None,
+            },
+            raster: None,
+            generated_raster: Some(generated_raster_spec),
+        };
+
+        let provider_modes = [
+            (
+                "cfg-generated-online",
+                "generated-online-success",
+                "ok",
+                vec![ProviderInputCapabilityV1::OnlineStrokes],
+            ),
+            (
+                "cfg-generated-raster",
+                "generated-raster-success",
+                "ok",
+                vec![ProviderInputCapabilityV1::Raster],
+            ),
+            (
+                "cfg-generated-raster-failure",
+                "generated-raster-runtime-failure",
+                "crash",
+                vec![ProviderInputCapabilityV1::Raster],
+            ),
+        ];
+        let mut expected_frames = BTreeMap::<String, (Vec<u8>, Vec<u8>)>::new();
+        let mut expected_input_view_ids = BTreeMap::<String, String>::new();
+        let mut providers = Vec::new();
+        for (provider_index, (configuration_id, mode_label, behavior, requested_modalities)) in
+            provider_modes.iter().enumerate()
+        {
+            let configuration = ProviderConfigurationV1 {
+                configuration_id: (*configuration_id).to_owned(),
+                values: BTreeMap::from([
+                    (
+                        "credential".to_owned(),
+                        "GENERATED_E2E_PROVIDER_SETTING_PRIVATE_SENTINEL".to_owned(),
+                    ),
+                    ("mode".to_owned(), (*mode_label).to_owned()),
+                ]),
+            };
+            let expected_request = build_recognition_request(RecognitionRequestBuildInput {
+                state: &journal.state,
+                request_id: format!("bench-{batch_id}-0-{provider_index}"),
+                region_id: case.region_id.clone(),
+                line_id: case.line_id.clone(),
+                coordinate_space: case.coordinate_space.clone(),
+                coordinate_units: case.coordinate_units.clone(),
+                language_hints: case.language_hints.clone(),
+                requested_input_modalities: requested_modalities.to_vec(),
+                provider_configuration: configuration.clone(),
+                selected_strokes: &selected_strokes,
+                raster: requested_modalities
+                    .contains(&ProviderInputCapabilityV1::Raster)
+                    .then(|| raster_request_input.clone()),
+            })
+            .unwrap();
+            assert_eq!(expected_request.source_revision, source_revision);
+            expected_input_view_ids.insert(
+                configuration.configuration_id.clone(),
+                expected_request.input_view_id.clone(),
+            );
+            let handshake = serde_json::to_string(&WorkerResponseFrameV1::Handshake {
+                protocol_version: PROVIDER_PROTOCOL_VERSION,
+                provider: fixture_provider(),
+                configuration_id: configuration.configuration_id.clone(),
+                configuration_fingerprint: expected_request
+                    .provider_configuration_fingerprint
+                    .clone(),
+                capabilities: fixture_capabilities_with_inputs(requested_modalities.to_vec()),
+            })
+            .unwrap();
+            let mut mock_result = fixture_result(&expected_request, source_revision.clone());
+            if !requested_modalities.contains(&ProviderInputCapabilityV1::OnlineStrokes) {
+                for candidate in &mut mock_result.candidates {
+                    candidate.stroke_ranges.clear();
+                }
+            }
+            let recognition = serde_json::to_string(&WorkerResponseFrameV1::Recognition {
+                protocol_version: PROVIDER_PROTOCOL_VERSION,
+                result: mock_result,
+            })
+            .unwrap();
+            expected_frames.insert(
+                configuration.configuration_id.clone(),
+                (
+                    handshake.as_bytes().to_vec(),
+                    recognition.as_bytes().to_vec(),
+                ),
+            );
+            providers.push(ApprovedBenchmarkProviderV1 {
+                provider_id: "mock-provider".to_owned(),
+                executable_path: mock.executable.clone(),
+                arguments: vec![(*behavior).to_owned(), handshake, recognition],
+                requested_input_modalities: Some(requested_modalities.to_vec()),
+                protocol_configuration: configuration,
+                artifacts: vec![ProviderArtifactPathV1 {
+                    artifact_id: "mock-executable".to_owned(),
+                    role: ProviderArtifactRoleV1::Executable,
+                    path: mock.executable.clone(),
+                }],
+                timeouts: Some(BenchmarkTimeoutsV1 {
+                    handshake_ms: 10_000,
+                    recognition_ms: 10_000,
+                    shutdown_ms: 1_000,
+                }),
+            });
+        }
+
+        let case_manifest = BenchmarkCaseManifestV1 {
+            schema_version: 1,
+            batch_id: batch_id.clone(),
+            cases: vec![case],
+        };
+        let provider_manifest = BenchmarkProviderManifestV1 {
+            schema_version: 1,
+            providers,
+        };
+        let case_manifest_path = mock.directory.join("generated-cases.json");
+        let provider_manifest_path = mock.directory.join("generated-providers.json");
+        fs::write(
+            &case_manifest_path,
+            serde_json::to_vec(&case_manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &provider_manifest_path,
+            serde_json::to_vec(&provider_manifest).unwrap(),
+        )
+        .unwrap();
+        let output_directory = mock.directory.join("generated-benchmark-output");
+        assert!(!output_directory.exists());
+        let completion = benchmark::run_batch_cli_to_directory(
+            &case_manifest_path,
+            &provider_manifest_path,
+            None,
+            &output_directory,
+        )
+        .unwrap();
+        assert_eq!(completion.run_count, 3);
+        assert_eq!(completion.failure_count, 1);
+
+        let artifact_bytes = fs::read(&completion.artifact_path).unwrap();
+        let artifact_text = String::from_utf8(artifact_bytes).unwrap();
+        assert!(!artifact_text.contains("GENERATED_E2E_PROVIDER_SETTING_PRIVATE_SENTINEL"));
+        assert!(!artifact_text.contains(&raster_payload_hex));
+        assert!(!artifact_text.contains(&raster_pixel_hex));
+        assert!(!artifact_text.contains(&bytes_hex(&first_sample.raw_payload)));
+        assert!(!artifact_text.contains(&bytes_hex(&second_sample.raw_payload)));
+
+        let rows = artifact_text
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let private_paths = [
+            &mock.executable,
+            &journal_path,
+            &case_manifest_path,
+            &provider_manifest_path,
+            &output_directory,
+        ];
+        for private_path in private_paths {
+            let path_sentinel = private_path.to_string_lossy();
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| { json_value_contains_string(row, path_sentinel.as_ref()) })
+            );
+        }
+        assert_eq!(rows.len(), 5);
+        let run_rows = rows
+            .iter()
+            .filter(|row| row["record_type"] == "run")
+            .map(|row| &row["record"])
+            .collect::<Vec<_>>();
+        assert_eq!(run_rows.len(), 3);
+        let find_run = |configuration_id: &str| {
+            run_rows
+                .iter()
+                .find(|row| row["provider_configuration_id"] == configuration_id)
+                .copied()
+                .unwrap()
+        };
+
+        let online = find_run("cfg-generated-online");
+        let raster = find_run("cfg-generated-raster");
+        let failed_raster = find_run("cfg-generated-raster-failure");
+        assert_eq!(online["status"], "completed");
+        assert_eq!(raster["status"], "completed");
+        assert_eq!(failed_raster["status"], "failed");
+        assert!(failed_raster["result"].is_null());
+        assert_eq!(
+            online["requested_input_modalities"],
+            serde_json::json!(["online_strokes"])
+        );
+        assert_eq!(
+            raster["requested_input_modalities"],
+            serde_json::json!(["raster"])
+        );
+        for (configuration_id, run) in [
+            ("cfg-generated-online", online),
+            ("cfg-generated-raster", raster),
+            ("cfg-generated-raster-failure", failed_raster),
+        ] {
+            assert_eq!(
+                run["input_view_id"],
+                expected_input_view_ids[configuration_id]
+            );
+        }
+        assert_eq!(
+            online["result"]["consumed_input_modalities"],
+            serde_json::json!(["online_strokes"])
+        );
+        assert_eq!(
+            raster["result"]["consumed_input_modalities"],
+            serde_json::json!(["raster"])
+        );
+        assert_eq!(online["raster_input_byte_count"], serde_json::Value::Null);
+        assert_eq!(online["raster_input_sha256"], serde_json::Value::Null);
+        assert_eq!(online["generated_raster_origin"], serde_json::Value::Null);
+        assert_ne!(online["input_view_id"], raster["input_view_id"]);
+        assert_eq!(
+            online["canonical_ink_comparison_binding"],
+            raster["canonical_ink_comparison_binding"]
+        );
+        assert_eq!(
+            failed_raster["canonical_ink_comparison_binding"],
+            raster["canonical_ink_comparison_binding"]
+        );
+        assert_eq!(
+            raster["canonical_ink_comparison_binding"]["raster_pixel_parity"],
+            "unverified"
+        );
+        assert_eq!(online["source_revision"], raster["source_revision"]);
+        assert_eq!(
+            online["source_sample_sequences"],
+            raster["source_sample_sequences"]
+        );
+        assert_eq!(
+            online["source_sample_sequences"],
+            serde_json::json!([first_sample_sequence, second_sample_sequence])
+        );
+        assert_eq!(online["selected_strokes"], raster["selected_strokes"]);
+        assert_eq!(
+            raster["raster_input_byte_count"].as_u64(),
+            Some(png_bytes.len() as u64)
+        );
+        assert_eq!(
+            raster["raster_input_sha256"].as_str(),
+            Some(raster_sha256_hex.as_str())
+        );
+
+        let origin = &raster["generated_raster_origin"];
+        assert_eq!(origin["schema_version"].as_u64(), Some(1));
+        assert_eq!(
+            origin["canonical_ink_comparison_binding_sha256"],
+            raster["canonical_ink_comparison_binding"]["sha256_hex"]
+        );
+        let producer = &origin["producer"];
+        assert_eq!(producer["source_revision"], raster["source_revision"]);
+        assert_eq!(
+            producer["source_content_sha256"].as_str(),
+            Some(raster_source_sha256.as_str())
+        );
+        assert_eq!(
+            producer["projection_spec_sha256"].as_str(),
+            Some(raster_projection_spec_sha256.as_str())
+        );
+        assert_eq!(
+            producer["geometry_sha256"].as_str(),
+            Some(raster_geometry_sha256.as_str())
+        );
+        assert_eq!(
+            producer["renderer_version"],
+            raster_image.renderer_version()
+        );
+        assert_eq!(
+            producer["pixel_bytes_sha256"].as_str(),
+            Some(raster_pixel_sha256.as_str())
+        );
+        assert_eq!(
+            producer["png_bytes_sha256"].as_str(),
+            Some(raster_sha256_hex.as_str())
+        );
+        assert_eq!(
+            producer["raster_artifact_sha256"].as_str(),
+            Some(raster_artifact_sha256.as_str())
+        );
+        assert_eq!(producer["output_width_px"].as_u64(), Some(128));
+        assert_eq!(producer["output_height_px"].as_u64(), Some(128));
+        assert_eq!(raster_row_stride_bytes, 512);
+        assert_eq!(
+            producer["row_stride_bytes"].as_u64(),
+            Some(u64::from(raster_row_stride_bytes))
+        );
+        assert_eq!(producer["projection_schema_version"].as_u64(), Some(1));
+        assert_eq!(
+            producer["pixel_layout"],
+            "rgba8_premultiplied_srgb_top_down"
+        );
+        assert_eq!(producer["selected_strokes"], raster["selected_strokes"]);
+        assert_eq!(producer["stroke_draw_order"], raster["selected_strokes"]);
+        assert_eq!(
+            producer["physical_sample_provenance"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            producer["physical_sample_provenance"][0]["journal_sequence"],
+            first_sample_sequence
+        );
+        assert_eq!(
+            producer["physical_sample_provenance"][1]["journal_sequence"],
+            second_sample_sequence
+        );
+        assert_eq!(
+            producer["physical_sample_provenance"][0]["source_sequence_raw"],
+            501
+        );
+        assert_eq!(
+            producer["physical_sample_provenance"][1]["source_sequence_raw"],
+            502
+        );
+        assert_eq!(
+            failed_raster["generated_raster_origin"],
+            raster["generated_raster_origin"]
+        );
+        assert_eq!(
+            failed_raster["requested_input_modalities"],
+            serde_json::json!(["raster"])
+        );
+
+        for configuration_id in ["cfg-generated-online", "cfg-generated-raster"] {
+            let run = find_run(configuration_id);
+            assert!(run["raw_response_capture_complete"].as_bool().unwrap());
+            let frames = run["raw_response_frames"].as_array().unwrap();
+            let expected = expected_frames.get(configuration_id).unwrap();
+            assert_eq!(frames.len(), 2);
+            for (ordinal, bytes) in [&expected.0, &expected.1].into_iter().enumerate() {
+                let prefix = u32::try_from(bytes.len()).unwrap().to_be_bytes();
+                assert_eq!(frames[ordinal]["ordinal"].as_u64(), Some(ordinal as u64));
+                assert_eq!(frames[ordinal]["payload_hex"], bytes_hex(bytes));
+                assert_eq!(frames[ordinal]["length_prefix_be_hex"], bytes_hex(&prefix));
+            }
+        }
+        assert!(
+            !failed_raster["raw_response_capture_complete"]
+                .as_bool()
+                .unwrap()
+        );
+        let failed_frames = failed_raster["raw_response_frames"].as_array().unwrap();
+        assert_eq!(failed_frames.len(), 1);
+        assert_eq!(failed_frames[0]["ordinal"].as_u64(), Some(0));
+        assert_eq!(
+            failed_frames[0]["payload_hex"],
+            bytes_hex(
+                &expected_frames
+                    .get("cfg-generated-raster-failure")
+                    .unwrap()
+                    .0
+            )
+        );
+        assert_eq!(failed_raster["source_revision"], raster["source_revision"]);
+        assert_eq!(failed_raster["input_view_id"], raster["input_view_id"]);
+        assert_eq!(
+            failed_raster["raster_input_sha256"],
+            raster["raster_input_sha256"]
+        );
+
+        let footer = &rows
+            .iter()
+            .find(|row| row["record_type"] == "footer")
+            .unwrap()["record"];
+        assert_eq!(footer["planned_case_count"].as_u64(), Some(1));
+        assert_eq!(footer["planned_provider_count"].as_u64(), Some(3));
+        assert_eq!(footer["recorded_run_count"].as_u64(), Some(3));
+        assert_eq!(footer["failed_run_count"].as_u64(), Some(1));
+        assert_eq!(footer["complete"].as_bool(), Some(true));
+        let summaries = footer["provider_summaries"].as_array().unwrap();
+        assert_eq!(summaries.len(), 3);
+        let failed_summary = summaries
+            .iter()
+            .find(|summary| summary["configuration_id"] == "cfg-generated-raster-failure")
+            .unwrap();
+        assert_eq!(failed_summary["attempted_run_count"].as_u64(), Some(1));
+        assert_eq!(failed_summary["completed_run_count"].as_u64(), Some(0));
+        assert_eq!(failed_summary["failed_run_count"].as_u64(), Some(1));
     }
 
     #[test]
