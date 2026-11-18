@@ -1881,7 +1881,10 @@ impl CanvasScene {
 /// `StrokeRef`; `source_sample` preserves the exact immutable journal payload.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterProjectionPlanV1 {
@@ -1895,7 +1898,10 @@ pub(crate) struct CanonicalRasterProjectionPlanV1 {
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterProjectionSampleV1 {
@@ -1914,7 +1920,10 @@ pub(crate) struct CanonicalRasterProjectionSampleV1 {
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterProjectionCropV1 {
@@ -1930,7 +1939,10 @@ macro_rules! raster_spec_enum {
     ($name:ident, $variant:ident) => {
         #[cfg_attr(
             not(test),
-            expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+            expect(
+                dead_code,
+                reason = "consumed by the later raster pixel-rendering slice"
+            )
         )]
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         pub(crate) enum $name {
@@ -1948,12 +1960,18 @@ raster_spec_enum!(
     CanonicalRasterClippingPolicyV1,
     RejectPointsOutsideSourceCropClipCoverageAtOutputBounds
 );
-raster_spec_enum!(CanonicalRasterSinglePointPolicyV1, OpaqueDiscAtObservedPoint);
+raster_spec_enum!(
+    CanonicalRasterSinglePointPolicyV1,
+    OpaqueDiscAtObservedPoint
+);
 raster_spec_enum!(CanonicalRasterStrokeOrderPolicyV1, JournalFirstOccurrence);
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterProjectionSpecV1 {
@@ -1976,7 +1994,10 @@ pub(crate) struct CanonicalRasterProjectionSpecV1 {
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 impl CanonicalRasterProjectionSpecV1 {
     pub(crate) fn new(
@@ -2037,10 +2058,10 @@ impl CanonicalRasterProjectionSpecV1 {
             ));
         }
 
-        let crop_width = i128::from(self.source_crop.right_px_exclusive)
-            - i128::from(self.source_crop.left_px);
-        let crop_height = i128::from(self.source_crop.bottom_px_exclusive)
-            - i128::from(self.source_crop.top_px);
+        let crop_width =
+            i128::from(self.source_crop.right_px_exclusive) - i128::from(self.source_crop.left_px);
+        let crop_height =
+            i128::from(self.source_crop.bottom_px_exclusive) - i128::from(self.source_crop.top_px);
         if crop_width <= 0
             || crop_height <= 0
             || crop_width > i128::from(MAX_CANONICAL_RASTER_CROP_DIMENSION)
@@ -2058,13 +2079,21 @@ impl CanonicalRasterProjectionSpecV1 {
                 "source crop area cap exceeded",
             ));
         }
-        Ok((crop_width, crop_height, row_stride_bytes, output_buffer_bytes))
+        Ok((
+            crop_width,
+            crop_height,
+            row_stride_bytes,
+            output_buffer_bytes,
+        ))
     }
 }
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterOutputPointV1 {
@@ -2080,7 +2109,10 @@ pub(crate) struct CanonicalRasterOutputPointV1 {
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterOutputGeometryV1 {
@@ -2109,7 +2141,10 @@ pub(crate) struct CanonicalRasterOutputGeometryV1 {
 /// every selected stroke must have exactly one valid captured start frame.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 pub(crate) fn build_canonical_raster_projection_plan(
     state: &JournalReplayState,
@@ -2185,9 +2220,7 @@ pub(crate) fn build_canonical_raster_projection_plan(
                 EditCommand::Restore { targets } if targets.contains(target) => {
                     explicit_visibility = Some(true);
                 }
-                EditCommand::StrokeVisibility { targets, visible }
-                    if targets.contains(target) =>
-                {
+                EditCommand::StrokeVisibility { targets, visible } if targets.contains(target) => {
                     explicit_visibility = Some(*visible);
                 }
                 _ => {}
@@ -2212,9 +2245,7 @@ pub(crate) fn build_canonical_raster_projection_plan(
     let mut previous_journal_sequence = None;
     let mut total_raw_sample_bytes = 0usize;
     for projected_sample in projected {
-        if previous_journal_sequence
-            .is_some_and(|previous| projected_sample.sequence <= previous)
-        {
+        if previous_journal_sequence.is_some_and(|previous| projected_sample.sequence <= previous) {
             return Err(CanvasError::InvalidCanonicalRasterProjection(
                 "projected samples are not in strict journal sequence order",
             ));
@@ -2255,8 +2286,7 @@ pub(crate) fn build_canonical_raster_projection_plan(
                 units: effective_position.units.clone(),
             });
         }
-        if i32::try_from(raw_position.x_raw).is_err()
-            || i32::try_from(raw_position.y_raw).is_err()
+        if i32::try_from(raw_position.x_raw).is_err() || i32::try_from(raw_position.y_raw).is_err()
         {
             return Err(CanvasError::InvalidCanonicalRasterProjection(
                 "raw Direct screen position is outside the native POINT range",
@@ -2329,7 +2359,10 @@ pub(crate) fn build_canonical_raster_projection_plan(
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 pub(crate) fn transform_canonical_raster_geometry(
     plan: &CanonicalRasterProjectionPlanV1,
@@ -2402,13 +2435,9 @@ pub(crate) fn transform_canonical_raster_geometry(
             ));
         }
 
-        let raw_position = point
-            .source_sample
-            .position
-            .as_ref()
-            .ok_or(CanvasError::InvalidCanonicalRasterProjection(
-                "output point has no raw position",
-            ))?;
+        let raw_position = point.source_sample.position.as_ref().ok_or(
+            CanvasError::InvalidCanonicalRasterProjection("output point has no raw position"),
+        )?;
         if raw_position.coordinate_space != SCREEN_POSITION_SPACE
             || raw_position.units != SCREEN_POSITION_UNITS
             || i32::try_from(raw_position.x_raw).is_err()
@@ -2423,9 +2452,7 @@ pub(crate) fn transform_canonical_raster_geometry(
                 "output point position or captured frame is unsupported",
             ));
         }
-        if frame_by_selected_stroke[selected_index]
-            .is_some_and(|frame| frame != point.view_frame)
-        {
+        if frame_by_selected_stroke[selected_index].is_some_and(|frame| frame != point.view_frame) {
             return Err(CanvasError::StrokeViewFrameMismatch);
         }
         frame_by_selected_stroke[selected_index] = Some(point.view_frame);
@@ -2453,9 +2480,7 @@ pub(crate) fn transform_canonical_raster_geometry(
             .checked_add(1)
             .ok_or(CanvasError::PointCapacityReached)?;
     }
-    if frame_by_selected_stroke.iter().any(Option::is_none)
-        || sample_counts.contains(&0)
-    {
+    if frame_by_selected_stroke.iter().any(Option::is_none) || sample_counts.contains(&0) {
         return Err(CanvasError::InvalidCanonicalRasterProjection(
             "output plan contains a selected stroke without visible committed geometry",
         ));
@@ -2463,7 +2488,8 @@ pub(crate) fn transform_canonical_raster_geometry(
 
     let stroke_draw_order = journal_first_occurrence_stroke_order(plan)?;
     let source_content_sha256 = hash_canonical_raster_source(plan, &stroke_draw_order);
-    let projection_spec_sha256 = hash_canonical_raster_spec(spec, row_stride_bytes, output_buffer_bytes);
+    let projection_spec_sha256 =
+        hash_canonical_raster_spec(spec, row_stride_bytes, output_buffer_bytes);
     let mut points_in_journal_order = Vec::new();
     points_in_journal_order
         .try_reserve_exact(plan.samples_in_journal_order.len())
@@ -2529,7 +2555,10 @@ pub(crate) fn transform_canonical_raster_geometry(
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 fn journal_first_occurrence_stroke_order(
     plan: &CanonicalRasterProjectionPlanV1,
@@ -2558,7 +2587,10 @@ fn journal_first_occurrence_stroke_order(
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 fn map_canonical_point_to_output(
     point: CanvasPointPx,
@@ -2603,7 +2635,9 @@ fn map_canonical_point_to_output(
                 x_numerator,
                 crop_width,
                 y_numerator,
-                crop_width.checked_mul(2).ok_or(CanvasError::InvalidTransform)?,
+                crop_width
+                    .checked_mul(2)
+                    .ok_or(CanvasError::InvalidTransform)?,
             )
         } else {
             let horizontal_padding_numerator = width_scale_cross - height_scale_cross;
@@ -2619,7 +2653,9 @@ fn map_canonical_point_to_output(
                 .ok_or(CanvasError::InvalidTransform)?;
             (
                 x_numerator,
-                crop_height.checked_mul(2).ok_or(CanvasError::InvalidTransform)?,
+                crop_height
+                    .checked_mul(2)
+                    .ok_or(CanvasError::InvalidTransform)?,
                 y_numerator,
                 crop_height,
             )
@@ -2646,7 +2682,10 @@ fn map_canonical_point_to_output(
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 fn round_nonnegative_ratio_ties_away(
     numerator: i128,
@@ -2662,7 +2701,9 @@ fn round_nonnegative_ratio_ties_away(
         .ok_or(CanvasError::InvalidTransform)?
         >= denominator;
     let rounded = if round_up {
-        quotient.checked_add(1).ok_or(CanvasError::InvalidTransform)?
+        quotient
+            .checked_add(1)
+            .ok_or(CanvasError::InvalidTransform)?
     } else {
         quotient
     };
@@ -2671,13 +2712,19 @@ fn round_nonnegative_ratio_ties_away(
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 struct CanonicalRasterHashWriter(Sha256);
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 impl CanonicalRasterHashWriter {
     fn new(domain: &[u8]) -> Self {
@@ -2840,7 +2887,10 @@ impl CanonicalRasterHashWriter {
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 fn hash_canonical_raster_source(
     plan: &CanonicalRasterProjectionPlanV1,
@@ -2870,7 +2920,10 @@ fn hash_canonical_raster_source(
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 fn hash_canonical_raster_spec(
     spec: &CanonicalRasterProjectionSpecV1,
@@ -2920,7 +2973,10 @@ fn hash_canonical_raster_spec(
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the later raster pixel-rendering slice")
+    expect(
+        dead_code,
+        reason = "consumed by the later raster pixel-rendering slice"
+    )
 )]
 fn hash_canonical_raster_geometry(
     source_content_sha256: [u8; 32],
@@ -3337,7 +3393,9 @@ mod tests {
         writer
             .append_sample(projection_sample(&first, 90, 110, 220, 2))
             .unwrap();
-        writer.start_stroke(second.clone(), second_frame, 3).unwrap();
+        writer
+            .start_stroke(second.clone(), second_frame, 3)
+            .unwrap();
         writer
             .append_sample(projection_sample(&second, 501, 540, 680, 4))
             .unwrap();
@@ -3389,10 +3447,7 @@ mod tests {
             plan.samples_in_journal_order[2].canonical_canvas_position_px,
             CanvasPointPx { x: 20, y: 30 }
         );
-        assert_eq!(
-            plan.samples_in_journal_order[1].view_frame,
-            second_frame
-        );
+        assert_eq!(plan.samples_in_journal_order[1].view_frame, second_frame);
         assert_eq!(
             plan.samples_in_journal_order[0]
                 .source_sample
@@ -3428,7 +3483,10 @@ mod tests {
             geometry.spec.single_point_policy,
             CanonicalRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint
         );
-        assert_eq!(geometry.stroke_draw_order, vec![first.clone(), second.clone()]);
+        assert_eq!(
+            geometry.stroke_draw_order,
+            vec![first.clone(), second.clone()]
+        );
         assert_eq!(geometry.caller_selection_order, selected);
         assert_eq!(
             geometry
@@ -3482,8 +3540,7 @@ mod tests {
         let forward_selection = [first.clone(), second.clone()];
         let forward_plan =
             build_canonical_raster_projection_plan(&state, &forward_selection).unwrap();
-        let forward_geometry =
-            transform_canonical_raster_geometry(&forward_plan, &spec).unwrap();
+        let forward_geometry = transform_canonical_raster_geometry(&forward_plan, &spec).unwrap();
         assert_eq!(
             forward_plan
                 .samples_in_journal_order
@@ -3495,14 +3552,28 @@ mod tests {
                 .map(|point| point.journal_sequence)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(forward_geometry.stroke_draw_order, geometry.stroke_draw_order);
-        assert_eq!(forward_geometry.source_content_sha256, geometry.source_content_sha256);
-        assert_eq!(forward_geometry.projection_spec_sha256, geometry.projection_spec_sha256);
+        assert_eq!(
+            forward_geometry.stroke_draw_order,
+            geometry.stroke_draw_order
+        );
+        assert_eq!(
+            forward_geometry.source_content_sha256,
+            geometry.source_content_sha256
+        );
+        assert_eq!(
+            forward_geometry.projection_spec_sha256,
+            geometry.projection_spec_sha256
+        );
         assert_eq!(forward_geometry.geometry_sha256, geometry.geometry_sha256);
-        assert_ne!(forward_geometry.caller_selection_order, geometry.caller_selection_order);
+        assert_ne!(
+            forward_geometry.caller_selection_order,
+            geometry.caller_selection_order
+        );
 
         let mut changed_source = plan.clone();
-        changed_source.samples_in_journal_order[0].source_sample.raw_payload[0] ^= 0xff;
+        changed_source.samples_in_journal_order[0]
+            .source_sample
+            .raw_payload[0] ^= 0xff;
         let changed_source_geometry =
             transform_canonical_raster_geometry(&changed_source, &spec).unwrap();
         assert_eq!(changed_source.journal_id, plan.journal_id);
@@ -3512,13 +3583,23 @@ mod tests {
             geometry.source_content_sha256,
             changed_source_geometry.source_content_sha256
         );
-        assert_ne!(geometry.geometry_sha256, changed_source_geometry.geometry_sha256);
+        assert_ne!(
+            geometry.geometry_sha256,
+            changed_source_geometry.geometry_sha256
+        );
 
         let mut changed_spec = spec.clone();
         changed_spec.output_width_px = 180;
-        let changed_spec_geometry = transform_canonical_raster_geometry(&plan, &changed_spec).unwrap();
-        assert_ne!(geometry.projection_spec_sha256, changed_spec_geometry.projection_spec_sha256);
-        assert_ne!(geometry.geometry_sha256, changed_spec_geometry.geometry_sha256);
+        let changed_spec_geometry =
+            transform_canonical_raster_geometry(&plan, &changed_spec).unwrap();
+        assert_ne!(
+            geometry.projection_spec_sha256,
+            changed_spec_geometry.projection_spec_sha256
+        );
+        assert_ne!(
+            geometry.geometry_sha256,
+            changed_spec_geometry.geometry_sha256
+        );
         writer.flush().unwrap();
         drop(writer);
         let _ = fs::remove_file(path);
@@ -3531,8 +3612,8 @@ mod tests {
             .stroke_view_frame(CanvasOrigin::default(), 1.0)
             .unwrap();
         let state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
-        let plan = build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target))
-            .unwrap();
+        let plan =
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).unwrap();
         let valid_crop = CanonicalRasterProjectionCropV1 {
             left_px: 0,
             top_px: 0,
@@ -3604,11 +3685,11 @@ mod tests {
                 1.0,
             )
             .unwrap();
-        let (path, mut writer) =
-            committed_projection_fixture(&target, frame, &[(73, 110, 220)]);
+        let (path, mut writer) = committed_projection_fixture(&target, frame, &[(73, 110, 220)]);
         let before_state = writer.replay_state().clone();
-        let before = build_canonical_raster_projection_plan(&before_state, std::slice::from_ref(&target))
-            .unwrap();
+        let before =
+            build_canonical_raster_projection_plan(&before_state, std::slice::from_ref(&target))
+                .unwrap();
         let raw_before = before.samples_in_journal_order[0]
             .source_sample
             .position
@@ -3635,8 +3716,14 @@ mod tests {
         let after =
             build_canonical_raster_projection_plan(&moved_state, std::slice::from_ref(&target))
                 .unwrap();
-        assert_eq!(after.samples_in_journal_order[0].journal_sequence, journal_sequence);
-        assert_eq!(after.samples_in_journal_order[0].source_sequence_raw, source_sequence);
+        assert_eq!(
+            after.samples_in_journal_order[0].journal_sequence,
+            journal_sequence
+        );
+        assert_eq!(
+            after.samples_in_journal_order[0].source_sequence_raw,
+            source_sequence
+        );
         assert_eq!(
             after.samples_in_journal_order[0]
                 .source_sample
@@ -3672,24 +3759,30 @@ mod tests {
             .unwrap();
         let (path, mut writer) =
             committed_projection_fixture(&target, frame, &[(1, 10, 60), (2, 20, 70)]);
-        assert!(build_canonical_raster_projection_plan(
-            writer.replay_state(),
-            std::slice::from_ref(&target)
-        )
-        .is_ok());
+        assert!(
+            build_canonical_raster_projection_plan(
+                writer.replay_state(),
+                std::slice::from_ref(&target)
+            )
+            .is_ok()
+        );
 
         writer.undo_last_edit(10).unwrap();
-        assert!(build_canonical_raster_projection_plan(
-            writer.replay_state(),
-            std::slice::from_ref(&target)
-        )
-        .is_err());
+        assert!(
+            build_canonical_raster_projection_plan(
+                writer.replay_state(),
+                std::slice::from_ref(&target)
+            )
+            .is_err()
+        );
         writer.redo_last_edit(11).unwrap();
-        assert!(build_canonical_raster_projection_plan(
-            writer.replay_state(),
-            std::slice::from_ref(&target)
-        )
-        .is_ok());
+        assert!(
+            build_canonical_raster_projection_plan(
+                writer.replay_state(),
+                std::slice::from_ref(&target)
+            )
+            .is_ok()
+        );
 
         writer
             .apply_edit_action(
@@ -3699,11 +3792,13 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(build_canonical_raster_projection_plan(
-            writer.replay_state(),
-            std::slice::from_ref(&target)
-        )
-        .is_err());
+        assert!(
+            build_canonical_raster_projection_plan(
+                writer.replay_state(),
+                std::slice::from_ref(&target)
+            )
+            .is_err()
+        );
         writer
             .apply_edit_action(
                 13,
@@ -3712,11 +3807,13 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(build_canonical_raster_projection_plan(
-            writer.replay_state(),
-            std::slice::from_ref(&target)
-        )
-        .is_ok());
+        assert!(
+            build_canonical_raster_projection_plan(
+                writer.replay_state(),
+                std::slice::from_ref(&target)
+            )
+            .is_ok()
+        );
         writer.flush().unwrap();
         drop(writer);
         let _ = fs::remove_file(path);
@@ -3734,11 +3831,13 @@ mod tests {
         writer
             .append_sample(projection_sample(&target, 1, 10, 60, 2))
             .unwrap();
-        assert!(build_canonical_raster_projection_plan(
-            writer.replay_state(),
-            std::slice::from_ref(&target)
-        )
-        .is_err());
+        assert!(
+            build_canonical_raster_projection_plan(
+                writer.replay_state(),
+                std::slice::from_ref(&target)
+            )
+            .is_err()
+        );
         writer.flush().unwrap();
         drop(writer);
         let _ = fs::remove_file(path);
@@ -3746,20 +3845,16 @@ mod tests {
         let target = projection_target("missing-frame-proof", "device-a");
         let mut state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
         state.stroke_starts.clear();
-        assert!(build_canonical_raster_projection_plan(
-            &state,
-            std::slice::from_ref(&target)
-        )
-        .is_err());
+        assert!(
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).is_err()
+        );
 
         let target = projection_target("invalid-frame-proof", "device-a");
         let mut state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
         state.stroke_starts[0].view_frame.canvas_zoom_bits = f64::NAN.to_bits();
-        assert!(build_canonical_raster_projection_plan(
-            &state,
-            std::slice::from_ref(&target)
-        )
-        .is_err());
+        assert!(
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).is_err()
+        );
 
         let target = projection_target("unsupported-units-proof", "device-a");
         let mut state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
@@ -3769,11 +3864,9 @@ mod tests {
             .as_mut()
             .unwrap()
             .units = "himetric".to_owned();
-        assert!(build_canonical_raster_projection_plan(
-            &state,
-            std::slice::from_ref(&target)
-        )
-        .is_err());
+        assert!(
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).is_err()
+        );
 
         let target = projection_target("missing-position-proof", "device-a");
         let mut state = committed_projection_state(
@@ -3782,11 +3875,9 @@ mod tests {
             &[(1, 10, 60), (2, 20, 70)],
         );
         state.physical_samples[0].sample.position = None;
-        assert!(build_canonical_raster_projection_plan(
-            &state,
-            std::slice::from_ref(&target)
-        )
-        .is_err());
+        assert!(
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).is_err()
+        );
 
         let target = projection_target("unsupported-space-proof", "device-a");
         let mut state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
@@ -3796,11 +3887,9 @@ mod tests {
             .as_mut()
             .unwrap()
             .coordinate_space = "windows-client-coordinates".to_owned();
-        assert!(build_canonical_raster_projection_plan(
-            &state,
-            std::slice::from_ref(&target)
-        )
-        .is_err());
+        assert!(
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).is_err()
+        );
 
         let target = projection_target("unrepresentable-transform-proof", "device-a");
         let mut state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
@@ -3812,11 +3901,9 @@ mod tests {
             .as_mut()
             .unwrap()
             .x_raw = i64::from(i32::MAX);
-        assert!(build_canonical_raster_projection_plan(
-            &state,
-            std::slice::from_ref(&target)
-        )
-        .is_err());
+        assert!(
+            build_canonical_raster_projection_plan(&state, std::slice::from_ref(&target)).is_err()
+        );
 
         let target = projection_target("unsupported-source-proof", "device-a");
         let state = committed_projection_state(&target, frame, &[(1, 10, 60)]);
@@ -3824,11 +3911,13 @@ mod tests {
             source_api: "wintab".to_owned(),
             ..target
         };
-        assert!(build_canonical_raster_projection_plan(
-            &state,
-            std::slice::from_ref(&unsupported_target)
-        )
-        .is_err());
+        assert!(
+            build_canonical_raster_projection_plan(
+                &state,
+                std::slice::from_ref(&unsupported_target)
+            )
+            .is_err()
+        );
     }
 
     #[test]
