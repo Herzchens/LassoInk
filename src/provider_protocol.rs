@@ -4644,7 +4644,6 @@ mod tests {
             ),
         ];
         let mut expected_frames = BTreeMap::<String, (Vec<u8>, Vec<u8>)>::new();
-        let mut expected_input_view_ids = BTreeMap::<String, String>::new();
         let mut providers = Vec::new();
         for (
             provider_index,
@@ -5184,6 +5183,7 @@ mod tests {
             ),
         ];
         let mut expected_frames = BTreeMap::<String, (Vec<u8>, Vec<u8>)>::new();
+        let mut expected_input_view_ids = BTreeMap::<String, String>::new();
         let mut providers = Vec::new();
         for (provider_index, (configuration_id, mode_label, behavior, requested_modalities)) in
             provider_modes.iter().enumerate()

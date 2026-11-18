@@ -1887,13 +1887,6 @@ impl CanvasScene {
 /// A validated geometry-only projection of the selected, committed Direct
 /// samples. `samples_in_journal_order` is never sorted by source clock or
 /// `StrokeRef`; `source_sample` preserves the exact immutable journal payload.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterProjectionPlanV1 {
     journal_id: String,
@@ -1904,13 +1897,6 @@ pub(crate) struct CanonicalRasterProjectionPlanV1 {
     samples_in_journal_order: Vec<CanonicalRasterProjectionSampleV1>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterProjectionSampleV1 {
     journal_sequence: u64,
@@ -1926,13 +1912,6 @@ pub(crate) struct CanonicalRasterProjectionSampleV1 {
     canonical_canvas_position_px: CanvasPointPx,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterProjectionCropV1 {
     /// Inclusive bounds in the plan's default-canvas pixel coordinates.
@@ -1945,13 +1924,6 @@ pub(crate) struct CanonicalRasterProjectionCropV1 {
 
 macro_rules! raster_spec_enum {
     ($name:ident, $variant:ident) => {
-        #[cfg_attr(
-            not(test),
-            expect(
-                dead_code,
-                reason = "consumed by the later raster pixel-rendering slice"
-            )
-        )]
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         pub(crate) enum $name {
             $variant,
@@ -1975,13 +1947,6 @@ raster_spec_enum!(
 );
 raster_spec_enum!(CanonicalRasterStrokeOrderPolicyV1, JournalFirstOccurrence);
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterProjectionSpecV1 {
     schema_version: u32,
@@ -2002,13 +1967,6 @@ pub(crate) struct CanonicalRasterProjectionSpecV1 {
     stroke_order_policy: CanonicalRasterStrokeOrderPolicyV1,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 impl CanonicalRasterProjectionSpecV1 {
     pub(crate) fn new(
         output_width_px: u32,
@@ -2099,13 +2057,6 @@ impl CanonicalRasterProjectionSpecV1 {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterOutputPointV1 {
     journal_sequence: u64,
@@ -2118,13 +2069,6 @@ pub(crate) struct CanonicalRasterOutputPointV1 {
     is_single_point_stroke: bool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterOutputGeometryV1 {
     schema_version: u32,
@@ -2147,13 +2091,6 @@ pub(crate) struct CanonicalRasterOutputGeometryV1 {
     points_in_journal_order: Vec<CanonicalRasterOutputPointV1>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster export/provider slice"
-    )
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterImageV1 {
     schema_version: u32,
@@ -2293,13 +2230,6 @@ impl CanonicalRasterImageV1 {
 /// Build a strict, immutable geometry view from the current append-only
 /// journal projection. No session-origin/default-frame fallback is used here:
 /// every selected stroke must have exactly one valid captured start frame.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 pub(crate) fn build_canonical_raster_projection_plan(
     state: &JournalReplayState,
     selected_strokes: &[StrokeRef],
@@ -2511,13 +2441,6 @@ pub(crate) fn build_canonical_raster_projection_plan(
     })
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 pub(crate) fn transform_canonical_raster_geometry(
     plan: &CanonicalRasterProjectionPlanV1,
     spec: &CanonicalRasterProjectionSpecV1,
@@ -2701,13 +2624,6 @@ pub(crate) fn transform_canonical_raster_geometry(
 /// Render the already-validated canonical geometry with the pinned CPU
 /// backend. This creates a projection artifact only; it does not claim parity
 /// with an external rasterizer, UI frame, or recognition model preprocessing.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster export/provider slice"
-    )
-)]
 pub(crate) fn render_canonical_raster(
     geometry: &CanonicalRasterOutputGeometryV1,
 ) -> Result<CanonicalRasterImageV1, CanvasError> {
@@ -2813,10 +2729,6 @@ pub(crate) fn render_canonical_raster(
     Ok(image)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the canonical raster renderer")
-)]
 fn validate_canonical_raster_geometry_for_render(
     geometry: &CanonicalRasterOutputGeometryV1,
 ) -> Result<(), CanvasError> {
@@ -2931,10 +2843,6 @@ fn validate_canonical_raster_geometry_for_render(
     Ok(())
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the canonical raster renderer")
-)]
 fn draw_canonical_raster_stroke(
     pixmap: &mut Pixmap,
     paint: &Paint<'_>,
@@ -3019,10 +2927,6 @@ fn draw_canonical_raster_stroke(
     Ok(())
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the canonical raster renderer")
-)]
 fn checked_q16_to_renderer_f32(value: i64) -> Result<f32, CanvasError> {
     let coordinate = value as f64 / CANONICAL_RASTER_FIXED_ONE as f64;
     if !coordinate.is_finite() || coordinate.abs() > f64::from(f32::MAX) {
@@ -3039,13 +2943,6 @@ fn checked_q16_to_renderer_f32(value: i64) -> Result<f32, CanvasError> {
     Ok(rendered)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 fn journal_first_occurrence_stroke_order(
     plan: &CanonicalRasterProjectionPlanV1,
 ) -> Result<Vec<StrokeRef>, CanvasError> {
@@ -3071,13 +2968,6 @@ fn journal_first_occurrence_stroke_order(
     Ok(order)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 fn map_canonical_point_to_output(
     point: CanvasPointPx,
     spec: &CanonicalRasterProjectionSpecV1,
@@ -3166,13 +3056,6 @@ fn map_canonical_point_to_output(
     Ok((x_subpixel_16_16, y_subpixel_16_16))
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 fn round_nonnegative_ratio_ties_away(
     numerator: i128,
     denominator: i128,
@@ -3196,22 +3079,8 @@ fn round_nonnegative_ratio_ties_away(
     i64::try_from(rounded).map_err(|_| CanvasError::InvalidTransform)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 struct CanonicalRasterHashWriter(Sha256);
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 impl CanonicalRasterHashWriter {
     fn new(domain: &[u8]) -> Self {
         let mut hash = Sha256::new();
@@ -3371,13 +3240,6 @@ impl CanonicalRasterHashWriter {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 fn hash_canonical_raster_source(
     plan: &CanonicalRasterProjectionPlanV1,
     stroke_draw_order: &[StrokeRef],
@@ -3404,13 +3266,6 @@ fn hash_canonical_raster_source(
     hash.finish()
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 fn hash_canonical_raster_spec(
     spec: &CanonicalRasterProjectionSpecV1,
     row_stride_bytes: u32,
@@ -3460,13 +3315,6 @@ fn hash_canonical_raster_spec(
     hash.finish()
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the later raster pixel-rendering slice"
-    )
-)]
 fn hash_canonical_raster_geometry(geometry: &CanonicalRasterOutputGeometryV1) -> [u8; 32] {
     let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-geometry/v1\0");
     hash.bytes(&geometry.source_content_sha256);
@@ -3491,10 +3339,6 @@ fn hash_canonical_raster_geometry(geometry: &CanonicalRasterOutputGeometryV1) ->
     hash.finish()
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the canonical raster renderer")
-)]
 fn hash_canonical_raster_artifact(image: &CanonicalRasterImageV1) -> [u8; 32] {
     let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-artifact/v1\0");
     hash.u32(image.schema_version);
