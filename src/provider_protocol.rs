@@ -3487,6 +3487,124 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_configuration_unicode_windows_path_shared_json_vector() {
+        #[derive(serde::Deserialize)]
+        struct SharedConfigFixture {
+            schema_version: u32,
+            configuration: ProviderConfigurationV1,
+            canonical_json_utf8: String,
+        }
+
+        let fixture: SharedConfigFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/provider_configuration_unicode_path_v1.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture.schema_version, 1);
+        let maximum = MAX_REQUEST_FRAME_BYTES / 4;
+        let actual = bounded_json_bytes(&fixture.configuration, maximum).unwrap();
+        assert_eq!(actual.as_slice(), fixture.canonical_json_utf8.as_bytes());
+    }
+
+    #[test]
+    fn input_view_fingerprint_matches_shared_fixture_payload_and_fnv() {
+        #[derive(serde::Deserialize)]
+        struct SharedInputViewFixture {
+            request: RecognitionRequestV1,
+            fingerprint_payload_hex: String,
+            input_view_id: String,
+        }
+
+        let fixture: SharedInputViewFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/provider_input_view_v1.json"
+        ))
+        .unwrap();
+        let (_, request) = fixture_request();
+        assert_eq!(request, fixture.request);
+
+        let requested_input_modalities =
+            canonicalize_input_modalities(&request.requested_input_modalities).unwrap();
+        let fingerprint = RequestFingerprintV1 {
+            protocol_version: request.protocol_version,
+            source_journal_id: &request.source_revision.journal_id,
+            logical_revision: request.source_revision.logical_revision,
+            region_id: &request.region_id,
+            line_id: &request.line_id,
+            coordinate_space: &request.coordinate_space,
+            coordinate_units: &request.coordinate_units,
+            language_hints: &request.language_hints,
+            requested_input_modalities: &requested_input_modalities,
+            stroke_views: &request.stroke_views,
+            samples: &request.samples,
+            raster: &request.raster,
+        };
+        let payload = bounded_json_bytes(&fingerprint, MAX_REQUEST_FRAME_BYTES).unwrap();
+        let mut payload_hex = String::new();
+        use std::fmt::Write as _;
+        for byte in &payload {
+            write!(&mut payload_hex, "{byte:02x}").unwrap();
+        }
+        assert_eq!(payload_hex, fixture.fingerprint_payload_hex);
+        assert_eq!(input_view_id(&request).unwrap(), fixture.input_view_id);
+    }
+
+    #[test]
+    fn raster_input_view_fingerprint_matches_shared_fixture_payload_and_fnv() {
+        #[derive(serde::Deserialize)]
+        struct SharedRasterInputViewFixture {
+            request: RecognitionRequestV1,
+            fingerprint_payload_hex: String,
+            input_view_id: String,
+        }
+
+        let fixture: SharedRasterInputViewFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/provider_raster_input_view_v1.json"
+        ))
+        .unwrap();
+        let (state, selected) = fixture_state_and_selection();
+        let raster = ProviderRasterInputV1 {
+            width: 1,
+            height: 1,
+            payload_contract: ProviderRasterPayloadContractV1::OpaqueBytes,
+            coordinate_space: "windows-screen-coordinates".to_owned(),
+            units: "screen-pixel".to_owned(),
+            raw_payload_hex: "00".to_owned(),
+        };
+        let request = fixture_request_with_inputs(
+            &state,
+            &selected,
+            fixture_configuration(),
+            vec![ProviderInputCapabilityV1::Raster],
+            Some(raster),
+        );
+        assert_eq!(request, fixture.request);
+
+        let requested_input_modalities =
+            canonicalize_input_modalities(&request.requested_input_modalities).unwrap();
+        let fingerprint = RequestFingerprintV1 {
+            protocol_version: request.protocol_version,
+            source_journal_id: &request.source_revision.journal_id,
+            logical_revision: request.source_revision.logical_revision,
+            region_id: &request.region_id,
+            line_id: &request.line_id,
+            coordinate_space: &request.coordinate_space,
+            coordinate_units: &request.coordinate_units,
+            language_hints: &request.language_hints,
+            requested_input_modalities: &requested_input_modalities,
+            stroke_views: &request.stroke_views,
+            samples: &request.samples,
+            raster: &request.raster,
+        };
+        let payload = bounded_json_bytes(&fingerprint, MAX_REQUEST_FRAME_BYTES).unwrap();
+        let mut payload_hex = String::new();
+        use std::fmt::Write as _;
+        for byte in &payload {
+            write!(&mut payload_hex, "{byte:02x}").unwrap();
+        }
+        assert_eq!(payload_hex, fixture.fingerprint_payload_hex);
+        assert_eq!(input_view_id(&request).unwrap(), fixture.input_view_id);
+    }
+
     fn fixture_request_for_state(
         state: &JournalReplayState,
         selected: &[StrokeRef],
