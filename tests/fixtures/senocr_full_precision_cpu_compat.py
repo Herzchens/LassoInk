@@ -21,7 +21,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 REPOSITORY = "Herzchens/LassoInk"
-REQUIRED_BRANCH = "test/raster-cpu-compatibility"
+REQUIRED_BRANCH = "feat/raster-reference-protocol"
 MODEL_REPOSITORY = "VietAlphaLabs/SenOCR-Vi"
 MODEL_REVISION = "1e70dff4ef0429b0d88a2b873fb5d03300af1a41"
 MODEL_INDEX_FILE = "model.safetensors.index.json"
@@ -564,6 +564,21 @@ def run_probe() -> dict[str, object]:
     CURRENT_STAGE = "temporary_workspace"
     with tempfile.TemporaryDirectory(prefix="lasso-senocr-compat-", dir=runner_temp) as temporary_directory:
         temporary_root = Path(temporary_directory).resolve()
+        keep_assets_for_worker_e2e = (
+            os.environ.get("LASSOINK_RUN_SENOCR_M4_E2E") == "1"
+        )
+        if keep_assets_for_worker_e2e:
+            model_dir = Path(os.environ.get("LASSOINK_SENOCR_ASSET_ROOT", ""))
+            require(
+                model_dir.is_absolute()
+                and model_dir.name == "lasso-senocr-worker-assets"
+                and model_dir.parent.resolve() == runner_temp.resolve()
+                and not model_dir.exists()
+                and not model_dir.is_symlink(),
+                "worker_asset_temp_path_invalid",
+            )
+        else:
+            model_dir = temporary_root / "model"
         expected_total_bytes = sum(value[0] for value in MODEL_FILES.values())
         require(expected_total_bytes <= MAX_TOTAL_MODEL_BYTES, "manifest_total_oversize")
         pre_download_free_disk = expected_total_bytes + PRE_DOWNLOAD_DISK_RESERVE_BYTES
@@ -592,7 +607,6 @@ def run_probe() -> dict[str, object]:
         metadata_elapsed_ms = int((time.perf_counter() - metadata_started) * 1000)
         require_resources(temporary_root, pre_download_free_disk)
 
-        model_dir = temporary_root / "model"
         model_dir.mkdir()
         download_started = time.perf_counter()
         download_deadline = time.monotonic() + DOWNLOAD_DEADLINE_SECONDS

@@ -3474,6 +3474,137 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_configuration_fingerprint_shared_golden_vector() {
+        let configuration = fixture_configuration();
+        assert_eq!(
+            bounded_json_bytes(&configuration, MAX_REQUEST_FRAME_BYTES / 4).unwrap(),
+            br#"{"configuration_id":"operator-approved-config","values":{"language-mode":"recognize"}}"#,
+        );
+        assert_eq!(
+            configuration.fingerprint().unwrap(),
+            "provider-config-v1-fnv64-5d449396c33394f8",
+        );
+    }
+
+    #[test]
+    fn provider_configuration_unicode_windows_path_shared_json_vector() {
+        #[derive(serde::Deserialize)]
+        struct SharedConfigFixture {
+            schema_version: u32,
+            configuration: ProviderConfigurationV1,
+            canonical_json_utf8: String,
+        }
+
+        let fixture: SharedConfigFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/provider_configuration_unicode_path_v1.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture.schema_version, 1);
+        let maximum = MAX_REQUEST_FRAME_BYTES / 4;
+        let actual = bounded_json_bytes(&fixture.configuration, maximum).unwrap();
+        assert_eq!(actual.as_slice(), fixture.canonical_json_utf8.as_bytes());
+    }
+
+    #[test]
+    fn input_view_fingerprint_matches_shared_fixture_payload_and_fnv() {
+        #[derive(serde::Deserialize)]
+        struct SharedInputViewFixture {
+            request: RecognitionRequestV1,
+            fingerprint_payload_hex: String,
+            input_view_id: String,
+        }
+
+        let fixture: SharedInputViewFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/provider_input_view_v1.json"
+        ))
+        .unwrap();
+        let (_, request) = fixture_request();
+        assert_eq!(request, fixture.request);
+
+        let requested_input_modalities =
+            canonicalize_input_modalities(&request.requested_input_modalities).unwrap();
+        let fingerprint = RequestFingerprintV1 {
+            protocol_version: request.protocol_version,
+            source_journal_id: &request.source_revision.journal_id,
+            logical_revision: request.source_revision.logical_revision,
+            region_id: &request.region_id,
+            line_id: &request.line_id,
+            coordinate_space: &request.coordinate_space,
+            coordinate_units: &request.coordinate_units,
+            language_hints: &request.language_hints,
+            requested_input_modalities: &requested_input_modalities,
+            stroke_views: &request.stroke_views,
+            samples: &request.samples,
+            raster: &request.raster,
+        };
+        let payload = bounded_json_bytes(&fingerprint, MAX_REQUEST_FRAME_BYTES).unwrap();
+        let mut payload_hex = String::new();
+        use std::fmt::Write as _;
+        for byte in &payload {
+            write!(&mut payload_hex, "{byte:02x}").unwrap();
+        }
+        assert_eq!(payload_hex, fixture.fingerprint_payload_hex);
+        assert_eq!(input_view_id(&request).unwrap(), fixture.input_view_id);
+    }
+
+    #[test]
+    fn raster_input_view_fingerprint_matches_shared_fixture_payload_and_fnv() {
+        #[derive(serde::Deserialize)]
+        struct SharedRasterInputViewFixture {
+            request: RecognitionRequestV1,
+            fingerprint_payload_hex: String,
+            input_view_id: String,
+        }
+
+        let fixture: SharedRasterInputViewFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/provider_raster_input_view_v1.json"
+        ))
+        .unwrap();
+        let (state, selected) = fixture_state_and_selection();
+        let raster = ProviderRasterInputV1 {
+            width: 1,
+            height: 1,
+            payload_contract: ProviderRasterPayloadContractV1::OpaqueBytes,
+            coordinate_space: "windows-screen-coordinates".to_owned(),
+            units: "screen-pixel".to_owned(),
+            raw_payload_hex: "00".to_owned(),
+        };
+        let request = fixture_request_with_inputs(
+            &state,
+            &selected,
+            fixture_configuration(),
+            vec![ProviderInputCapabilityV1::Raster],
+            Some(raster),
+        );
+        assert_eq!(request, fixture.request);
+
+        let requested_input_modalities =
+            canonicalize_input_modalities(&request.requested_input_modalities).unwrap();
+        let fingerprint = RequestFingerprintV1 {
+            protocol_version: request.protocol_version,
+            source_journal_id: &request.source_revision.journal_id,
+            logical_revision: request.source_revision.logical_revision,
+            region_id: &request.region_id,
+            line_id: &request.line_id,
+            coordinate_space: &request.coordinate_space,
+            coordinate_units: &request.coordinate_units,
+            language_hints: &request.language_hints,
+            requested_input_modalities: &requested_input_modalities,
+            stroke_views: &request.stroke_views,
+            samples: &request.samples,
+            raster: &request.raster,
+        };
+        let payload = bounded_json_bytes(&fingerprint, MAX_REQUEST_FRAME_BYTES).unwrap();
+        let mut payload_hex = String::new();
+        use std::fmt::Write as _;
+        for byte in &payload {
+            write!(&mut payload_hex, "{byte:02x}").unwrap();
+        }
+        assert_eq!(payload_hex, fixture.fingerprint_payload_hex);
+        assert_eq!(input_view_id(&request).unwrap(), fixture.input_view_id);
+    }
+
     fn fixture_request_for_state(
         state: &JournalReplayState,
         selected: &[StrokeRef],
@@ -4212,6 +4343,41 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    fn require_senocr_m4_worker_test_opt_in() {
+        assert!(
+            std::env::var("LASSOINK_RUN_SENOCR_M4_E2E").is_ok_and(|value| value == "1"),
+            "the model-backed M4 worker test requires its dedicated hosted opt-in"
+        );
+        require_provider_mock_test_opt_in();
+        let expected_head = std::env::var("LASSOINK_EXPECTED_HEAD_SHA")
+            .expect("the guarded worker job provides its exact PR head");
+        assert_eq!(expected_head.len(), 40, "expected a full PR head SHA");
+        assert!(
+            expected_head
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        assert!(
+            std::env::var("LASSOINK_CHECKED_OUT_HEAD_SHA")
+                .is_ok_and(|actual| actual == expected_head)
+        );
+        assert!(
+            std::env::var("LASSOINK_EXPECTED_HEAD_REPOSITORY")
+                .is_ok_and(|actual| actual == "Herzchens/LassoInk")
+        );
+        assert!(
+            std::env::var("LASSOINK_EXPECTED_HEAD_REF")
+                .is_ok_and(|actual| actual == "feat/raster-reference-protocol")
+        );
+        assert!(std::env::var("GITHUB_EVENT_NAME").is_ok_and(|actual| actual == "pull_request"));
+        assert!(
+            std::env::var("GITHUB_HEAD_REF")
+                .is_ok_and(|actual| actual == "feat/raster-reference-protocol")
+        );
+        assert!(std::env::var("RUNNER_ARCH").is_ok_and(|actual| actual == "X64"));
+    }
+
     struct MockWorkerBinary {
         directory: PathBuf,
         executable: PathBuf,
@@ -4329,6 +4495,53 @@ mod tests {
                 "provider worker result timed out"
             );
             thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
+    fn run_senocr_worker_request(
+        python_executable: &std::path::Path,
+        worker_script: &std::path::Path,
+        request: RecognitionRequestV1,
+    ) -> Result<ProviderExecution, ProviderExecutionError> {
+        assert!(python_executable.is_absolute());
+        assert!(worker_script.is_absolute());
+        let approved = OperatorApprovedProviderConfig::from_explicit_selection(
+            "senocr-v1-fp32-local".to_owned(),
+            python_executable.to_path_buf(),
+            vec![
+                "-u".to_owned(),
+                worker_script.to_string_lossy().into_owned(),
+            ],
+            request.provider_configuration.clone(),
+        )
+        .unwrap_or_else(|_| panic!("construct the explicit local Python worker configuration"));
+        let worker = ProviderWorkerHandle::start(
+            approved,
+            ProviderCallTimeouts {
+                handshake: Duration::from_secs(5),
+                recognition: Duration::from_secs(120),
+                shutdown: Duration::from_secs(2),
+            },
+        )
+        .unwrap_or_else(|_| panic!("start the isolated one-shot worker"));
+        worker
+            .try_submit(request)
+            .unwrap_or_else(|_| panic!("submit the frozen synthetic Raster request"));
+        let deadline = Instant::now() + Duration::from_secs(135);
+        loop {
+            match worker.try_receive() {
+                ProviderWorkerPoll::Outcome(outcome) => return outcome.outcome,
+                ProviderWorkerPoll::Stopped => {
+                    panic!("SenOCR worker stopped before returning a protocol outcome")
+                }
+                ProviderWorkerPoll::Pending => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "SenOCR worker exceeded its test observation deadline"
+            );
+            thread::sleep(Duration::from_millis(25));
         }
     }
 
@@ -5727,5 +5940,384 @@ mod tests {
             after_cleanup.result.candidates[0].recognized_text,
             "fixture text"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "model-backed M4 integration; guarded hosted Windows x64 job only"]
+    fn senocr_full_precision_raster_worker_integrates_with_m4_parent() {
+        require_senocr_m4_worker_test_opt_in();
+        let runner_temp = PathBuf::from(
+            std::env::var_os("RUNNER_TEMP").expect("guarded hosted runner temp directory"),
+        );
+        let shared_dir = PathBuf::from(
+            std::env::var_os("LASSOINK_SENOCR_E2E_SHARED_DIR")
+                .expect("guarded test-only sidecar directory"),
+        );
+        assert!(runner_temp.is_absolute() && shared_dir.is_absolute());
+        assert_eq!(
+            shared_dir.file_name().and_then(|name| name.to_str()),
+            Some("lasso-senocr-worker-e2e")
+        );
+        assert!(
+            shared_dir
+                .parent()
+                .and_then(|parent| parent.canonicalize().ok())
+                .is_some_and(|parent| runner_temp.canonicalize().is_ok_and(|root| parent == root)),
+            "test sidecar directory must remain directly under RUNNER_TEMP"
+        );
+        fs::create_dir(&shared_dir).expect("create unique bounded test-only sidecar directory");
+
+        let target = stroke_ref("senocr-e2e-stroke", "synthetic-device");
+        let journal_path = shared_dir.join("synthetic-source.journal");
+        let mut writer = JournalWriter::create(
+            journal_path.clone(),
+            JournalHeader {
+                journal_id: target.journal_id.clone(),
+                session_id: target.session_id.clone(),
+                config_id: Some("synthetic-senocr-e2e-config".to_owned()),
+                device_model_declared: Some("synthetic fixture device".to_owned()),
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        writer
+            .start_stroke(target.clone(), StrokeViewFrame::default(), 10)
+            .unwrap();
+        let mut first = physical_sample(&target, 701, 128);
+        first.position.as_mut().unwrap().y_raw = 160;
+        first.app_arrival_elapsed_ns = 11;
+        let first_sequence = writer.append_sample(first).unwrap();
+        let mut second = physical_sample(&target, 702, 320);
+        second.position.as_mut().unwrap().y_raw = 340;
+        second.app_arrival_elapsed_ns = 12;
+        let second_sequence = writer.append_sample(second).unwrap();
+        writer.commit_stroke(target.clone(), 13).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let journal = crate::journal::read_journal(&journal_path).unwrap();
+        assert!(!journal.recovery.truncated_final_record);
+        assert_eq!(journal.state.physical_samples.len(), 2);
+        let source_revision = ProviderSourceRevisionV1::from_journal(&journal.state);
+        let selected = vec![target.clone()];
+        let generated_spec = crate::canvas::CanonicalRasterProjectionSpecV1::new(
+            128,
+            128,
+            crate::canvas::CanonicalRasterProjectionCropV1 {
+                left_px: 0,
+                top_px: 0,
+                right_px_exclusive: 512,
+                bottom_px_exclusive: 512,
+            },
+        );
+        let plan = crate::canvas::build_canonical_raster_projection_plan(&journal.state, &selected)
+            .unwrap();
+        let geometry =
+            crate::canvas::transform_canonical_raster_geometry(&plan, &generated_spec).unwrap();
+        let raster_image = crate::canvas::render_canonical_raster(&geometry).unwrap();
+        let (width, height, stride) = raster_image.output_dimensions_and_stride();
+        assert_eq!((width, height, stride), (128, 128, 512));
+        let rgba = raster_image.rgba8_premultiplied_srgb_top_down();
+        assert_eq!(rgba.len(), (stride * height) as usize);
+        let mut canonical_rgb = Vec::with_capacity(width as usize * height as usize * 3);
+        let (rgba_pixels, rgba_remainder) = rgba.as_chunks::<4>();
+        assert!(rgba_remainder.is_empty());
+        for pixel in rgba_pixels {
+            assert_eq!(pixel[3], 255);
+            canonical_rgb.extend_from_slice(&pixel[..3]);
+        }
+
+        let pixel_path = shared_dir.join("canonical-rgba.bin");
+        let mut pixel_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pixel_path)
+            .expect("create the bounded test-only canonical pixel baseline");
+        pixel_file.write_all(rgba).unwrap();
+        pixel_file.flush().unwrap();
+        drop(pixel_file);
+
+        let hex = |bytes: &[u8]| {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+            for byte in bytes {
+                output.push(char::from(HEX[usize::from(*byte >> 4)]));
+                output.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+            }
+            output
+        };
+        let png = raster_image.png_bytes();
+        assert!(!png.is_empty() && png.len() <= 1024 * 1024);
+        let png_hex = hex(png);
+        let raster = ProviderRasterInputV1 {
+            width,
+            height,
+            payload_contract: ProviderRasterPayloadContractV1::OpaqueBytes,
+            coordinate_space: "canonical-raster-output-v1".to_owned(),
+            units: "pixel".to_owned(),
+            raw_payload_hex: png_hex.clone(),
+        };
+
+        let python_executable = PathBuf::from(
+            std::env::var_os("LASSOINK_SENOCR_PYTHON")
+                .expect("setup-python provides its absolute executable path"),
+        );
+        let worker_script =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/senocr_fp32_worker.py");
+        let asset_root = PathBuf::from(
+            std::env::var_os("LASSOINK_SENOCR_ASSET_ROOT")
+                .expect("the prior guarded probe retained the verified local asset directory"),
+        );
+        assert!(python_executable.is_absolute() && worker_script.is_absolute());
+        assert!(asset_root.is_absolute() && asset_root.is_dir());
+        let make_request =
+            |request_id: &str,
+             asset_root: &std::path::Path,
+             requested_input_modalities: Vec<ProviderInputCapabilityV1>,
+             raster_input: Option<ProviderRasterInputV1>| {
+                let configuration = ProviderConfigurationV1 {
+                    configuration_id: "senocr-v1-fp32-local".to_owned(),
+                    values: BTreeMap::from([
+                        (
+                            "asset_root".to_owned(),
+                            asset_root.to_string_lossy().into_owned(),
+                        ),
+                        ("model_id".to_owned(), "VietAlphaLabs/SenOCR-Vi".to_owned()),
+                        (
+                            "model_revision".to_owned(),
+                            "1e70dff4ef0429b0d88a2b873fb5d03300af1a41".to_owned(),
+                        ),
+                    ]),
+                };
+                build_recognition_request(RecognitionRequestBuildInput {
+                    state: &journal.state,
+                    request_id: request_id.to_owned(),
+                    region_id: "synthetic-senocr-region".to_owned(),
+                    line_id: "synthetic-senocr-line".to_owned(),
+                    coordinate_space: "canonical-raster-output-v1".to_owned(),
+                    coordinate_units: "pixel".to_owned(),
+                    language_hints: vec!["vi-VN".to_owned()],
+                    requested_input_modalities,
+                    provider_configuration: configuration,
+                    selected_strokes: &selected,
+                    raster: raster_input,
+                })
+                .unwrap()
+            };
+        let request = make_request(
+            "senocr-m4-raster-e2e",
+            &asset_root,
+            vec![ProviderInputCapabilityV1::Raster],
+            Some(raster.clone()),
+        );
+        assert_eq!(request.source_revision, source_revision);
+        assert_eq!(
+            request.requested_input_modalities,
+            vec![ProviderInputCapabilityV1::Raster]
+        );
+        assert_eq!(
+            request
+                .samples
+                .iter()
+                .map(|sample| sample.journal_sequence)
+                .collect::<Vec<_>>(),
+            vec![first_sequence, second_sequence]
+        );
+        assert_eq!(request.samples.len(), 2);
+
+        let execution =
+            run_senocr_worker_request(&python_executable, &worker_script, request.clone())
+                .unwrap_or_else(|_error| {
+                    panic!("the guarded local Raster worker returned a failure")
+                });
+        let result = &execution.result;
+        assert_eq!(result.request_id, request.request_id);
+        assert_eq!(result.input_view_id, request.input_view_id);
+        assert_eq!(result.source_revision, request.source_revision);
+        assert_eq!(result.region_id, request.region_id);
+        assert_eq!(result.line_id, request.line_id);
+        assert_eq!(
+            result.provider_configuration_id,
+            request.provider_configuration.configuration_id
+        );
+        assert_eq!(
+            result.provider_configuration_fingerprint,
+            request.provider_configuration_fingerprint
+        );
+        assert_eq!(
+            result.consumed_input_modalities,
+            vec![ProviderInputCapabilityV1::Raster]
+        );
+        assert_eq!(result.provider.provider_id, "senocr-v1-fp32-local");
+        assert_eq!(
+            result.provider.model_version.as_deref(),
+            Some("1e70dff4ef0429b0d88a2b873fb5d03300af1a41")
+        );
+        assert_eq!(result.candidates.len(), 1);
+        assert!(result.candidates[0].recognized_text.len() <= MAX_TEXT_BYTES);
+        assert!(result.candidates[0].native_score_raw.is_none());
+        assert!(result.candidates[0].stroke_ranges.is_empty());
+        assert!(execution.raw_response_transcript.capture_complete);
+        assert_eq!(execution.raw_response_transcript.frames.len(), 2);
+        assert!(execution.timing.process_create_call_to_recognition_ns > 0);
+        assert!(execution.timing.model_cold_start_ns.is_none());
+
+        let sidecar_path = shared_dir.join("processor-parity.json");
+        let sidecar_bytes = fs::read(&sidecar_path).unwrap();
+        assert!(sidecar_bytes.len() <= 16 * 1024);
+        let sidecar_text = std::str::from_utf8(&sidecar_bytes).unwrap();
+        assert!(!sidecar_text.contains(&asset_root.to_string_lossy().into_owned()));
+        assert!(!sidecar_text.contains(&worker_script.to_string_lossy().into_owned()));
+        assert!(!sidecar_text.contains(&png_hex));
+        assert!(!sidecar_text.contains("recognized_text"));
+        let sidecar: serde_json::Value = serde_json::from_slice(&sidecar_bytes).unwrap();
+        assert_eq!(sidecar["schema"], "senocr-processor-parity-v1");
+        assert_eq!(sidecar["width"].as_u64(), Some(u64::from(width)));
+        assert_eq!(sidecar["height"].as_u64(), Some(u64::from(height)));
+        assert_eq!(sidecar["canonical_rgba_sha256"], hex(&Sha256::digest(rgba)));
+        let canonical_rgb_sha256 = hex(&Sha256::digest(&canonical_rgb));
+        assert_eq!(sidecar["canonical_rgb_sha256"], canonical_rgb_sha256);
+        assert_eq!(sidecar["decoded_png_rgb_sha256"], canonical_rgb_sha256);
+        assert_eq!(
+            sidecar["decoded_processor_inputs"],
+            sidecar["direct_processor_inputs"]
+        );
+        assert!(sidecar["decoded_processor_inputs"]["input_ids"].is_object());
+        assert!(
+            sidecar["decoded_processor_inputs"]
+                .as_object()
+                .is_some_and(|inputs| inputs.len() >= 2)
+        );
+        fs::remove_file(&sidecar_path).unwrap();
+
+        let expect_worker_failure = |request: RecognitionRequestV1, expected_code: &str| {
+            let error = match run_senocr_worker_request(&python_executable, &worker_script, request)
+            {
+                Ok(_execution) => panic!("invalid Raster request unexpectedly succeeded"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                &error.kind,
+                ProviderErrorKind::ProviderFailure { code, .. } if code == expected_code
+            ));
+            assert!(error.raw_response_transcript.capture_complete);
+            assert_eq!(error.raw_response_transcript.frames.len(), 2);
+            let failure_payload = &error.raw_response_transcript.frames[1].payload_bytes;
+            let failure: serde_json::Value = serde_json::from_slice(failure_payload).unwrap();
+            assert_eq!(failure["kind"], "failure");
+            assert_eq!(failure["code"], expected_code);
+        };
+        let raster_for_png = |payload: &[u8]| ProviderRasterInputV1 {
+            raw_payload_hex: hex(payload),
+            ..raster.clone()
+        };
+
+        let truncated_png = &png[..png.len().saturating_sub(16)];
+        assert!(truncated_png.len() > 33);
+        expect_worker_failure(
+            make_request(
+                "senocr-m4-truncated-png",
+                &asset_root,
+                vec![ProviderInputCapabilityV1::Raster],
+                Some(raster_for_png(truncated_png)),
+            ),
+            "raster_decode_failed",
+        );
+
+        let apng_fixture = PathBuf::from(
+            std::env::var_os("LASSOINK_SENOCR_APNG_FIXTURE")
+                .expect("the guarded Pillow test produced a bounded APNG fixture"),
+        );
+        assert!(apng_fixture.is_absolute() && !apng_fixture.is_symlink());
+        assert_eq!(
+            apng_fixture.file_name().and_then(|name| name.to_str()),
+            Some("senocr-apng-negative.png")
+        );
+        assert!(
+            apng_fixture
+                .parent()
+                .and_then(|parent| parent.canonicalize().ok())
+                .is_some_and(|parent| runner_temp.canonicalize().is_ok_and(|root| parent == root)),
+            "APNG fixture must remain directly under RUNNER_TEMP"
+        );
+        let apng_bytes = fs::read(&apng_fixture).unwrap();
+        assert!(!apng_bytes.is_empty() && apng_bytes.len() <= 64 * 1024);
+        expect_worker_failure(
+            make_request(
+                "senocr-m4-apng",
+                &asset_root,
+                vec![ProviderInputCapabilityV1::Raster],
+                Some(raster_for_png(&apng_bytes)),
+            ),
+            "raster_decode_failed",
+        );
+
+        let mut transparent_pixmap = tiny_skia::Pixmap::new(128, 128).unwrap();
+        transparent_pixmap.fill(tiny_skia::Color::from_rgba8(10, 20, 30, 254));
+        let transparent_png = transparent_pixmap.encode_png().unwrap();
+        assert!(!transparent_png.is_empty() && transparent_png.len() <= 64 * 1024);
+        expect_worker_failure(
+            make_request(
+                "senocr-m4-transparent-alpha",
+                &asset_root,
+                vec![ProviderInputCapabilityV1::Raster],
+                Some(raster_for_png(&transparent_png)),
+            ),
+            "raster_decode_failed",
+        );
+
+        let unsupported_mode = make_request(
+            "senocr-m4-unsupported-online-mode",
+            &asset_root,
+            vec![ProviderInputCapabilityV1::OnlineStrokes],
+            None,
+        );
+        let unsupported_mode_error =
+            match run_senocr_worker_request(&python_executable, &worker_script, unsupported_mode) {
+                Ok(_execution) => panic!("unsupported mode unexpectedly received a result"),
+                Err(error) => error,
+            };
+        assert!(matches!(
+            unsupported_mode_error.kind,
+            ProviderErrorKind::UnsupportedCapability(_)
+        ));
+        assert_eq!(
+            unsupported_mode_error.raw_response_transcript.frames.len(),
+            1
+        );
+        assert!(
+            !unsupported_mode_error
+                .raw_response_transcript
+                .capture_complete
+        );
+
+        let missing_asset_root = shared_dir.join("missing-asset-root");
+        assert!(!missing_asset_root.exists());
+        let missing_request = make_request(
+            "senocr-m4-missing-assets",
+            &missing_asset_root,
+            vec![ProviderInputCapabilityV1::Raster],
+            Some(raster.clone()),
+        );
+        let missing =
+            match run_senocr_worker_request(&python_executable, &worker_script, missing_request) {
+                Ok(_execution) => {
+                    panic!("missing local model files must fail without an alternate provider")
+                }
+                Err(error) => error,
+            };
+        assert!(matches!(
+            missing.kind,
+            ProviderErrorKind::ProviderFailure { code, .. } if code == "asset_directory_invalid"
+        ));
+        assert!(missing.raw_response_transcript.capture_complete);
+        let failure_payload = &missing.raw_response_transcript.frames[1].payload_bytes;
+        let failure: serde_json::Value = serde_json::from_slice(failure_payload).unwrap();
+        assert_eq!(failure["kind"], "failure");
+        assert_eq!(failure["code"], "asset_directory_invalid");
+        assert!(failure["message"].as_str().is_some());
+
+        fs::remove_dir_all(&shared_dir).unwrap();
     }
 }

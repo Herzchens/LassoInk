@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "configuration": {
+    "configuration_id": "local-vi-reference",
+    "values": {
+      "z-model-directory": "C:\\Users\\Example\\Tài liệu\\SenOCR-Vi",
+      "a-operator-label": "Việt-日本"
+    }
+  },
+  "canonical_json_utf8": "{\"configuration_id\":\"local-vi-reference\",\"values\":{\"a-operator-label\":\"Việt-日本\",\"z-model-directory\":\"C:\\\\Users\\\\Example\\\\Tài liệu\\\\SenOCR-Vi\"}}"
+}
