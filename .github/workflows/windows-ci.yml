@@ -1,0 +1,571 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+
+  bootstrap-integrity:
+    name: Verify trusted bootstrap integrity (no app build)
+    if: github.event_name == 'pull_request'
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Verify trusted root object and local-only policy without checkout
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+          TRUSTED_ROOT_SHA: c23cb9f6451e3d59752f4181ee7b44d3496eb352
+          TRUSTED_ROOT_TREE: 0a9a78a8e182c35ca8d5533df8a0f014500b4942
+          TRUSTED_OWNER_EMAIL: 166841132+Herzchens@users.noreply.github.com
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:REPOSITORY -cne 'Herzchens/LassoInk' -or $env:EVENT_NAME -cne 'pull_request' -or $env:BASE_REF -cne 'main' -or $env:HEAD_REPOSITORY -cne $env:REPOSITORY) { throw 'Trusted bootstrap repository/event guard failed.' }
+          if ($env:CI -cne 'true' -or $env:GITHUB_ACTIONS -cne 'true' -or $env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64') { throw 'Trusted bootstrap hosted runner guard failed.' }
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $root = Invoke-RestMethod -Method Get -Uri "https://api.github.com/repos/$env:REPOSITORY/commits/$env:TRUSTED_ROOT_SHA" -Headers $headers -ErrorAction Stop
+          if ($root.sha -cne $env:TRUSTED_ROOT_SHA -or $root.commit.tree.sha -cne $env:TRUSTED_ROOT_TREE) { throw 'Trusted bootstrap object/tree mismatch.' }
+          if (@($root.parents).Count -ne 0) { throw 'Trusted bootstrap root must remain parentless.' }
+          if (($root.commit.message -split "`n", 2)[0].TrimEnd([char]13) -cne 'chore: bootstrap repository policy') { throw 'Trusted bootstrap subject mismatch.' }
+          if ($root.commit.verification.verified -ne $true -or $root.commit.verification.reason -cne 'valid') { throw 'Trusted bootstrap signature is not verified.' }
+          if ($root.commit.author.email -cne $env:TRUSTED_OWNER_EMAIL -or $root.commit.committer.email -cne $env:TRUSTED_OWNER_EMAIL) { throw 'Trusted bootstrap owner identity mismatch.' }
+          $tree = Invoke-RestMethod -Method Get -Uri "https://api.github.com/repos/$env:REPOSITORY/git/trees/$($root.commit.tree.sha)?recursive=1" -Headers $headers -ErrorAction Stop
+          if ($tree.truncated) { throw 'Trusted bootstrap tree was truncated.' }
+          $trackedNames = @($tree.tree | ForEach-Object { $_.path })
+          if ($trackedNames | Where-Object { $_ -match '(^|/)local_document(/|$)|(^|/)local_[^/]+($|/)' }) { throw 'Trusted bootstrap contains a local-only path.' }
+          $ignoreEntry = $tree.tree | Where-Object { $_.path -ceq '.gitignore' -and $_.type -ceq 'blob' } | Select-Object -First 1
+          if (-not $ignoreEntry) { throw 'Trusted bootstrap .gitignore is missing.' }
+          $ignoreBlob = Invoke-RestMethod -Method Get -Uri "https://api.github.com/repos/$env:REPOSITORY/git/blobs/$($ignoreEntry.sha)" -Headers $headers -ErrorAction Stop
+          $ignoreText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($ignoreBlob.content))
+          if ($ignoreText -notmatch '(?m)^/local_document/$' -or $ignoreText -notmatch '(?m)^/local_\*/$') { throw 'Trusted bootstrap does not ignore local planning paths.' }
+
+  introduced-history:
+    name: Require exact green checks for prior introduced commits
+    if: always() && github.event_name == 'pull_request'
+    needs: bootstrap-integrity
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Verify signed ancestry and existing exact-SHA CI proof without checkout
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BOOTSTRAP_RESULT: ${{ needs.bootstrap-integrity.result }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+          TRUSTED_ROOT_SHA: c23cb9f6451e3d59752f4181ee7b44d3496eb352
+          OWNER_EMAIL: 166841132+Herzchens@users.noreply.github.com
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:BOOTSTRAP_RESULT -cne 'success') { throw 'Trusted bootstrap integrity check did not succeed.' }
+          if ($env:REPOSITORY -cne 'Herzchens/LassoInk' -or $env:EVENT_NAME -cne 'pull_request' -or $env:BASE_REF -cne 'main') { throw 'History gate repository/event/base guard failed.' }
+          if ($env:HEAD_REPOSITORY -cne $env:REPOSITORY -or $env:HEAD_REF -notmatch '^(feat|fix|docs|style|refactor|test|chore|ci|perf|repair)/[A-Za-z0-9][A-Za-z0-9._-]*$') { throw 'History gate requires an owned same-repository source branch.' }
+          if ($env:CI -cne 'true' -or $env:GITHUB_ACTIONS -cne 'true' -or $env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64') { throw 'History gate hosted runner guard failed.' }
+          if ($env:BASE_SHA -notmatch '^[0-9a-f]{40}$' -or $env:HEAD_SHA -notmatch '^[0-9a-f]{40}$' -or $env:TRUSTED_ROOT_SHA -notmatch '^[0-9a-f]{40}$') { throw 'History gate received an invalid SHA.' }
+          if ($env:PR_NUMBER -notmatch '^[0-9]+$') { throw 'History gate received an invalid pull request number.' }
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          function Get-GitHubApi([string]$Path) {
+            Invoke-RestMethod -Method Get -Uri "https://api.github.com/repos/$env:REPOSITORY/$Path" -Headers $headers -ErrorAction Stop
+          }
+          function Get-RunEvidence([object]$RunList, [string]$ExpectedSha, [string]$ExpectedRepository) {
+            if ($null -eq $RunList) { return [pscustomobject]@{ Error = 'workflow run list is missing'; ExactRuns = @(); RelevantRuns = @() } }
+            $runs = @($RunList.workflow_runs)
+            if ($runs.Count -eq 0) { return [pscustomobject]@{ Error = 'workflow run list is empty'; ExactRuns = @(); RelevantRuns = @() } }
+            $exactRuns = @($runs | Where-Object { $_.head_sha -ceq $ExpectedSha -and $_.head_repository.full_name -ceq $ExpectedRepository })
+            if ($exactRuns.Count -eq 0) { return [pscustomobject]@{ Error = 'no exact-SHA run exists'; ExactRuns = @(); RelevantRuns = @() } }
+            $relevantRuns = @($exactRuns | Where-Object { $_.event -ceq 'pull_request' -or $_.event -ceq 'push' })
+            if ($relevantRuns.Count -eq 0) { return [pscustomobject]@{ Error = 'no relevant push or pull-request run exists'; ExactRuns = $exactRuns; RelevantRuns = @() } }
+            if ($relevantRuns.Count -ne $exactRuns.Count) { return [pscustomobject]@{ Error = 'unexpected exact-SHA workflow event exists'; ExactRuns = $exactRuns; RelevantRuns = $relevantRuns } }
+            foreach ($run in $relevantRuns) {
+              $attempt = [string]$run.run_attempt
+              if ($attempt -notmatch '^[1-9][0-9]*$') { return [pscustomobject]@{ Error = 'exact-SHA workflow run has an invalid latest attempt'; ExactRuns = $exactRuns; RelevantRuns = $relevantRuns } }
+              if ($run.status -cne 'completed' -or $run.conclusion -cne 'success') { return [pscustomobject]@{ Error = 'an exact-SHA workflow run is incomplete or unsuccessful'; ExactRuns = $exactRuns; RelevantRuns = $relevantRuns } }
+            }
+            return [pscustomobject]@{ Error = $null; ExactRuns = $exactRuns; RelevantRuns = $relevantRuns }
+          }
+          $syntheticSha = 'a' * 40
+          $syntheticRepository = 'Herzchens/LassoInk'
+          $emptyEvidence = Get-RunEvidence ([pscustomobject]@{ workflow_runs = @() }) $syntheticSha $syntheticRepository
+          if ($null -eq $emptyEvidence.Error) { throw 'Run evidence self-check accepted an empty run list.' }
+          $wrongShaRun = [pscustomobject]@{ head_sha = ('b' * 40); head_repository = [pscustomobject]@{ full_name = $syntheticRepository }; event = 'push'; run_attempt = 1; status = 'completed'; conclusion = 'success' }
+          $wrongShaEvidence = Get-RunEvidence ([pscustomobject]@{ workflow_runs = @($wrongShaRun) }) $syntheticSha $syntheticRepository
+          if ($null -eq $wrongShaEvidence.Error) { throw 'Run evidence self-check accepted a mismatched head SHA.' }
+          $irrelevantEventRun = [pscustomobject]@{ head_sha = $syntheticSha; head_repository = [pscustomobject]@{ full_name = $syntheticRepository }; event = 'workflow_dispatch'; run_attempt = 1; status = 'completed'; conclusion = 'success' }
+          $irrelevantEventEvidence = Get-RunEvidence ([pscustomobject]@{ workflow_runs = @($irrelevantEventRun) }) $syntheticSha $syntheticRepository
+          if ($null -eq $irrelevantEventEvidence.Error -or $irrelevantEventEvidence.RelevantRuns.Count -ne 0) { throw 'Run evidence self-check accepted an exact SHA with no relevant event.' }
+          $failedLatestRun = [pscustomobject]@{ head_sha = $syntheticSha; head_repository = [pscustomobject]@{ full_name = $syntheticRepository }; event = 'push'; run_attempt = 2; status = 'completed'; conclusion = 'failure' }
+          $failedLatestEvidence = Get-RunEvidence ([pscustomobject]@{ workflow_runs = @($failedLatestRun) }) $syntheticSha $syntheticRepository
+          if ($null -eq $failedLatestEvidence.Error) { throw 'Run evidence self-check accepted an unsuccessful latest attempt.' }
+          $successfulRerun = [pscustomobject]@{ head_sha = $syntheticSha; head_repository = [pscustomobject]@{ full_name = $syntheticRepository }; event = 'push'; run_attempt = 2; status = 'completed'; conclusion = 'success' }
+          $successfulRerunEvidence = Get-RunEvidence ([pscustomobject]@{ workflow_runs = @($successfulRerun) }) $syntheticSha $syntheticRepository
+          if ($null -ne $successfulRerunEvidence.Error) { throw 'Run evidence self-check rejected a successful latest attempt.' }
+
+          $pullRequest = Get-GitHubApi "pulls/$env:PR_NUMBER"
+          if ($pullRequest.state -cne 'open' -or $pullRequest.base.ref -cne 'main' -or $pullRequest.base.sha -cne $env:BASE_SHA -or $pullRequest.head.sha -cne $env:HEAD_SHA -or $pullRequest.head.repo.full_name -cne $env:HEAD_REPOSITORY -or $pullRequest.head.ref -cne $env:HEAD_REF) { throw 'Pull request event is stale or does not match the exact API head/base.' }
+
+          $baseAncestry = Get-GitHubApi "compare/$($env:TRUSTED_ROOT_SHA)...$($env:BASE_SHA)?per_page=1"
+          if ($baseAncestry.merge_base_commit.sha -cne $env:TRUSTED_ROOT_SHA -or $baseAncestry.status -notin @('ahead', 'identical')) { throw 'PR base is not descended from the trusted bootstrap root.' }
+
+          $headComparison = Get-GitHubApi "compare/$($env:BASE_SHA)...$($env:HEAD_SHA)?per_page=1"
+          $mergeBase = [string]$headComparison.merge_base_commit.sha
+          if ($mergeBase -notmatch '^[0-9a-f]{40}$') { throw 'PR merge base SHA is invalid.' }
+          $mergeBaseAncestry = Get-GitHubApi "compare/$($env:TRUSTED_ROOT_SHA)...$mergeBase?per_page=1"
+          if ($mergeBaseAncestry.merge_base_commit.sha -cne $env:TRUSTED_ROOT_SHA -or $mergeBaseAncestry.status -notin @('ahead', 'identical')) { throw 'PR merge base is not descended from the trusted bootstrap root.' }
+
+          $reverseIntroduced = [System.Collections.Generic.List[string]]::new()
+          $cursor = $env:HEAD_SHA
+          while ($cursor -cne $mergeBase) {
+            if ($reverseIntroduced.Count -ge 100) { throw 'PR introduced chain exceeds the bounded 100-commit history gate.' }
+            $commit = Get-GitHubApi "commits/$cursor"
+            if ($commit.sha -cne $cursor) { throw 'GitHub returned a mismatched commit object.' }
+            if (@($commit.parents).Count -ne 1) { throw 'Every introduced commit must have exactly one parent.' }
+            $parent = [string]$commit.parents[0].sha
+            if ($parent -notmatch '^[0-9a-f]{40}$') { throw 'Introduced chain contains an invalid parent SHA.' }
+            if ($commit.commit.verification.verified -ne $true -or $commit.commit.verification.reason -cne 'valid') { throw 'Every introduced commit must have a valid GitHub signature.' }
+            if ($commit.commit.author.email -cne $env:OWNER_EMAIL -or $commit.commit.committer.email -cne $env:OWNER_EMAIL) { throw 'Every introduced commit must use the approved owner identity.' }
+            $subject = ($commit.commit.message -split "`n", 2)[0].TrimEnd([char]13)
+            if ($subject -notmatch '^(feat|fix|docs|style|refactor|test|chore|ci|perf|repair)(\([A-Za-z0-9._-]+\))?: \S.+$') { throw 'Every introduced commit must have an English Conventional subject.' }
+            $reverseIntroduced.Add($cursor)
+            $cursor = $parent
+          }
+          if ($reverseIntroduced.Count -eq 0) { throw 'PR head must introduce at least one commit after the merge base.' }
+          $introducedShas = [string[]]$reverseIntroduced.ToArray()
+          [Array]::Reverse($introducedShas)
+          if ($introducedShas[-1] -cne $env:HEAD_SHA) { throw 'Introduced chain does not end at the exact PR head.' }
+          $introducedCount = $introducedShas.Count
+          if ($introducedCount -lt 1 -or [int]$headComparison.ahead_by -ne $introducedCount) { throw 'GitHub comparison does not match the verified introduced commit chain.' }
+
+          $pullRequestJobs = @(
+            'Verify trusted bootstrap integrity (no app build)',
+            'Require exact green checks for prior introduced commits',
+            'Verify M5/M6 benchmark harness and default tests on Windows x64',
+            'Guarded Windows and provider subprocess tests',
+            'Test stdlib Raster worker protocol helpers'
+          )
+          $pushJobs = @(
+            'Verify M5/M6 benchmark harness and default tests on Windows x64',
+            'Guarded Windows and provider subprocess tests',
+            'Test stdlib Raster worker protocol helpers'
+          )
+          for ($index = 0; $index -lt ($introducedShas.Count - 1); $index++) {
+            $ancestorSha = $introducedShas[$index]
+            $runList = Get-GitHubApi "actions/workflows/windows-ci.yml/runs?head_sha=$ancestorSha&per_page=100"
+            if ([int]$runList.total_count -gt 100) { throw 'Too many exact-SHA workflow runs to validate unambiguously.' }
+            $runEvidence = Get-RunEvidence $runList $ancestorSha $env:REPOSITORY
+            if ($null -ne $runEvidence.Error) { throw "$($runEvidence.Error) for introduced ancestor $ancestorSha." }
+            $exactRuns = @($runEvidence.ExactRuns)
+            $relevantRuns = @($runEvidence.RelevantRuns)
+            if ($exactRuns.Count -eq 0) { throw "No exact-SHA workflow run exists for introduced ancestor $ancestorSha." }
+            if ($relevantRuns.Count -eq 0) { throw "No relevant push or pull-request workflow run exists for introduced ancestor $ancestorSha." }
+            foreach ($run in $relevantRuns) {
+              if ($run.event -ceq 'pull_request') {
+                $requiredJobs = $pullRequestJobs
+                $proofEvent = 'pull_request'
+              } elseif ($run.event -ceq 'push') {
+                $requiredJobs = $pushJobs
+                $proofEvent = 'push'
+              } else {
+                throw "Unexpected exact-SHA workflow event exists for introduced ancestor $ancestorSha."
+              }
+              $attempt = [string]$run.run_attempt
+              $jobList = Get-GitHubApi "actions/runs/$($run.id)/attempts/$attempt/jobs?per_page=100"
+              if ([int]$jobList.total_count -gt 100) { throw "Too many jobs in the exact-SHA workflow attempt for introduced ancestor $ancestorSha." }
+              foreach ($jobName in $requiredJobs) {
+                $matchingJobs = @($jobList.jobs | Where-Object { $_.name -ceq $jobName })
+                if ($matchingJobs.Count -ne 1 -or $matchingJobs[0].status -cne 'completed' -or $matchingJobs[0].conclusion -cne 'success') { throw "Required exact-SHA $proofEvent job '$jobName' is missing or not green for introduced ancestor $ancestorSha." }
+              }
+            }
+          }
+          Write-Host "Verified $introducedCount introduced commit(s); prior ancestors have exact green Windows CI and the current PR head is covered by this run's normal jobs."
+
+  verify:
+    name: Verify M5/M6 benchmark harness and default tests on Windows x64
+    runs-on: windows-2025
+    steps:
+      - name: Check out exact PR head or pushed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out head SHA
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:EXPECTED_HEAD_SHA) {
+            throw "Expected $env:EXPECTED_HEAD_SHA; got $actual"
+          }
+
+      - name: Verify local-only planning boundary
+        shell: pwsh
+        run: |
+          $trackedPaths = @(git ls-files)
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect tracked repository paths.' }
+          $privatePaths = @($trackedPaths | Where-Object { $_ -match '(^|/)local_document(/|$)|(^|/)local_[^/]+($|/)' })
+          if ($privatePaths.Count -gt 0) { throw 'Local-only planning paths must not be tracked.' }
+          foreach ($path in @('local_document/Plan.md', 'local_document/DependencyEvidence.md')) {
+            git check-ignore --no-index --quiet -- $path
+            if ($LASTEXITCODE -ne 0) { throw 'Canonical planning and dependency evidence paths must remain ignored.' }
+          }
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.100.0 --profile minimal --component clippy --component rustfmt --target x86_64-pc-windows-msvc
+
+      - name: Check formatting
+        shell: pwsh
+        run: cargo +1.100.0 fmt --all -- --check
+
+      - name: Run Clippy
+        shell: pwsh
+        run: cargo +1.100.0 clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        shell: pwsh
+        run: cargo +1.100.0 test --locked --workspace
+
+      - name: Build
+        shell: pwsh
+        run: cargo +1.100.0 build --locked --workspace
+
+  native-ui:
+    name: Guarded Windows and provider subprocess tests
+    needs: verify
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      LASSOINK_RUN_NATIVE_UI_TESTS: "1"
+      LASSOINK_RUN_PROVIDER_MOCK_TESTS: "1"
+    steps:
+      - name: Check out exact PR head or pushed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out head SHA
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:EXPECTED_HEAD_SHA) {
+            throw "Expected $env:EXPECTED_HEAD_SHA; got $actual"
+          }
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.100.0 --profile minimal --component clippy --component rustfmt --target x86_64-pc-windows-msvc
+
+      - name: Run guarded native UI tests serially
+        shell: pwsh
+        run: |
+          $env:RUSTUP_TOOLCHAIN = "1.100.0"
+          $env:RUSTC = "rustc"
+          cargo +1.100.0 test --locked --workspace -- --include-ignored --test-threads=1 --skip senocr_full_precision_raster_worker_integrates_with_m4_parent
+
+  raster-reference-protocol:
+    name: Test stdlib Raster worker protocol helpers
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact PR head or pushed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out head SHA
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:EXPECTED_HEAD_SHA) {
+            throw "Expected $env:EXPECTED_HEAD_SHA; got $actual"
+          }
+
+      - name: Set up pinned Python x64
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13.17'
+          architecture: x64
+          check-latest: false
+
+      - name: Run stdlib protocol tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -p test_raster_reference_protocol.py
+
+  raster-cpu-compatibility:
+    name: Guarded SenOCR CPU compatibility and M4 Raster worker E2E
+    if: >-
+      github.repository == 'Herzchens/LassoInk' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.pull_request.head.ref == 'feat/benchmark-fidelity' ||
+       github.event.pull_request.head.ref == 'repair/ci-green-history')
+    needs: verify
+    runs-on: windows-2025
+    timeout-minutes: 60
+    concurrency:
+      group: senocr-cpu-compatibility
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      LASSOINK_RUN_SENOCR_CPU_COMPAT: '1'
+      LASSOINK_RUN_SENOCR_M4_E2E: '1'
+      LASSOINK_RUN_RUNTIME_INVENTORY: '1'
+    steps:
+      - name: Guard hosted runner and explicit opt-in before checkout or network access
+        shell: pwsh
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_EVENT: ${{ github.event_name }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || '' }}
+          EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
+          LASSOINK_RUN_SENOCR_CPU_COMPAT: '1'
+          LASSOINK_RUN_SENOCR_M4_E2E: '1'
+          LASSOINK_RUN_RUNTIME_INVENTORY: '1'
+        run: |
+          if ($env:EXPECTED_REPOSITORY -cne 'Herzchens/LassoInk') { throw 'Repository guard failed.' }
+          if ($env:EXPECTED_EVENT -cne 'pull_request') { throw 'Pull request event is required.' }
+          if ($env:CI -cne 'true' -or $env:GITHUB_ACTIONS -cne 'true') { throw 'Actions guard failed.' }
+          if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64') { throw 'Hosted Windows x64 guard failed.' }
+          if ($env:LASSOINK_RUN_SENOCR_CPU_COMPAT -cne '1') { throw 'Explicit opt-in is required.' }
+          if ($env:LASSOINK_RUN_SENOCR_M4_E2E -cne '1') { throw 'Explicit M4 worker E2E opt-in is required.' }
+          if ($env:EXPECTED_HEAD_SHA -notmatch '^[0-9a-f]{40}$') { throw 'Exact head SHA is invalid.' }
+          if ($env:EXPECTED_HEAD_REPOSITORY -cne 'Herzchens/LassoInk' -or ($env:EXPECTED_HEAD_REF -cne 'feat/benchmark-fidelity' -and $env:EXPECTED_HEAD_REF -cne 'repair/ci-green-history')) { throw 'Pull request source guard failed.' }
+          if ($env:LASSOINK_RUN_RUNTIME_INVENTORY -cne '1') { throw 'Explicit runtime profile opt-in is required.' }
+
+      - name: Check out exact PR head or pushed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out head SHA
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:EXPECTED_HEAD_SHA) {
+            throw "Expected $env:EXPECTED_HEAD_SHA; got $actual"
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "LASSOINK_CHECKED_OUT_HEAD_SHA=$actual"
+
+      - name: Verify the stable runtime profile payload before setup or network
+        shell: pwsh
+        env:
+          EXPECTED_PROFILE_SHA256: '3d6150df16fc91bf032638d88a02d30be6877f5b4e62da5682fa601d0fe1ac1c'
+        run: |
+          $profileBytes = [IO.File]::ReadAllBytes('tests/fixtures/senocr_runtime_profile_v1.json')
+          if ($profileBytes.Length -gt 65536) { throw 'Runtime profile exceeds its size cap.' }
+          $payloadLength = $profileBytes.Length
+          if ($payloadLength -gt 0 -and $profileBytes[$payloadLength - 1] -eq 10) {
+            $payloadLength--
+            if ($payloadLength -gt 0 -and $profileBytes[$payloadLength - 1] -eq 13) { $payloadLength-- }
+          }
+          $sha = [Security.Cryptography.SHA256]::Create()
+          try {
+            $actualProfileSha = ([BitConverter]::ToString($sha.ComputeHash($profileBytes, 0, $payloadLength))).Replace('-', '').ToLowerInvariant()
+          } finally {
+            $sha.Dispose()
+          }
+          if ($actualProfileSha -cne $env:EXPECTED_PROFILE_SHA256) { throw 'Runtime profile payload digest mismatch.' }
+
+      - name: Set up pinned Python x64
+        id: setup-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13.17'
+          architecture: x64
+          check-latest: false
+
+      - name: Install the checked-in runtime closure into an isolated venv
+        shell: pwsh
+        env:
+          BASE_PYTHON: ${{ steps.setup-python.outputs.python-path }}
+          PIP_DISABLE_PIP_VERSION_CHECK: '1'
+          PIP_NO_CACHE_DIR: '1'
+        run: |
+          $profile = Get-Content -LiteralPath tests/fixtures/senocr_runtime_profile_v1.json -Raw | ConvertFrom-Json
+          if ($profile.schema_version -ne 1 -or $profile.distribution_count -ne 41 -or @($profile.installed_distribution_closure).Count -ne 41) { throw 'Checked-in runtime profile shape/count is invalid.' }
+          if ($profile.python_version -cne '3.13.17' -or $profile.platform -cne 'windows-x64') { throw 'Checked-in runtime profile target is invalid.' }
+          $expectedPins = @{ jinja2='3.1.6'; pillow='13.0.0'; torch='2.15.0+cpu'; transformers='5.23.0' }
+          if (@($profile.root_pins).Count -ne $expectedPins.Count) { throw 'Checked-in root pin count is invalid.' }
+          foreach ($pin in $profile.root_pins) {
+            if (-not $expectedPins.ContainsKey($pin.name) -or $expectedPins[$pin.name] -cne $pin.version) { throw 'Checked-in runtime root pin is invalid.' }
+          }
+          $names = @{}
+          foreach ($package in $profile.installed_distribution_closure) {
+            if ($package.name -notmatch '^[a-z0-9][a-z0-9.-]*$' -or $package.version -notmatch '^[A-Za-z0-9][A-Za-z0-9.!+_-]*$' -or $names.ContainsKey($package.name)) { throw 'Checked-in distribution entry is invalid.' }
+            $names[$package.name] = $true
+          }
+          foreach ($name in @('pip', 'setuptools', 'torch')) { if (-not $names.ContainsKey($name)) { throw 'Checked-in tool/runtime bootstrap package is missing.' } }
+          $venv = Join-Path $env:RUNNER_TEMP 'lasso-senocr-runtime-profile-venv'
+          & $env:BASE_PYTHON -m venv $venv
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated runtime venv setup failed.' }
+          $venvPython = Join-Path $venv 'Scripts\python.exe'
+          $bootstrapSpecs = @($profile.installed_distribution_closure | Where-Object { $_.name -in @('pip', 'setuptools') } | ForEach-Object { "$($_.name)==$($_.version)" })
+          $torchSpec = @($profile.installed_distribution_closure | Where-Object { $_.name -ceq 'torch' } | ForEach-Object { "$($_.name)==$($_.version)" })
+          $remainingSpecs = @($profile.installed_distribution_closure | Where-Object { $_.name -notin @('pip', 'setuptools', 'torch') } | ForEach-Object { "$($_.name)==$($_.version)" })
+          if ($bootstrapSpecs.Count -ne 2 -or $torchSpec.Count -ne 1 -or $remainingSpecs.Count -ne 38) { throw 'Checked-in package groups are incomplete.' }
+          & $venvPython -m pip install --quiet --disable-pip-version-check --no-cache-dir --no-deps --only-binary=:all: --index-url https://pypi.org/simple $bootstrapSpecs
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned pip/setuptools bootstrap installation failed.' }
+          & $venvPython -m pip install --quiet --disable-pip-version-check --no-cache-dir --no-deps --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu $torchSpec
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned CPU PyTorch installation failed.' }
+          & $venvPython -m pip install --quiet --disable-pip-version-check --no-cache-dir --no-deps --only-binary=:all: --index-url https://pypi.org/simple $remainingSpecs
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned runtime closure installation failed.' }
+          Add-Content -Path $env:GITHUB_ENV -Value "LASSOINK_SENOCR_PYTHON=$venvPython"
+
+      - name: Inventory and validate exact installed runtime closure
+        shell: pwsh
+        env:
+          LASSOINK_RUN_RUNTIME_INVENTORY: '1'
+          LASSOINK_EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LASSOINK_EXPECTED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          LASSOINK_EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $venvPython = Join-Path $env:RUNNER_TEMP 'lasso-senocr-runtime-profile-venv\Scripts\python.exe'
+          & $venvPython tests/fixtures/senocr_runtime_inventory.py
+          if ($LASTEXITCODE -ne 0) { throw 'Exact runtime closure validation failed.' }
+
+      - name: Upload only the bounded JSON runtime profile inventory
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: senocr-runtime-inventory
+          path: '${{ runner.temp }}\senocr-runtime-inventory.json'
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Run guarded PNG and absolute-path worker checks before model fetch
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          LASSOINK_EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          LASSOINK_EXPECTED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || '' }}
+          LASSOINK_EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
+          LASSOINK_RUN_SENOCR_CPU_COMPAT: '1'
+          LASSOINK_RUN_SENOCR_M4_E2E: '1'
+          LASSOINK_SENOCR_APNG_FIXTURE: '${{ runner.temp }}\senocr-apng-negative.png'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $venvPython = Join-Path $env:RUNNER_TEMP 'lasso-senocr-runtime-profile-venv\Scripts\python.exe'
+          & $venvPython -m unittest discover -s tests -p test_raster_reference_protocol.py
+          if ($LASTEXITCODE -ne 0) { throw 'Guarded PNG and absolute-path worker checks failed.' }
+
+      - name: Run compatibility-only synthetic CPU probe
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_EVENT: ${{ github.event_name }}
+          EXPECTED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || '' }}
+          EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
+          LASSOINK_EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          LASSOINK_EXPECTED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || '' }}
+          LASSOINK_EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
+          LASSOINK_RUN_SENOCR_CPU_COMPAT: '1'
+          LASSOINK_RUN_SENOCR_M4_E2E: '1'
+          LASSOINK_SENOCR_ASSET_ROOT: '${{ runner.temp }}\lasso-senocr-worker-assets'
+          HF_HUB_DISABLE_TELEMETRY: '1'
+          HF_HUB_DISABLE_PROGRESS_BARS: '1'
+          TRANSFORMERS_VERBOSITY: error
+          TOKENIZERS_PARALLELISM: 'false'
+          OMP_NUM_THREADS: '2'
+          MKL_NUM_THREADS: '2'
+          OPENBLAS_NUM_THREADS: '1'
+          PYTHONUNBUFFERED: '1'
+        run: |
+          $venvPython = Join-Path $env:RUNNER_TEMP 'lasso-senocr-runtime-profile-venv\Scripts\python.exe'
+          & $venvPython tests/fixtures/senocr_full_precision_cpu_compat.py
+          if ($LASTEXITCODE -ne 0) { throw 'Compatibility-only synthetic CPU probe failed.' }
+
+      - name: Install pinned Rust toolchain for the actual M4 parent test
+        shell: pwsh
+        run: rustup toolchain install 1.100.0 --profile minimal --target x86_64-pc-windows-msvc
+
+      - name: Run guarded actual M4 parent and SenOCR Raster worker E2E
+        shell: pwsh
+        env:
+          LASSOINK_RUN_PROVIDER_MOCK_TESTS: '1'
+          LASSOINK_RUN_SENOCR_CPU_COMPAT: '1'
+          LASSOINK_RUN_SENOCR_M4_E2E: '1'
+          LASSOINK_EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          LASSOINK_EXPECTED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || '' }}
+          LASSOINK_EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
+          LASSOINK_SENOCR_ASSET_ROOT: '${{ runner.temp }}\lasso-senocr-worker-assets'
+          LASSOINK_SENOCR_E2E_SHARED_DIR: '${{ runner.temp }}\lasso-senocr-worker-e2e'
+          LASSOINK_SENOCR_APNG_FIXTURE: '${{ runner.temp }}\senocr-apng-negative.png'
+          HF_HUB_DISABLE_TELEMETRY: '1'
+          HF_HUB_DISABLE_PROGRESS_BARS: '1'
+          HF_HUB_OFFLINE: '1'
+          TRANSFORMERS_OFFLINE: '1'
+          TRANSFORMERS_VERBOSITY: error
+          TOKENIZERS_PARALLELISM: 'false'
+          OMP_NUM_THREADS: '2'
+          MKL_NUM_THREADS: '2'
+          OPENBLAS_NUM_THREADS: '1'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: cargo +1.100.0 test --locked --workspace senocr_full_precision_raster_worker_integrates_with_m4_parent -- --ignored --test-threads=1
+
+      - name: Remove model and test-only temporary files
+        if: always()
+        shell: pwsh
+        run: |
+          $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          foreach ($name in @('lasso-senocr-worker-assets', 'lasso-senocr-worker-e2e', 'lasso-senocr-runtime-profile-venv', 'senocr-runtime-inventory.json')) {
+            $target = [IO.Path]::GetFullPath((Join-Path $runnerTemp $name))
+            if ([IO.Path]::GetDirectoryName($target) -cne $runnerTemp) { throw 'Temporary cleanup path escaped RUNNER_TEMP.' }
+            if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+          }
+          $apngFixture = [IO.Path]::GetFullPath((Join-Path $runnerTemp 'senocr-apng-negative.png'))
+          if ([IO.Path]::GetDirectoryName($apngFixture) -cne $runnerTemp) { throw 'APNG cleanup path escaped RUNNER_TEMP.' }
+          if (Test-Path -LiteralPath $apngFixture) { Remove-Item -LiteralPath $apngFixture -Force }
