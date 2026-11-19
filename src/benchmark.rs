@@ -135,6 +135,10 @@ pub(crate) struct BenchmarkAnnotationCaseV1 {
     pub annotation_id: String,
     pub reference_text: String,
     pub reference_language_scope: BenchmarkReferenceLanguageScopeV1,
+    /// Optional human annotation; missing values remain unknown and are never
+    /// inferred from the journal or provider output.
+    #[serde(default)]
+    pub reference_handwriting_style: Option<BenchmarkHandwritingStyleV1>,
     /// Optional reference lexical segments are retained only in the local
     /// annotation input. Predicted lexical boundaries are unavailable unless
     /// an independently validated segmenter is supplied.
@@ -148,6 +152,15 @@ pub(crate) enum BenchmarkReferenceLanguageScopeV1 {
     VietnameseOnly,
     MixedOrUnknown,
     OtherLanguage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BenchmarkHandwritingStyleV1 {
+    Print,
+    SemiCursive,
+    Cursive,
+    Mixed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -574,6 +587,9 @@ pub(crate) struct BenchmarkRunRecordV1 {
     pub annotation_id: Option<String>,
     /// Copied from the validated corpus annotation, never from case provenance.
     pub reference_language_scope: Option<BenchmarkReferenceLanguageScopeV1>,
+    /// Copied from the human annotation; absent means legacy/unknown.
+    #[serde(default)]
+    pub reference_handwriting_style: Option<BenchmarkHandwritingStyleV1>,
     pub writer_key: String,
     pub session_key: String,
     pub declared_session_start_unix_ns: Option<u64>,
@@ -717,6 +733,9 @@ pub(crate) struct BenchmarkProviderSummaryV1 {
     pub attempted_run_count: u32,
     pub completed_run_count: u32,
     pub failed_run_count: u32,
+    /// Missing on legacy summaries; new summaries keep cursive CER separate by split.
+    #[serde(default)]
+    pub cursive_only_cer_by_split: Option<Vec<BenchmarkCursiveOnlyCerSummaryV1>>,
     pub app_batch_call_wall_ns: BenchmarkU64PercentilesV1,
     pub process_create_call_to_handshake_ns: BenchmarkU64PercentilesV1,
     pub process_create_call_to_recognition_ns: BenchmarkU64PercentilesV1,
@@ -726,6 +745,29 @@ pub(crate) struct BenchmarkProviderSummaryV1 {
     pub peak_process_memory_bytes_raw: BenchmarkU64PercentilesV1,
     pub model_cold_start_ns: BenchmarkU64PercentilesV1,
     pub gpu_memory_bytes_raw: BenchmarkU64PercentilesV1,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkHandwritingStyleCoverageV1 {
+    pub print_case_count: u32,
+    pub semi_cursive_case_count: u32,
+    pub cursive_case_count: u32,
+    pub mixed_case_count: u32,
+    pub unknown_case_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkCursiveOnlyCerSummaryV1 {
+    pub split: Option<BenchmarkSplitV1>,
+    pub style_annotation_coverage: BenchmarkHandwritingStyleCoverageV1,
+    pub explicitly_cursive_reference_case_count: u32,
+    pub scored_case_count: u32,
+    pub unavailable_case_count: u32,
+    pub nfc_unicode_scalar_micro_cer: Option<BenchmarkCountMetricV1>,
+    pub unavailable_reason: Option<String>,
+    pub partial_coverage_note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1174,12 +1216,124 @@ struct EvaluationObservation {
     wer: Option<BenchmarkCountMetricV1>,
 }
 
+#[derive(Default)]
+struct CursiveOnlyCerAccumulator {
+    style_coverage: BenchmarkHandwritingStyleCoverageV1,
+    errors: u64,
+    reference_units: u64,
+    scored_case_count: u32,
+    unavailable_case_count: u32,
+}
+
+impl CursiveOnlyCerAccumulator {
+    fn observe(
+        &mut self,
+        style: Option<BenchmarkHandwritingStyleV1>,
+        metric: Option<&BenchmarkCountMetricV1>,
+    ) -> io::Result<()> {
+        let style_count = match style {
+            Some(BenchmarkHandwritingStyleV1::Print) => &mut self.style_coverage.print_case_count,
+            Some(BenchmarkHandwritingStyleV1::SemiCursive) => {
+                &mut self.style_coverage.semi_cursive_case_count
+            }
+            Some(BenchmarkHandwritingStyleV1::Cursive) => {
+                &mut self.style_coverage.cursive_case_count
+            }
+            Some(BenchmarkHandwritingStyleV1::Mixed) => &mut self.style_coverage.mixed_case_count,
+            None => &mut self.style_coverage.unknown_case_count,
+        };
+        *style_count = style_count
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("handwriting-style coverage count overflow"))?;
+
+        if style == Some(BenchmarkHandwritingStyleV1::Cursive) {
+            if let Some(metric) = metric.filter(|metric| metric.reference_units > 0) {
+                self.errors = self
+                    .errors
+                    .checked_add(metric.errors)
+                    .ok_or_else(|| invalid_data("cursive-only CER error total overflow"))?;
+                self.reference_units = self
+                    .reference_units
+                    .checked_add(metric.reference_units)
+                    .ok_or_else(|| invalid_data("cursive-only CER reference total overflow"))?;
+                self.scored_case_count = self
+                    .scored_case_count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("cursive-only CER scored count overflow"))?;
+            } else {
+                self.unavailable_case_count = self
+                    .unavailable_case_count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("cursive-only CER unavailable count overflow"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, split: Option<BenchmarkSplitV1>) -> BenchmarkCursiveOnlyCerSummaryV1 {
+        let explicitly_cursive_reference_case_count = self.style_coverage.cursive_case_count;
+        let nfc_unicode_scalar_micro_cer =
+            (self.reference_units > 0).then_some(BenchmarkCountMetricV1 {
+                errors: self.errors,
+                reference_units: self.reference_units,
+            });
+        let unavailable_reason = nfc_unicode_scalar_micro_cer.is_none().then(|| {
+            if explicitly_cursive_reference_case_count == 0 {
+                "no human-labeled cursive references were supplied".to_owned()
+            } else {
+                "no explicitly cursive reference had a usable positive-denominator CER observation"
+                    .to_owned()
+            }
+        });
+        let partial_coverage_note = (nfc_unicode_scalar_micro_cer.is_some()
+            && self.unavailable_case_count > 0)
+            .then(|| {
+                "micro CER covers only cursive-labeled cases with usable quality-eligible rank-0 CER; inspect unavailable case count"
+                    .to_owned()
+            });
+        BenchmarkCursiveOnlyCerSummaryV1 {
+            split,
+            style_annotation_coverage: self.style_coverage,
+            explicitly_cursive_reference_case_count,
+            scored_case_count: self.scored_case_count,
+            unavailable_case_count: self.unavailable_case_count,
+            nfc_unicode_scalar_micro_cer,
+            unavailable_reason,
+            partial_coverage_note,
+        }
+    }
+}
+
+fn accumulate_cursive_cer_by_split(
+    accumulators: &mut BTreeMap<Option<BenchmarkSplitV1>, CursiveOnlyCerAccumulator>,
+    split: Option<BenchmarkSplitV1>,
+    style: Option<BenchmarkHandwritingStyleV1>,
+    metric: Option<&BenchmarkCountMetricV1>,
+) -> io::Result<()> {
+    accumulators
+        .entry(split)
+        .or_default()
+        .observe(style, metric)
+}
+
+fn finish_cursive_only_cer_by_split(
+    accumulators: BTreeMap<Option<BenchmarkSplitV1>, CursiveOnlyCerAccumulator>,
+) -> io::Result<Vec<BenchmarkCursiveOnlyCerSummaryV1>> {
+    let mut summaries = Vec::new();
+    summaries.try_reserve_exact(accumulators.len())?;
+    for (split, accumulator) in accumulators {
+        summaries.push(accumulator.finish(split));
+    }
+    Ok(summaries)
+}
+
 struct ProviderSummaryAccumulator {
     provider_id: String,
     configuration_id: String,
     attempted_run_count: u32,
     completed_run_count: u32,
     failed_run_count: u32,
+    cursive_cer_by_split: BTreeMap<Option<BenchmarkSplitV1>, CursiveOnlyCerAccumulator>,
     app_batch_call_wall_ns: Vec<u64>,
     process_create_call_to_handshake_ns: Vec<u64>,
     process_create_call_to_recognition_ns: Vec<u64>,
@@ -1199,6 +1353,7 @@ impl ProviderSummaryAccumulator {
             attempted_run_count: 0,
             completed_run_count: 0,
             failed_run_count: 0,
+            cursive_cer_by_split: BTreeMap::new(),
             app_batch_call_wall_ns: Vec::new(),
             process_create_call_to_handshake_ns: Vec::new(),
             process_create_call_to_recognition_ns: Vec::new(),
@@ -1246,6 +1401,17 @@ impl ProviderSummaryAccumulator {
                     .ok_or_else(|| invalid_data("provider summary failure count overflow"))?;
             }
         }
+        let nfc_cer = run
+            .candidate_metrics
+            .iter()
+            .find(|metrics| metrics.candidate_rank == 0)
+            .and_then(|metrics| metrics.nfc_unicode_scalar_cer.as_ref());
+        accumulate_cursive_cer_by_split(
+            &mut self.cursive_cer_by_split,
+            run.split,
+            run.reference_handwriting_style,
+            nfc_cer,
+        )?;
         self.app_batch_call_wall_ns
             .push(run.elapsed_app_batch_call_wall_ns);
         if let Some(timing) = &run.timing {
@@ -1278,12 +1444,15 @@ impl ProviderSummaryAccumulator {
 
     fn finish(mut self) -> io::Result<BenchmarkProviderSummaryV1> {
         let attempted_run_count = self.attempted_run_count;
+        let cursive_only_cer_by_split =
+            finish_cursive_only_cer_by_split(std::mem::take(&mut self.cursive_cer_by_split))?;
         Ok(BenchmarkProviderSummaryV1 {
             provider_id: self.provider_id,
             configuration_id: self.configuration_id,
             attempted_run_count: self.attempted_run_count,
             completed_run_count: self.completed_run_count,
             failed_run_count: self.failed_run_count,
+            cursive_only_cer_by_split: Some(cursive_only_cer_by_split),
             app_batch_call_wall_ns: u64_percentiles(
                 &mut self.app_batch_call_wall_ns,
                 attempted_run_count,
@@ -1952,6 +2121,8 @@ fn successful_run_record(
         corpus_id: base.case.provenance.corpus_id.clone(),
         annotation_id: base.case.provenance.annotation_id.clone(),
         reference_language_scope: annotation.map(|value| value.reference_language_scope),
+        reference_handwriting_style: annotation
+            .and_then(|value| value.reference_handwriting_style),
         writer_key: base.case.provenance.writer_key.clone(),
         session_key: base.case.provenance.session_key.clone(),
         declared_session_start_unix_ns: base.case.provenance.session_start_unix_ns,
@@ -2076,6 +2247,8 @@ fn failed_run_record(
         corpus_id: base.case.provenance.corpus_id.clone(),
         annotation_id: base.case.provenance.annotation_id.clone(),
         reference_language_scope: annotation.map(|value| value.reference_language_scope),
+        reference_handwriting_style: annotation
+            .and_then(|value| value.reference_handwriting_style),
         writer_key: base.case.provenance.writer_key.clone(),
         session_key: base.case.provenance.session_key.clone(),
         declared_session_start_unix_ns: base.case.provenance.session_start_unix_ns,
@@ -4410,6 +4583,7 @@ mod tests {
             annotation_id: annotation_id.to_owned(),
             reference_text: reference_text.to_owned(),
             reference_language_scope: BenchmarkReferenceLanguageScopeV1::VietnameseOnly,
+            reference_handwriting_style: None,
             reference_lexical_tokens: None,
             delayed_marks: Vec::new(),
         }
@@ -6119,6 +6293,281 @@ mod tests {
                 .syllable_boundary_offset_diagnostic_unavailable_reason
                 .is_some()
         );
+    }
+
+    #[test]
+    fn legacy_corpus_annotation_without_style_deserializes_as_unknown() {
+        let mut value = serde_json::to_value(annotation("human reference")).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("reference_handwriting_style");
+        let restored: BenchmarkAnnotationCaseV1 = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.reference_handwriting_style, None);
+
+        let mut explicitly_labeled = annotation("human reference");
+        explicitly_labeled.reference_handwriting_style =
+            Some(BenchmarkHandwritingStyleV1::SemiCursive);
+        let encoded = serde_json::to_value(&explicitly_labeled).unwrap();
+        assert_eq!(encoded["reference_handwriting_style"], "semi_cursive");
+    }
+
+    #[test]
+    fn cursive_only_micro_cer_excludes_other_and_unknown_styles() {
+        let mut accumulator = CursiveOnlyCerAccumulator::default();
+        let excluded_metric = BenchmarkCountMetricV1 {
+            errors: 0,
+            reference_units: 100,
+        };
+        accumulator
+            .observe(
+                Some(BenchmarkHandwritingStyleV1::Print),
+                Some(&excluded_metric),
+            )
+            .unwrap();
+        accumulator
+            .observe(
+                Some(BenchmarkHandwritingStyleV1::SemiCursive),
+                Some(&excluded_metric),
+            )
+            .unwrap();
+        accumulator
+            .observe(
+                Some(BenchmarkHandwritingStyleV1::Mixed),
+                Some(&excluded_metric),
+            )
+            .unwrap();
+        accumulator.observe(None, Some(&excluded_metric)).unwrap();
+
+        let short_cursive = BenchmarkCountMetricV1 {
+            errors: 1,
+            reference_units: 1,
+        };
+        let long_cursive = BenchmarkCountMetricV1 {
+            errors: 0,
+            reference_units: 10,
+        };
+        accumulator
+            .observe(
+                Some(BenchmarkHandwritingStyleV1::Cursive),
+                Some(&short_cursive),
+            )
+            .unwrap();
+        accumulator
+            .observe(
+                Some(BenchmarkHandwritingStyleV1::Cursive),
+                Some(&long_cursive),
+            )
+            .unwrap();
+
+        let summary = accumulator.finish(Some(BenchmarkSplitV1::Evaluation));
+        let coverage = &summary.style_annotation_coverage;
+        assert_eq!(coverage.print_case_count, 1);
+        assert_eq!(coverage.semi_cursive_case_count, 1);
+        assert_eq!(coverage.cursive_case_count, 2);
+        assert_eq!(coverage.mixed_case_count, 1);
+        assert_eq!(coverage.unknown_case_count, 1);
+        assert_eq!(summary.explicitly_cursive_reference_case_count, 2);
+        assert_eq!(summary.scored_case_count, 2);
+        assert_eq!(summary.unavailable_case_count, 0);
+        assert_eq!(
+            summary.nfc_unicode_scalar_micro_cer,
+            Some(BenchmarkCountMetricV1 {
+                errors: 1,
+                reference_units: 11,
+            })
+        );
+        assert!(summary.unavailable_reason.is_none());
+        assert!(summary.partial_coverage_note.is_none());
+    }
+
+    #[test]
+    fn cursive_only_micro_cer_summaries_remain_split_disjoint() {
+        let mut by_split = BTreeMap::<Option<BenchmarkSplitV1>, CursiveOnlyCerAccumulator>::new();
+        let train_metric = BenchmarkCountMetricV1 {
+            errors: 1,
+            reference_units: 2,
+        };
+        let evaluation_metric = BenchmarkCountMetricV1 {
+            errors: 0,
+            reference_units: 10,
+        };
+        accumulate_cursive_cer_by_split(
+            &mut by_split,
+            Some(BenchmarkSplitV1::Train),
+            Some(BenchmarkHandwritingStyleV1::Cursive),
+            Some(&train_metric),
+        )
+        .unwrap();
+        accumulate_cursive_cer_by_split(
+            &mut by_split,
+            Some(BenchmarkSplitV1::Evaluation),
+            Some(BenchmarkHandwritingStyleV1::Cursive),
+            Some(&evaluation_metric),
+        )
+        .unwrap();
+
+        let summaries = finish_cursive_only_cer_by_split(by_split).unwrap();
+        assert_eq!(summaries.len(), 2);
+        let train = summaries
+            .iter()
+            .find(|summary| summary.split == Some(BenchmarkSplitV1::Train))
+            .unwrap();
+        let evaluation = summaries
+            .iter()
+            .find(|summary| summary.split == Some(BenchmarkSplitV1::Evaluation))
+            .unwrap();
+        assert_eq!(
+            train.nfc_unicode_scalar_micro_cer,
+            Some(BenchmarkCountMetricV1 {
+                errors: 1,
+                reference_units: 2,
+            })
+        );
+        assert_eq!(
+            evaluation.nfc_unicode_scalar_micro_cer,
+            Some(BenchmarkCountMetricV1 {
+                errors: 0,
+                reference_units: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn cursive_only_micro_cer_uses_nfc_scalars_for_nfd_text() {
+        let mut reference = annotation("é");
+        reference.reference_handwriting_style = Some(BenchmarkHandwritingStyleV1::Cursive);
+        let metrics = score_candidate(
+            "e\u{0301}",
+            &reference,
+            BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+            0,
+        )
+        .unwrap();
+        let metric = metrics.nfc_unicode_scalar_cer.as_ref().unwrap();
+        assert_eq!(metric.errors, 0);
+        assert_eq!(metric.reference_units, 1);
+
+        let mut accumulator = CursiveOnlyCerAccumulator::default();
+        accumulator
+            .observe(reference.reference_handwriting_style, Some(metric))
+            .unwrap();
+        let summary = accumulator.finish(Some(BenchmarkSplitV1::Evaluation));
+        assert_eq!(
+            summary.nfc_unicode_scalar_micro_cer,
+            Some(BenchmarkCountMetricV1 {
+                errors: 0,
+                reference_units: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn cursive_only_cer_empty_and_unlabeled_subsets_are_unavailable() {
+        let mut empty_reference = annotation("");
+        empty_reference.reference_handwriting_style = Some(BenchmarkHandwritingStyleV1::Cursive);
+        let empty_metrics = score_candidate(
+            "ink",
+            &empty_reference,
+            BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+            0,
+        )
+        .unwrap();
+        assert!(empty_metrics.nfc_unicode_scalar_cer.is_none());
+        let mut empty_accumulator = CursiveOnlyCerAccumulator::default();
+        empty_accumulator
+            .observe(
+                empty_reference.reference_handwriting_style,
+                empty_metrics.nfc_unicode_scalar_cer.as_ref(),
+            )
+            .unwrap();
+        let empty_summary = empty_accumulator.finish(Some(BenchmarkSplitV1::Evaluation));
+        let empty_coverage = &empty_summary.style_annotation_coverage;
+        assert_eq!(empty_coverage.cursive_case_count, 1);
+        assert_eq!(empty_summary.explicitly_cursive_reference_case_count, 1);
+        assert_eq!(empty_summary.scored_case_count, 0);
+        assert_eq!(empty_summary.unavailable_case_count, 1);
+        assert!(empty_summary.nfc_unicode_scalar_micro_cer.is_none());
+        assert!(empty_summary.unavailable_reason.is_some());
+
+        let mut unlabeled_accumulator = CursiveOnlyCerAccumulator::default();
+        unlabeled_accumulator
+            .observe(
+                None,
+                Some(&BenchmarkCountMetricV1 {
+                    errors: 0,
+                    reference_units: 3,
+                }),
+            )
+            .unwrap();
+        unlabeled_accumulator
+            .observe(
+                Some(BenchmarkHandwritingStyleV1::Print),
+                Some(&BenchmarkCountMetricV1 {
+                    errors: 0,
+                    reference_units: 3,
+                }),
+            )
+            .unwrap();
+        unlabeled_accumulator
+            .observe(
+                Some(BenchmarkHandwritingStyleV1::Mixed),
+                Some(&BenchmarkCountMetricV1 {
+                    errors: 0,
+                    reference_units: 3,
+                }),
+            )
+            .unwrap();
+        let unlabeled_summary = unlabeled_accumulator.finish(Some(BenchmarkSplitV1::Evaluation));
+        let unlabeled_coverage = &unlabeled_summary.style_annotation_coverage;
+        assert_eq!(unlabeled_coverage.cursive_case_count, 0);
+        assert_eq!(unlabeled_coverage.unknown_case_count, 1);
+        assert_eq!(unlabeled_summary.explicitly_cursive_reference_case_count, 0);
+        assert_eq!(unlabeled_summary.scored_case_count, 0);
+        assert_eq!(unlabeled_summary.unavailable_case_count, 0);
+        assert!(unlabeled_summary.nfc_unicode_scalar_micro_cer.is_none());
+        assert!(
+            unlabeled_summary
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no human-labeled cursive"))
+        );
+    }
+
+    #[test]
+    fn handwriting_style_annotations_do_not_enter_provider_request_or_view_id() {
+        let (state, stroke) = generated_raster_journal_fixture();
+        let request = generated_raster_request(
+            &state,
+            &stroke,
+            "style-leak-test",
+            vec![ProviderInputCapabilityV1::OnlineStrokes],
+            None,
+        );
+        let request_json = serde_json::to_value(&request).unwrap();
+        let original_input_view_id = request.input_view_id.clone();
+        let original_binding = canonical_ink_comparison_binding(&request).unwrap();
+
+        for style in [
+            Some(BenchmarkHandwritingStyleV1::Cursive),
+            Some(BenchmarkHandwritingStyleV1::Mixed),
+            None,
+        ] {
+            let mut reference = annotation("human-only reference");
+            reference.reference_handwriting_style = style;
+            let _ = score_candidate(
+                "provider text",
+                &reference,
+                BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+                0,
+            )
+            .unwrap();
+            assert_eq!(request.input_view_id, original_input_view_id);
+            assert_eq!(
+                canonical_ink_comparison_binding(&request).unwrap(),
+                original_binding
+            );
+            assert_eq!(serde_json::to_value(&request).unwrap(), request_json);
+        }
+        assert!(request_json.get("reference_handwriting_style").is_none());
     }
 
     #[test]

@@ -4828,6 +4828,9 @@ mod tests {
                 reference_text: "PRIVATE_REFERENCE_TEXT_SENTINEL".to_owned(),
                 reference_language_scope:
                     crate::benchmark::BenchmarkReferenceLanguageScopeV1::MixedOrUnknown,
+                reference_handwriting_style: Some(
+                    crate::benchmark::BenchmarkHandwritingStyleV1::Cursive,
+                ),
                 reference_lexical_tokens: None,
                 delayed_marks: Vec::new(),
             }],
@@ -4857,6 +4860,7 @@ mod tests {
             ),
         ];
         let mut expected_frames = BTreeMap::<String, (Vec<u8>, Vec<u8>)>::new();
+        let mut expected_input_view_ids = BTreeMap::<String, String>::new();
         let mut providers = Vec::new();
         for (
             provider_index,
@@ -4918,6 +4922,10 @@ mod tests {
                     handshake.as_bytes().to_vec(),
                     recognition.as_bytes().to_vec(),
                 ),
+            );
+            expected_input_view_ids.insert(
+                configuration.configuration_id.clone(),
+                request.input_view_id.clone(),
             );
             providers.push(ApprovedBenchmarkProviderV1 {
                 provider_id: "mock-provider".to_owned(),
@@ -5046,6 +5054,15 @@ mod tests {
         let success_b = find_run("cfg-success-b");
         assert_eq!(success_a["status"], "completed");
         assert_eq!(success_b["status"], "completed");
+        assert_eq!(success_a["reference_handwriting_style"], "cursive");
+        assert_eq!(
+            success_a["input_view_id"].as_str(),
+            Some(expected_input_view_ids["cfg-success-a"].as_str())
+        );
+        assert_eq!(
+            success_b["input_view_id"].as_str(),
+            Some(expected_input_view_ids["cfg-success-b"].as_str())
+        );
         assert_eq!(success_a["case_id"], case_id);
         assert_eq!(success_a["provider_id"], "mock-provider");
         assert_eq!(
@@ -5215,6 +5232,16 @@ mod tests {
             assert_eq!(summary["attempted_run_count"].as_u64(), Some(1));
             assert_eq!(summary["completed_run_count"].as_u64(), Some(completed));
             assert_eq!(summary["failed_run_count"].as_u64(), Some(failed_count));
+            let cursive_summary = summary["cursive_only_cer_by_split"].as_array().unwrap();
+            assert_eq!(cursive_summary.len(), 1);
+            assert_eq!(cursive_summary[0]["split"], "evaluation");
+            assert_eq!(
+                cursive_summary[0]["style_annotation_coverage"]["cursive_case_count"],
+                1
+            );
+            assert!(cursive_summary[0]["nfc_unicode_scalar_micro_cer"].is_null());
+            assert_eq!(cursive_summary[0]["scored_case_count"], 0);
+            assert_eq!(cursive_summary[0]["unavailable_case_count"], 1);
         }
     }
 
