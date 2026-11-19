@@ -6392,15 +6392,55 @@ mod tests {
         assert!(!benchmark_text.contains(&png_hex));
 
         let expect_worker_failure = |request: RecognitionRequestV1, expected_code: &str| {
+            let case_label = request.request_id.clone();
             let error = match run_senocr_worker_request(&python_executable, &worker_script, request)
             {
                 Ok(_execution) => panic!("invalid Raster request unexpectedly succeeded"),
                 Err(error) => error,
             };
-            assert!(matches!(
-                &error.kind,
-                ProviderErrorKind::ProviderFailure { code, .. } if code == expected_code
-            ));
+            let actual_error_kind_code = match &error.kind {
+                ProviderErrorKind::ProviderFailure { code, .. } => {
+                    let safe_code = !code.is_empty()
+                        && code.len() <= 64
+                        && code.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+                        });
+                    format!(
+                        "provider_failure:{}",
+                        if safe_code { code.as_str() } else { "<redacted>" }
+                    )
+                }
+                ProviderErrorKind::InvalidConfiguration(_) => "invalid_configuration".to_owned(),
+                ProviderErrorKind::InvalidRequest(_) => "invalid_request".to_owned(),
+                ProviderErrorKind::InvalidResponse(_) => "invalid_response".to_owned(),
+                ProviderErrorKind::ProtocolVersion { .. } => "protocol_version".to_owned(),
+                ProviderErrorKind::OversizedFrame { .. } => "oversized_frame".to_owned(),
+                ProviderErrorKind::TimedOut(_) => "timed_out".to_owned(),
+                ProviderErrorKind::Cancelled => "cancelled".to_owned(),
+                ProviderErrorKind::SpawnFailed(_) => "spawn_failed".to_owned(),
+                ProviderErrorKind::IoFailed { .. } => "io_failed".to_owned(),
+                ProviderErrorKind::WorkerExited { .. } => "worker_exited".to_owned(),
+                ProviderErrorKind::UnexpectedFrame(_) => "unexpected_frame".to_owned(),
+                ProviderErrorKind::UnsupportedCapability(_) => "unsupported_capability".to_owned(),
+                ProviderErrorKind::StaleSourceRevision => "stale_source_revision".to_owned(),
+                ProviderErrorKind::ProviderRequestMismatch => "provider_request_mismatch".to_owned(),
+                ProviderErrorKind::ProviderConfigurationMismatch => {
+                    "provider_configuration_mismatch".to_owned()
+                }
+                ProviderErrorKind::WorkerThreadPanicked => "worker_thread_panicked".to_owned(),
+                ProviderErrorKind::UnsupportedPlatform => "unsupported_platform".to_owned(),
+                ProviderErrorKind::WorkerCapacityReached => "worker_capacity_reached".to_owned(),
+                ProviderErrorKind::WorkerSubsystemPoisoned => "worker_subsystem_poisoned".to_owned(),
+                ProviderErrorKind::ProcessCleanupFailed(_) => "process_cleanup_failed".to_owned(),
+                ProviderErrorKind::AllocationFailed => "allocation_failed".to_owned(),
+            };
+            assert!(
+                matches!(
+                    &error.kind,
+                    ProviderErrorKind::ProviderFailure { code, .. } if code == expected_code
+                ),
+                "guarded Raster case {case_label} expected provider_failure:{expected_code}, got {actual_error_kind_code}"
+            );
             assert!(error.raw_response_transcript.capture_complete);
             assert_eq!(error.raw_response_transcript.frames.len(), 2);
             let failure_payload = &error.raw_response_transcript.frames[1].payload_bytes;
