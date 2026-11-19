@@ -277,3 +277,105 @@ jobs:
           $apngFixture = [IO.Path]::GetFullPath((Join-Path $runnerTemp 'senocr-apng-negative.png'))
           if ([IO.Path]::GetDirectoryName($apngFixture) -cne $runnerTemp) { throw 'APNG cleanup path escaped RUNNER_TEMP.' }
           if (Test-Path -LiteralPath $apngFixture) { Remove-Item -LiteralPath $apngFixture -Force }
+
+  benchmark-runtime-inventory:
+    name: Opt-in SenOCR runtime inventory on Windows x64
+    if: >-
+      github.repository == 'Herzchens/LassoInk' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'feat/benchmark-fidelity'
+    needs: verify
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      LASSOINK_RUN_RUNTIME_INVENTORY: '1'
+    steps:
+      - name: Guard hosted runner and explicit opt-in before checkout or network access
+        shell: pwsh
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_EVENT: ${{ github.event_name }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EXPECTED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || '' }}
+          EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
+          LASSOINK_RUN_RUNTIME_INVENTORY: '1'
+        run: |
+          if ($env:EXPECTED_REPOSITORY -cne 'Herzchens/LassoInk') { throw 'Repository guard failed.' }
+          if ($env:EXPECTED_EVENT -cne 'pull_request') { throw 'Pull request event is required.' }
+          if ($env:CI -cne 'true' -or $env:GITHUB_ACTIONS -cne 'true') { throw 'Actions guard failed.' }
+          if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64') { throw 'Hosted Windows x64 guard failed.' }
+          if ($env:LASSOINK_RUN_RUNTIME_INVENTORY -cne '1') { throw 'Explicit runtime inventory opt-in is required.' }
+          if ($env:EXPECTED_HEAD_SHA -notmatch '^[0-9a-f]{40}$') { throw 'Exact head SHA is invalid.' }
+          if ($env:EXPECTED_HEAD_REPOSITORY -cne 'Herzchens/LassoInk' -or $env:EXPECTED_HEAD_REF -cne 'feat/benchmark-fidelity') { throw 'Pull request source guard failed.' }
+
+      - name: Check out exact PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out exact head
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:EXPECTED_HEAD_SHA) { throw 'Checked-out head SHA mismatch.' }
+          Add-Content -Path $env:GITHUB_ENV -Value "LASSOINK_CHECKED_OUT_HEAD_SHA=$actual"
+
+      - name: Set up pinned Python x64
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13.17'
+          architecture: x64
+          check-latest: false
+
+      - name: Install accepted runtime roots into an isolated temporary venv
+        shell: pwsh
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: '1'
+          PIP_NO_CACHE_DIR: '1'
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP 'lasso-senocr-runtime-inventory-venv'
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated runtime venv setup failed.' }
+          $venvPython = Join-Path $venv 'Scripts\python.exe'
+          & $venvPython -m pip install --quiet --disable-pip-version-check --no-cache-dir --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu 'torch==2.15.0+cpu'
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned CPU PyTorch installation failed.' }
+          & $venvPython -m pip install --quiet --disable-pip-version-check --no-cache-dir --only-binary=:all: --index-url https://pypi.org/simple 'transformers==5.23.0' 'Pillow==13.0.0' 'Jinja2==3.1.6'
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Transformers/Pillow/template installation failed.' }
+
+      - name: Generate bounded installed-distribution inventory
+        shell: pwsh
+        env:
+          LASSOINK_RUN_RUNTIME_INVENTORY: '1'
+          LASSOINK_EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LASSOINK_EXPECTED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          LASSOINK_EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          $venvPython = Join-Path $env:RUNNER_TEMP 'lasso-senocr-runtime-inventory-venv\Scripts\python.exe'
+          & $venvPython tests/fixtures/senocr_runtime_inventory.py
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime inventory generation failed.' }
+
+      - name: Upload only the bounded JSON inventory
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: senocr-runtime-inventory
+          path: '${{ runner.temp }}\senocr-runtime-inventory.json'
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove runtime venv and inventory file
+        if: always()
+        shell: pwsh
+        run: |
+          $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          foreach ($name in @('lasso-senocr-runtime-inventory-venv', 'senocr-runtime-inventory.json')) {
+            $target = [IO.Path]::GetFullPath((Join-Path $runnerTemp $name))
+            if ([IO.Path]::GetDirectoryName($target) -cne $runnerTemp) { throw 'Cleanup path escaped RUNNER_TEMP.' }
+            if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+          }
