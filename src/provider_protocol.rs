@@ -6250,10 +6250,7 @@ mod tests {
                     "asset_root".to_owned(),
                     asset_root.to_string_lossy().into_owned(),
                 ),
-                (
-                    "model_id".to_owned(),
-                    "VietAlphaLabs/SenOCR-Vi".to_owned(),
-                ),
+                ("model_id".to_owned(), "VietAlphaLabs/SenOCR-Vi".to_owned()),
                 (
                     "model_revision".to_owned(),
                     "1e70dff4ef0429b0d88a2b873fb5d03300af1a41".to_owned(),
@@ -6302,7 +6299,11 @@ mod tests {
                 }),
             }],
         };
-        fs::write(&benchmark_case_path, serde_json::to_vec(&benchmark_case).unwrap()).unwrap();
+        fs::write(
+            &benchmark_case_path,
+            serde_json::to_vec(&benchmark_case).unwrap(),
+        )
+        .unwrap();
         fs::write(
             &benchmark_provider_path,
             serde_json::to_vec(&benchmark_provider).unwrap(),

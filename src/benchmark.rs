@@ -2036,7 +2036,9 @@ fn candidate_metrics_for_quality_evidence(
     match (annotation, tokenization_policy) {
         (Some(_), Some(_)) if result.candidates.is_empty() => (
             Vec::new(),
-            Some("text metrics unavailable because provider returned no rank-0 candidate".to_owned()),
+            Some(
+                "text metrics unavailable because provider returned no rank-0 candidate".to_owned(),
+            ),
         ),
         (Some(annotation), Some(policy)) => match score_candidates(result, annotation, policy) {
             Ok(metrics) => (metrics, None),
@@ -2527,9 +2529,8 @@ fn senocr_asset_plan_from_manifest(
 
     let mut mismatch_reason = None;
     if provider.protocol_configuration.configuration_id != SENOCR_REFERENCE_CONFIGURATION_ID {
-        mismatch_reason = Some(
-            "SenOCR evidence requires the fixed operator configuration ID".to_owned(),
-        );
+        mismatch_reason =
+            Some("SenOCR evidence requires the fixed operator configuration ID".to_owned());
     }
     let values = &provider.protocol_configuration.values;
     let model_root = values
@@ -2537,11 +2538,10 @@ fn senocr_asset_plan_from_manifest(
         .map(|value| PathBuf::from(value.as_str()));
     if values.len() != 3
         || values.get("model_id").map(String::as_str) != Some("VietAlphaLabs/SenOCR-Vi")
-        || values.get("model_revision").map(String::as_str)
-            != Some(SENOCR_REFERENCE_MODEL_REVISION)
-        || model_root
-            .as_deref()
-            .is_none_or(|path| require_local_absolute_path(path, "SenOCR model asset root").is_err())
+        || values.get("model_revision").map(String::as_str) != Some(SENOCR_REFERENCE_MODEL_REVISION)
+        || model_root.as_deref().is_none_or(|path| {
+            require_local_absolute_path(path, "SenOCR model asset root").is_err()
+        })
     {
         mismatch_reason.get_or_insert_with(|| {
             "SenOCR model configuration does not match the fixed local reference model".to_owned()
@@ -2760,7 +2760,9 @@ fn load_senocr_runtime_profile_manifest() -> io::Result<SenocrRuntimeProfileMani
         let matches_closure = manifest
             .installed_distribution_closure
             .iter()
-            .any(|distribution| distribution.name == pin.name && distribution.version == pin.version);
+            .any(|distribution| {
+                distribution.name == pin.name && distribution.version == pin.version
+            });
         if !matches_closure
             || previous_pin_name.is_some_and(|previous| previous >= pin.name.as_str())
         {
@@ -4419,7 +4421,10 @@ mod tests {
         let configuration = ProviderConfigurationV1 {
             configuration_id: SENOCR_REFERENCE_CONFIGURATION_ID.to_owned(),
             values: BTreeMap::from([
-                ("asset_root".to_owned(), asset_root.to_string_lossy().into_owned()),
+                (
+                    "asset_root".to_owned(),
+                    asset_root.to_string_lossy().into_owned(),
+                ),
                 ("model_id".to_owned(), "VietAlphaLabs/SenOCR-Vi".to_owned()),
                 (
                     "model_revision".to_owned(),
@@ -5610,8 +5615,8 @@ mod tests {
     #[test]
     fn senocr_quality_evidence_binds_profile_and_all_twelve_prelaunch_asset_hashes() {
         let provider = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
-        let evidence = benchmark_quality_evidence(&provider, Some(&senocr_quality_test_identity()))
-            .unwrap();
+        let evidence =
+            benchmark_quality_evidence(&provider, Some(&senocr_quality_test_identity())).unwrap();
         assert_eq!(
             evidence.status,
             BenchmarkQualityEvidenceStatusV1::EligibleByDeclaredSenocrEvidence
@@ -5791,16 +5796,23 @@ mod tests {
         assert_eq!(comparisons[0].nfc_cer_paired_case_count, 0);
         assert_eq!(comparisons[0].whitespace_syllable_wer_paired_case_count, 0);
         assert!(comparisons[0].nfc_cer_rate_difference.is_none());
-        assert!(comparisons[0].whitespace_syllable_wer_rate_difference.is_none());
-        assert!(comparisons[0]
-            .nfc_cer_unavailable_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("no paired cases")));
+        assert!(
+            comparisons[0]
+                .whitespace_syllable_wer_rate_difference
+                .is_none()
+        );
+        assert!(
+            comparisons[0]
+                .nfc_cer_unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no paired cases"))
+        );
     }
 
     #[test]
     fn senocr_quality_evidence_withholds_metrics_for_missing_asset_identity_and_size_mismatches() {
-        let partial = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len() - 1);
+        let partial =
+            senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len() - 1);
         let partial_evidence =
             benchmark_quality_evidence(&partial, Some(&senocr_quality_test_identity())).unwrap();
         assert_eq!(
@@ -5819,7 +5831,8 @@ mod tests {
         let complete = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
         let mut wrong_identity = senocr_quality_test_identity();
         wrong_identity.resource_version = Some("different-runtime-profile".to_owned());
-        let identity_evidence = benchmark_quality_evidence(&complete, Some(&wrong_identity)).unwrap();
+        let identity_evidence =
+            benchmark_quality_evidence(&complete, Some(&wrong_identity)).unwrap();
         assert_eq!(
             identity_evidence.status,
             BenchmarkQualityEvidenceStatusV1::MismatchedSenocrEvidence
@@ -5829,11 +5842,8 @@ mod tests {
 
         let mut wrong_size = complete;
         wrong_size.artifact_digests[1].byte_count += 1;
-        let size_evidence = benchmark_quality_evidence(
-            &wrong_size,
-            Some(&senocr_quality_test_identity()),
-        )
-        .unwrap();
+        let size_evidence =
+            benchmark_quality_evidence(&wrong_size, Some(&senocr_quality_test_identity())).unwrap();
         assert_eq!(
             size_evidence.status,
             BenchmarkQualityEvidenceStatusV1::MismatchedSenocrEvidence
@@ -5847,7 +5857,8 @@ mod tests {
 
     #[test]
     fn senocr_quality_evidence_rejects_artifact_paths_outside_configured_root() {
-        let mut provider = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
+        let mut provider =
+            senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
         let mut manifest = ApprovedBenchmarkProviderV1 {
             provider_id: provider.provider_id.clone(),
             executable_path: PathBuf::from(r"C:\python\python.exe"),
@@ -5878,8 +5889,8 @@ mod tests {
             },
         );
         provider.senocr_asset_plan = senocr_asset_plan_from_manifest(&manifest);
-        let evidence = benchmark_quality_evidence(&provider, Some(&senocr_quality_test_identity()))
-            .unwrap();
+        let evidence =
+            benchmark_quality_evidence(&provider, Some(&senocr_quality_test_identity())).unwrap();
         assert_eq!(
             evidence.status,
             BenchmarkQualityEvidenceStatusV1::MismatchedSenocrEvidence
@@ -5913,26 +5924,26 @@ mod tests {
             manifest.distribution_count,
             SENOCR_REFERENCE_RUNTIME_DISTRIBUTION_COUNT
         );
-        assert_eq!(
-            manifest.python_version,
-            SENOCR_REFERENCE_PYTHON_VERSION
-        );
-        assert_eq!(
-            manifest.platform,
-            SENOCR_REFERENCE_PLATFORM
-        );
+        assert_eq!(manifest.python_version, SENOCR_REFERENCE_PYTHON_VERSION);
+        assert_eq!(manifest.platform, SENOCR_REFERENCE_PLATFORM);
         assert_eq!(manifest.installed_distribution_closure.len(), 41);
         assert_eq!(manifest.root_pins.len(), SENOCR_REFERENCE_ROOT_PIN_COUNT);
 
         let provider = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
-        let evidence = benchmark_quality_evidence(&provider, Some(&senocr_quality_test_identity()))
-            .unwrap();
+        let evidence =
+            benchmark_quality_evidence(&provider, Some(&senocr_quality_test_identity())).unwrap();
         let serialized_artifact_evidence = serde_json::to_vec(&evidence).unwrap();
         let restored: BenchmarkQualityEvidenceV1 =
             serde_json::from_slice(&serialized_artifact_evidence).unwrap();
         let restored_profile = restored.runtime_profile.unwrap();
-        assert_eq!(restored_profile.manifest_schema_version, manifest.schema_version);
-        assert_eq!(restored_profile.profile_manifest_sha256, SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256);
+        assert_eq!(
+            restored_profile.manifest_schema_version,
+            manifest.schema_version
+        );
+        assert_eq!(
+            restored_profile.profile_manifest_sha256,
+            SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256
+        );
         assert_eq!(restored_profile.distribution_count, 41);
         assert_eq!(
             restored_profile.installed_distribution_closure,
