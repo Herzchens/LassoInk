@@ -71,6 +71,34 @@ const MAX_NFD_MARK_SCALARS: usize = 4 * MAX_REFERENCE_TEXT_BYTES;
 const MAX_METRIC_DP_CELLS: usize = 1024 * 1024;
 const MAX_BOOTSTRAP_REPLICATES: u32 = 5_000;
 const MAX_TOTAL_BOOTSTRAP_CLUSTER_DRAWS: u64 = 10_000_000;
+const SENOCR_REFERENCE_PROVIDER_ID: &str = "senocr-v1-fp32-local";
+const SENOCR_REFERENCE_PROVIDER_VERSION: &str = "stdlib-senocr-fp32-worker-v1";
+const SENOCR_REFERENCE_CONFIGURATION_ID: &str = "senocr-v1-fp32-local";
+const SENOCR_REFERENCE_MODEL_REVISION: &str = "1e70dff4ef0429b0d88a2b873fb5d03300af1a41";
+const SENOCR_REFERENCE_RUNTIME_PROFILE_ID: &str = "senocr-runtime-profile-v1";
+const SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256: &str =
+    "3d6150df16fc91bf032638d88a02d30be6877f5b4e62da5682fa601d0fe1ac1c";
+const SENOCR_REFERENCE_RUNTIME_DISTRIBUTION_COUNT: u32 = 41;
+const SENOCR_REFERENCE_PYTHON_VERSION: &str = "3.13.17";
+const SENOCR_REFERENCE_PLATFORM: &str = "windows-x64";
+const MAX_SENOCR_RUNTIME_PROFILE_BYTES: usize = 64 * 1024;
+const SENOCR_REFERENCE_ROOT_PIN_COUNT: usize = 4;
+const SENOCR_RUNTIME_PROFILE_DOCUMENT: &[u8] =
+    include_bytes!("../tools/senocr_runtime_profile_v1.json");
+pub(crate) const SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES: [(&str, u64); 12] = [
+    ("added_tokens.json", 25_381),
+    ("chat_template.jinja", 1_474),
+    ("config.json", 2_059),
+    ("generation_config.json", 133),
+    ("model-00001-of-00001.safetensors", 3_834_433_136),
+    ("model.safetensors.index.json", 58_809),
+    ("preprocessor_config.json", 641),
+    ("processor_config.json", 137),
+    ("special_tokens_map.json", 1_151),
+    ("tokenizer.json", 11_189_060),
+    ("tokenizer.model", 1_614_363),
+    ("tokenizer_config.json", 186_947),
+];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -332,6 +360,109 @@ pub(crate) struct ProviderArtifactDigestV1 {
     pub observation: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BenchmarkQualityEvidenceStatusV1 {
+    /// A legacy row had no structured runtime/asset evidence. It is diagnostic
+    /// only and is not eligible for quality comparison.
+    LegacyUnassessed,
+    /// No configured provider-specific evidence policy makes this row
+    /// diagnostic only, not quality-eligible.
+    ProviderPolicyNotApplicable,
+    /// The declared runtime profile and all required prelaunch asset hashes match.
+    EligibleByDeclaredSenocrEvidence,
+    /// One or more required runtime or asset observations are absent.
+    IncompleteSenocrEvidence,
+    /// Supplied provider identity or asset mapping conflicts with the fixed policy.
+    MismatchedSenocrEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkRuntimeDistributionV1 {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkRuntimeProfileBindingV1 {
+    pub manifest_schema_version: u32,
+    pub profile_id: String,
+    pub profile_manifest_sha256: String,
+    pub distribution_count: u32,
+    pub python_version: String,
+    pub platform: String,
+    pub root_pins: Vec<BenchmarkRuntimeDistributionV1>,
+    pub installed_distribution_closure: Vec<BenchmarkRuntimeDistributionV1>,
+    pub observation_scope: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SenocrRuntimeProfileManifestV1 {
+    distribution_count: u32,
+    installed_distribution_closure: Vec<BenchmarkRuntimeDistributionV1>,
+    platform: String,
+    python_version: String,
+    root_pins: Vec<BenchmarkRuntimeDistributionV1>,
+    schema_version: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkModelAssetObservationV1 {
+    pub asset_name: String,
+    pub expected_byte_count: u64,
+    pub observed_byte_count: u64,
+    pub observed_sha256_hex: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BenchmarkModelAssetCoverageStatusV1 {
+    CompletePrelaunchObservations,
+    IncompletePrelaunchObservations,
+    MismatchedPrelaunchManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkModelAssetCoverageV1 {
+    pub model_revision: String,
+    pub required_asset_count: u32,
+    pub observed_asset_count: u32,
+    pub missing_asset_names: Vec<String>,
+    pub observed_assets: Vec<BenchmarkModelAssetObservationV1>,
+    pub status: BenchmarkModelAssetCoverageStatusV1,
+    pub observation_scope: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkQualityEvidenceV1 {
+    pub schema_version: u32,
+    pub status: BenchmarkQualityEvidenceStatusV1,
+    pub runtime_profile: Option<BenchmarkRuntimeProfileBindingV1>,
+    pub model_asset_coverage: Option<BenchmarkModelAssetCoverageV1>,
+    pub unavailable_reason: Option<String>,
+}
+
+impl Default for BenchmarkQualityEvidenceV1 {
+    fn default() -> Self {
+        Self {
+            schema_version: 0,
+            status: BenchmarkQualityEvidenceStatusV1::LegacyUnassessed,
+            runtime_profile: None,
+            model_asset_coverage: None,
+            unavailable_reason: Some(
+                "legacy benchmark row has no structured runtime/profile and complete model-asset evidence; not quality-eligible"
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BenchmarkArtifactHeaderV1 {
@@ -475,6 +606,10 @@ pub(crate) struct BenchmarkRunRecordV1 {
     pub artifact_digests: Vec<ProviderArtifactDigestV1>,
     pub model_artifact_digests: Vec<ProviderArtifactDigestV1>,
     pub model_artifact_hash_unavailable_reason: Option<String>,
+    /// Optional for backward-compatible parsing; missing fields mean legacy
+    /// evidence is unknown and cannot establish quality eligibility.
+    #[serde(default)]
+    pub quality_evidence: BenchmarkQualityEvidenceV1,
     pub elapsed_app_batch_call_wall_ns: u64,
     pub timing: Option<crate::provider_protocol::ProviderExecutionTimingV1>,
     pub timing_unavailable_reason: Option<String>,
@@ -1018,6 +1153,13 @@ struct PreparedBenchmarkProvider {
     approved: OperatorApprovedProviderConfig,
     timeouts: ProviderCallTimeouts,
     artifact_digests: Vec<ProviderArtifactDigestV1>,
+    senocr_asset_plan: Option<SenocrAssetPlan>,
+}
+
+#[derive(Clone, Debug)]
+struct SenocrAssetPlan {
+    artifact_id_by_asset_name: BTreeMap<String, String>,
+    mismatch_reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1388,6 +1530,7 @@ fn run_batch_cli_inner(
         .map_err(|error| {
             invalid_data(format!("invalid operator provider configuration: {error}"))
         })?;
+        let senocr_asset_plan = senocr_asset_plan_from_manifest(&provider);
         let timeouts = provider
             .timeouts
             .map(ProviderCallTimeouts::from)
@@ -1412,6 +1555,7 @@ fn run_batch_cli_inner(
             approved,
             timeouts,
             artifact_digests,
+            senocr_asset_plan,
         });
     }
 
@@ -1780,29 +1924,14 @@ fn successful_run_record(
     annotation: Option<&BenchmarkAnnotationCaseV1>,
     tokenization_policy: Option<BenchmarkTokenizationPolicyV1>,
 ) -> Result<BenchmarkRunRecordV1, io::Error> {
-    let (candidate_metrics, metric_evaluation_unavailable_reason) = match (
-        annotation,
-        tokenization_policy,
-    ) {
-        (Some(_), Some(_)) if execution.result.candidates.is_empty() => (
-            Vec::new(),
-            Some(
-                "text metrics unavailable because provider returned no rank-0 candidate".to_owned(),
-            ),
-        ),
-        (Some(annotation), Some(policy)) => {
-            match score_candidates(&execution.result, annotation, policy) {
-                Ok(metrics) => (metrics, None),
-                Err(error) => (
-                    Vec::new(),
-                    Some(format!(
-                        "text metrics unavailable; provider result and raw response are preserved: {error}"
-                    )),
-                ),
-            }
-        }
-        _ => (Vec::new(), None),
-    };
+    let quality_evidence = benchmark_quality_evidence(base.provider, Some(&execution.provider))?;
+    let (candidate_metrics, metric_evaluation_unavailable_reason) =
+        candidate_metrics_for_quality_evidence(
+            &execution.result,
+            annotation,
+            tokenization_policy,
+            &quality_evidence,
+        );
     let transcript = execution.raw_response_transcript;
     let raw_response_frames = encode_response_frames(transcript.frames)?;
     let (model_artifact_digests, model_artifact_hash_unavailable_reason) =
@@ -1852,6 +1981,7 @@ fn successful_run_record(
         artifact_digests: base.provider.artifact_digests.clone(),
         model_artifact_digests,
         model_artifact_hash_unavailable_reason,
+        quality_evidence,
         elapsed_app_batch_call_wall_ns,
         timing: Some(execution.timing),
         timing_unavailable_reason: None,
@@ -1886,6 +2016,41 @@ fn successful_run_record(
     Ok(run)
 }
 
+fn candidate_metrics_for_quality_evidence(
+    result: &RecognitionResultV1,
+    annotation: Option<&BenchmarkAnnotationCaseV1>,
+    tokenization_policy: Option<BenchmarkTokenizationPolicyV1>,
+    quality_evidence: &BenchmarkQualityEvidenceV1,
+) -> (Vec<BenchmarkCandidateMetricsV1>, Option<String>) {
+    if !quality_metrics_allowed(quality_evidence) {
+        return (
+            Vec::new(),
+            quality_evidence.unavailable_reason.clone().or_else(|| {
+                Some(
+                    "text metrics withheld because runtime/model evidence is not quality-eligible"
+                        .to_owned(),
+                )
+            }),
+        );
+    }
+    match (annotation, tokenization_policy) {
+        (Some(_), Some(_)) if result.candidates.is_empty() => (
+            Vec::new(),
+            Some("text metrics unavailable because provider returned no rank-0 candidate".to_owned()),
+        ),
+        (Some(annotation), Some(policy)) => match score_candidates(result, annotation, policy) {
+            Ok(metrics) => (metrics, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!(
+                    "text metrics unavailable; provider result and raw response are preserved: {error}"
+                )),
+            ),
+        },
+        _ => (Vec::new(), None),
+    }
+}
+
 fn failed_run_record(
     base: BenchmarkRunBase<'_>,
     error: ProviderExecutionError,
@@ -1894,6 +2059,7 @@ fn failed_run_record(
 ) -> Result<BenchmarkRunRecordV1, io::Error> {
     let category = failure_category(&error.kind);
     let transcript = error.raw_response_transcript;
+    let quality_evidence = benchmark_quality_evidence(base.provider, None)?;
     let (model_artifact_digests, model_artifact_hash_unavailable_reason) =
         model_artifact_hash_status(&base.provider.artifact_digests)?;
     Ok(BenchmarkRunRecordV1 {
@@ -1937,6 +2103,7 @@ fn failed_run_record(
         artifact_digests: base.provider.artifact_digests.clone(),
         model_artifact_digests,
         model_artifact_hash_unavailable_reason,
+        quality_evidence,
         elapsed_app_batch_call_wall_ns,
         timing: None,
         timing_unavailable_reason: Some(
@@ -2333,6 +2500,357 @@ fn resolve_provider_input_modalities(
     modalities.try_reserve_exact(resolved.len())?;
     modalities.extend_from_slice(resolved);
     Ok(modalities)
+}
+
+fn senocr_evidence_candidate(
+    provider_id: &str,
+    configuration_id: &str,
+    identity: Option<&ProviderIdentityV1>,
+) -> bool {
+    provider_id == SENOCR_REFERENCE_PROVIDER_ID
+        || configuration_id == SENOCR_REFERENCE_CONFIGURATION_ID
+        || identity.is_some_and(|value| value.provider_id == SENOCR_REFERENCE_PROVIDER_ID)
+}
+
+/// Retain only an in-memory basename→operator artifact-ID map. Paths are used
+/// for strict association checks and are never copied into benchmark evidence.
+fn senocr_asset_plan_from_manifest(
+    provider: &ApprovedBenchmarkProviderV1,
+) -> Option<SenocrAssetPlan> {
+    if !senocr_evidence_candidate(
+        &provider.provider_id,
+        &provider.protocol_configuration.configuration_id,
+        None,
+    ) {
+        return None;
+    }
+
+    let mut mismatch_reason = None;
+    if provider.protocol_configuration.configuration_id != SENOCR_REFERENCE_CONFIGURATION_ID {
+        mismatch_reason = Some(
+            "SenOCR evidence requires the fixed operator configuration ID".to_owned(),
+        );
+    }
+    let values = &provider.protocol_configuration.values;
+    let model_root = values
+        .get("asset_root")
+        .map(|value| PathBuf::from(value.as_str()));
+    if values.len() != 3
+        || values.get("model_id").map(String::as_str) != Some("VietAlphaLabs/SenOCR-Vi")
+        || values.get("model_revision").map(String::as_str)
+            != Some(SENOCR_REFERENCE_MODEL_REVISION)
+        || model_root
+            .as_deref()
+            .is_none_or(|path| require_local_absolute_path(path, "SenOCR model asset root").is_err())
+    {
+        mismatch_reason.get_or_insert_with(|| {
+            "SenOCR model configuration does not match the fixed local reference model".to_owned()
+        });
+    }
+
+    let mut artifact_id_by_asset_name = BTreeMap::new();
+    for artifact in &provider.artifacts {
+        if artifact.role == ProviderArtifactRoleV1::Executable {
+            if artifact.path != provider.executable_path {
+                mismatch_reason.get_or_insert_with(|| {
+                    "SenOCR artifact manifest contains an unexpected executable entry".to_owned()
+                });
+            }
+            continue;
+        }
+
+        let asset_name = artifact.path.file_name().and_then(|name| name.to_str());
+        let Some((expected_name, _expected_bytes)) = asset_name.and_then(|name| {
+            SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES
+                .iter()
+                .find(|(expected_name, _)| *expected_name == name)
+        }) else {
+            mismatch_reason.get_or_insert_with(|| {
+                "SenOCR artifact manifest contains an unrecognized non-executable asset".to_owned()
+            });
+            continue;
+        };
+        let root_matches = model_root
+            .as_deref()
+            .is_some_and(|root| artifact.path.parent() == Some(root));
+        if !root_matches {
+            mismatch_reason.get_or_insert_with(|| {
+                "SenOCR asset observations are not bound to the configured asset directory"
+                    .to_owned()
+            });
+            continue;
+        }
+        if artifact_id_by_asset_name
+            .insert((*expected_name).to_owned(), artifact.artifact_id.clone())
+            .is_some()
+        {
+            mismatch_reason.get_or_insert_with(|| {
+                "SenOCR artifact manifest maps multiple paths to one required asset".to_owned()
+            });
+        }
+    }
+
+    Some(SenocrAssetPlan {
+        artifact_id_by_asset_name,
+        mismatch_reason,
+    })
+}
+
+fn senocr_model_asset_coverage(
+    plan: Option<&SenocrAssetPlan>,
+    artifact_digests: &[ProviderArtifactDigestV1],
+) -> io::Result<BenchmarkModelAssetCoverageV1> {
+    let mut observed_assets = Vec::new();
+    let mut missing_asset_names = Vec::new();
+    let mut size_mismatch = false;
+    observed_assets.try_reserve_exact(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len())?;
+    missing_asset_names.try_reserve_exact(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len())?;
+    let Some(plan) = plan else {
+        for (name, _) in SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES {
+            missing_asset_names.push(name.to_owned());
+        }
+        return Ok(BenchmarkModelAssetCoverageV1 {
+            model_revision: SENOCR_REFERENCE_MODEL_REVISION.to_owned(),
+            required_asset_count: SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len() as u32,
+            observed_asset_count: 0,
+            missing_asset_names,
+            observed_assets,
+            status: BenchmarkModelAssetCoverageStatusV1::IncompletePrelaunchObservations,
+            observation_scope: "bounded prelaunch SHA-256 observations of operator-enumerated required asset paths; not authenticity, loaded-file identity, or a TOCTOU guarantee".to_owned(),
+        });
+    };
+    for (asset_name, expected_byte_count) in SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES {
+        let digest = plan
+            .artifact_id_by_asset_name
+            .get(asset_name)
+            .and_then(|artifact_id| {
+                artifact_digests
+                    .iter()
+                    .find(|artifact| artifact.artifact_id == *artifact_id)
+            });
+        let Some(digest) = digest.filter(|digest| {
+            digest.role != ProviderArtifactRoleV1::Executable
+                && validate_sha256_hex(&digest.sha256_hex, "SenOCR asset observation").is_ok()
+        }) else {
+            missing_asset_names.push(asset_name.to_owned());
+            continue;
+        };
+        size_mismatch |= digest.byte_count != expected_byte_count;
+        observed_assets.push(BenchmarkModelAssetObservationV1 {
+            asset_name: asset_name.to_owned(),
+            expected_byte_count,
+            observed_byte_count: digest.byte_count,
+            observed_sha256_hex: digest.sha256_hex.clone(),
+        });
+    }
+    let status = if plan.mismatch_reason.is_some() || size_mismatch {
+        BenchmarkModelAssetCoverageStatusV1::MismatchedPrelaunchManifest
+    } else if !missing_asset_names.is_empty() {
+        BenchmarkModelAssetCoverageStatusV1::IncompletePrelaunchObservations
+    } else {
+        BenchmarkModelAssetCoverageStatusV1::CompletePrelaunchObservations
+    };
+    Ok(BenchmarkModelAssetCoverageV1 {
+        model_revision: SENOCR_REFERENCE_MODEL_REVISION.to_owned(),
+        required_asset_count: SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len() as u32,
+        observed_asset_count: observed_assets.len() as u32,
+        missing_asset_names,
+        observed_assets,
+        status,
+        observation_scope: "complete means all fixed required files had matching configured basenames and expected byte counts and were hashed before launch; hashes do not authenticate the files or prove which bytes the provider loaded".to_owned(),
+    })
+}
+
+fn senocr_runtime_profile_binding(
+    identity: Option<&ProviderIdentityV1>,
+) -> io::Result<Result<BenchmarkRuntimeProfileBindingV1, BenchmarkQualityEvidenceStatusV1>> {
+    let Some(identity) = identity else {
+        return Ok(Err(
+            BenchmarkQualityEvidenceStatusV1::IncompleteSenocrEvidence,
+        ));
+    };
+    let expected_resource_version = format!(
+        "{SENOCR_REFERENCE_RUNTIME_PROFILE_ID}-sha256-{SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256}"
+    );
+    if identity.provider_id != SENOCR_REFERENCE_PROVIDER_ID
+        || identity.provider_version != SENOCR_REFERENCE_PROVIDER_VERSION
+        || identity.model_version.as_deref() != Some(SENOCR_REFERENCE_MODEL_REVISION)
+        || identity.resource_version.as_deref() != Some(expected_resource_version.as_str())
+    {
+        return Ok(Err(
+            BenchmarkQualityEvidenceStatusV1::MismatchedSenocrEvidence,
+        ));
+    }
+    let manifest = load_senocr_runtime_profile_manifest()?;
+    Ok(Ok(BenchmarkRuntimeProfileBindingV1 {
+        manifest_schema_version: manifest.schema_version,
+        profile_id: SENOCR_REFERENCE_RUNTIME_PROFILE_ID.to_owned(),
+        profile_manifest_sha256: SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256.to_owned(),
+        distribution_count: manifest.distribution_count,
+        python_version: manifest.python_version,
+        platform: manifest.platform,
+        root_pins: manifest.root_pins,
+        installed_distribution_closure: manifest.installed_distribution_closure,
+        observation_scope: "provider-declared runtime profile matched the checked-in full installed-distribution snapshot by SHA-256; not wheel authenticity or a proof of isolated-process state"
+            .to_owned(),
+    }))
+}
+
+fn load_senocr_runtime_profile_manifest() -> io::Result<SenocrRuntimeProfileManifestV1> {
+    let raw = SENOCR_RUNTIME_PROFILE_DOCUMENT;
+    if raw.is_empty() || raw.len() > MAX_SENOCR_RUNTIME_PROFILE_BYTES {
+        return Err(invalid_data(
+            "checked-in SenOCR runtime profile exceeds its fixed byte bounds",
+        ));
+    }
+    let payload = raw
+        .strip_suffix(b"\r\n")
+        .or_else(|| raw.strip_suffix(b"\n"))
+        .unwrap_or(raw);
+    if payload.is_empty() || payload.contains(&b'\r') || payload.contains(&b'\n') {
+        return Err(invalid_data(
+            "checked-in SenOCR runtime profile has invalid line endings",
+        ));
+    }
+    let actual_sha256 = hex_encode(&Sha256::digest(payload))?;
+    if actual_sha256 != SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256 {
+        return Err(invalid_data(
+            "checked-in SenOCR runtime profile digest differs from the fixed reference",
+        ));
+    }
+    let manifest: SenocrRuntimeProfileManifestV1 = serde_json::from_slice(payload)
+        .map_err(|_| invalid_data("checked-in SenOCR runtime profile is malformed"))?;
+    let canonical = serde_json::to_vec(&manifest)
+        .map_err(|_| invalid_data("checked-in SenOCR runtime profile cannot be serialized"))?;
+    if canonical.as_slice() != payload
+        || manifest.schema_version != 1
+        || manifest.distribution_count != SENOCR_REFERENCE_RUNTIME_DISTRIBUTION_COUNT
+        || manifest.installed_distribution_closure.len()
+            != SENOCR_REFERENCE_RUNTIME_DISTRIBUTION_COUNT as usize
+        || manifest.root_pins.len() != SENOCR_REFERENCE_ROOT_PIN_COUNT
+        || manifest.python_version != SENOCR_REFERENCE_PYTHON_VERSION
+        || manifest.platform != SENOCR_REFERENCE_PLATFORM
+    {
+        return Err(invalid_data(
+            "checked-in SenOCR runtime profile disagrees with its fixed schema or runtime identity",
+        ));
+    }
+
+    let mut previous_name: Option<&str> = None;
+    for distribution in &manifest.installed_distribution_closure {
+        if distribution.name.is_empty()
+            || distribution.name.len() > 128
+            || !distribution
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || distribution.version.is_empty()
+            || distribution.version.len() > 128
+            || !distribution.version.is_ascii()
+            || previous_name.is_some_and(|previous| previous >= distribution.name.as_str())
+        {
+            return Err(invalid_data(
+                "checked-in SenOCR runtime package catalog is not canonical",
+            ));
+        }
+        previous_name = Some(&distribution.name);
+    }
+    let mut previous_pin_name: Option<&str> = None;
+    for pin in &manifest.root_pins {
+        let matches_closure = manifest
+            .installed_distribution_closure
+            .iter()
+            .any(|distribution| distribution.name == pin.name && distribution.version == pin.version);
+        if !matches_closure
+            || previous_pin_name.is_some_and(|previous| previous >= pin.name.as_str())
+        {
+            return Err(invalid_data(
+                "checked-in SenOCR runtime root pins disagree with its package catalog",
+            ));
+        }
+        previous_pin_name = Some(&pin.name);
+    }
+    Ok(manifest)
+}
+
+fn benchmark_quality_evidence(
+    provider: &PreparedBenchmarkProvider,
+    identity: Option<&ProviderIdentityV1>,
+) -> io::Result<BenchmarkQualityEvidenceV1> {
+    if !senocr_evidence_candidate(&provider.provider_id, &provider.configuration_id, identity) {
+        return Ok(BenchmarkQualityEvidenceV1 {
+            schema_version: 1,
+            status: BenchmarkQualityEvidenceStatusV1::ProviderPolicyNotApplicable,
+            runtime_profile: None,
+            model_asset_coverage: None,
+            unavailable_reason: Some(
+                "no eligible provider-specific frozen runtime/profile and required-asset evidence policy is configured; raw output is diagnostic only and not quality-eligible"
+                    .to_owned(),
+            ),
+        });
+    }
+
+    let coverage = senocr_model_asset_coverage(
+        provider.senocr_asset_plan.as_ref(),
+        &provider.artifact_digests,
+    )?;
+    let mut mismatch_reason = provider
+        .senocr_asset_plan
+        .as_ref()
+        .and_then(|plan| plan.mismatch_reason.clone());
+    if provider.configuration_id != SENOCR_REFERENCE_CONFIGURATION_ID {
+        mismatch_reason.get_or_insert_with(|| {
+            "SenOCR result is not bound to the fixed operator configuration ID".to_owned()
+        });
+    }
+    let (runtime_profile, runtime_status) = match senocr_runtime_profile_binding(identity)? {
+        Ok(binding) => (Some(binding), None),
+        Err(status) => (None, Some(status)),
+    };
+    if coverage.status == BenchmarkModelAssetCoverageStatusV1::MismatchedPrelaunchManifest {
+        mismatch_reason.get_or_insert_with(|| {
+            "SenOCR required-asset manifest or observed byte counts do not match the fixed inventory"
+                .to_owned()
+        });
+    }
+
+    let (status, reason) = if mismatch_reason.is_some()
+        || runtime_status == Some(BenchmarkQualityEvidenceStatusV1::MismatchedSenocrEvidence)
+    {
+        (
+            BenchmarkQualityEvidenceStatusV1::MismatchedSenocrEvidence,
+            mismatch_reason.or_else(|| {
+                Some("SenOCR provider identity or declared runtime profile mismatched the fixed reference".to_owned())
+            }),
+        )
+    } else if runtime_profile.is_none()
+        || coverage.status != BenchmarkModelAssetCoverageStatusV1::CompletePrelaunchObservations
+    {
+        (
+            BenchmarkQualityEvidenceStatusV1::IncompleteSenocrEvidence,
+            Some(
+                "SenOCR runtime profile or all 12 required prelaunch model-asset observations are unavailable; result is diagnostic only and excluded from quality comparisons"
+                    .to_owned(),
+            ),
+        )
+    } else {
+        (
+            BenchmarkQualityEvidenceStatusV1::EligibleByDeclaredSenocrEvidence,
+            None,
+        )
+    };
+    Ok(BenchmarkQualityEvidenceV1 {
+        schema_version: 1,
+        status,
+        runtime_profile,
+        model_asset_coverage: Some(coverage),
+        unavailable_reason: reason,
+    })
+}
+
+fn quality_metrics_allowed(evidence: &BenchmarkQualityEvidenceV1) -> bool {
+    // Do not treat missing policy/evidence as an implicit approval.
+    evidence.status == BenchmarkQualityEvidenceStatusV1::EligibleByDeclaredSenocrEvidence
 }
 
 fn validate_provider_spec(provider: &ApprovedBenchmarkProviderV1) -> io::Result<()> {
@@ -3895,6 +4413,115 @@ mod tests {
         }
     }
 
+    fn senocr_quality_test_provider(asset_count: usize) -> PreparedBenchmarkProvider {
+        let executable_path = PathBuf::from(r"C:\python\python.exe");
+        let asset_root = PathBuf::from(r"C:\runner\models\senocr");
+        let configuration = ProviderConfigurationV1 {
+            configuration_id: SENOCR_REFERENCE_CONFIGURATION_ID.to_owned(),
+            values: BTreeMap::from([
+                ("asset_root".to_owned(), asset_root.to_string_lossy().into_owned()),
+                ("model_id".to_owned(), "VietAlphaLabs/SenOCR-Vi".to_owned()),
+                (
+                    "model_revision".to_owned(),
+                    SENOCR_REFERENCE_MODEL_REVISION.to_owned(),
+                ),
+            ]),
+        };
+        let mut artifacts = vec![ProviderArtifactPathV1 {
+            artifact_id: "python-executable".to_owned(),
+            role: ProviderArtifactRoleV1::Executable,
+            path: executable_path.clone(),
+        }];
+        let mut artifact_digests = vec![ProviderArtifactDigestV1 {
+            artifact_id: "python-executable".to_owned(),
+            role: ProviderArtifactRoleV1::Executable,
+            byte_count: 1,
+            sha256_hex: hex_encode(&Sha256::digest(b"python")).unwrap(),
+            observation: "test-only".to_owned(),
+        }];
+        for (index, (asset_name, byte_count)) in SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES
+            .iter()
+            .take(asset_count)
+            .enumerate()
+        {
+            let artifact_id = format!("required-asset-{index:02}");
+            artifacts.push(ProviderArtifactPathV1 {
+                artifact_id: artifact_id.clone(),
+                role: ProviderArtifactRoleV1::Resource,
+                path: asset_root.join(*asset_name),
+            });
+            artifact_digests.push(ProviderArtifactDigestV1 {
+                artifact_id,
+                role: ProviderArtifactRoleV1::Resource,
+                byte_count: *byte_count,
+                sha256_hex: hex_encode(&Sha256::digest(asset_name.as_bytes())).unwrap(),
+                observation: "test-only prelaunch digest".to_owned(),
+            });
+        }
+        let manifest = ApprovedBenchmarkProviderV1 {
+            provider_id: SENOCR_REFERENCE_PROVIDER_ID.to_owned(),
+            executable_path: executable_path.clone(),
+            arguments: Vec::new(),
+            requested_input_modalities: Some(vec![ProviderInputCapabilityV1::Raster]),
+            protocol_configuration: configuration.clone(),
+            artifacts,
+            timeouts: None,
+        };
+        let senocr_asset_plan = senocr_asset_plan_from_manifest(&manifest);
+        let approved = OperatorApprovedProviderConfig::from_explicit_selection(
+            manifest.provider_id.clone(),
+            executable_path,
+            manifest.arguments.clone(),
+            configuration.clone(),
+        )
+        .unwrap();
+        PreparedBenchmarkProvider {
+            provider_id: manifest.provider_id,
+            configuration,
+            configuration_id: SENOCR_REFERENCE_CONFIGURATION_ID.to_owned(),
+            approved,
+            timeouts: ProviderCallTimeouts::default(),
+            artifact_digests,
+            senocr_asset_plan,
+        }
+    }
+
+    fn senocr_quality_test_identity() -> ProviderIdentityV1 {
+        ProviderIdentityV1 {
+            provider_id: SENOCR_REFERENCE_PROVIDER_ID.to_owned(),
+            provider_version: SENOCR_REFERENCE_PROVIDER_VERSION.to_owned(),
+            model_version: Some(SENOCR_REFERENCE_MODEL_REVISION.to_owned()),
+            resource_version: Some(format!(
+                "{SENOCR_REFERENCE_RUNTIME_PROFILE_ID}-sha256-{SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256}"
+            )),
+        }
+    }
+
+    fn senocr_quality_test_result(text: &str) -> RecognitionResultV1 {
+        RecognitionResultV1 {
+            request_id: "quality-gate-test-request".to_owned(),
+            input_view_id: "quality-gate-test-view".to_owned(),
+            source_revision: ProviderSourceRevisionV1 {
+                journal_id: "quality-gate-test-journal".to_owned(),
+                logical_revision: 1,
+                last_sequence: 12,
+            },
+            region_id: "quality-gate-test-region".to_owned(),
+            line_id: "quality-gate-test-line".to_owned(),
+            provider_configuration_id: SENOCR_REFERENCE_CONFIGURATION_ID.to_owned(),
+            provider_configuration_fingerprint: "a".repeat(64),
+            provider: senocr_quality_test_identity(),
+            provider_provenance: "test-only quality evidence gate fixture".to_owned(),
+            consumed_input_modalities: vec![ProviderInputCapabilityV1::Raster],
+            candidates: vec![crate::provider_protocol::ProviderCandidateV1 {
+                recognized_text: text.to_owned(),
+                native_score_raw: None,
+                stroke_ranges: Vec::new(),
+                raw_candidate: serde_json::json!({"text": text}),
+            }],
+        }
+    }
+
     fn case_with_split(
         case_id: &str,
         writer_key: &str,
@@ -4978,6 +5605,340 @@ mod tests {
             model_artifact_hash_status(&[executable, model.clone()]).unwrap();
         assert_eq!(model_artifacts, vec![model]);
         assert!(reason.is_none());
+    }
+
+    #[test]
+    fn senocr_quality_evidence_binds_profile_and_all_twelve_prelaunch_asset_hashes() {
+        let provider = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
+        let evidence = benchmark_quality_evidence(&provider, Some(&senocr_quality_test_identity()))
+            .unwrap();
+        assert_eq!(
+            evidence.status,
+            BenchmarkQualityEvidenceStatusV1::EligibleByDeclaredSenocrEvidence
+        );
+        let profile = evidence.runtime_profile.as_ref().unwrap();
+        assert_eq!(profile.profile_id, SENOCR_REFERENCE_RUNTIME_PROFILE_ID);
+        assert_eq!(
+            profile.profile_manifest_sha256,
+            SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256
+        );
+        assert_eq!(profile.distribution_count, 41);
+        assert_eq!(profile.python_version, "3.13.17");
+        assert_eq!(profile.platform, "windows-x64");
+
+        let coverage = evidence.model_asset_coverage.as_ref().unwrap();
+        assert_eq!(coverage.model_revision, SENOCR_REFERENCE_MODEL_REVISION);
+        assert_eq!(coverage.required_asset_count, 12);
+        assert_eq!(coverage.observed_asset_count, 12);
+        assert!(coverage.missing_asset_names.is_empty());
+        assert_eq!(coverage.observed_assets.len(), 12);
+        assert_eq!(
+            coverage.status,
+            BenchmarkModelAssetCoverageStatusV1::CompletePrelaunchObservations
+        );
+        assert!(quality_metrics_allowed(&evidence));
+
+        let serialized = serde_json::to_string(&evidence).unwrap();
+        assert!(!serialized.contains(r"C:\runner\models\senocr"));
+        assert!(!serialized.contains("asset_root"));
+        assert!(serialized.contains(SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256));
+    }
+
+    #[test]
+    fn quality_scoring_requires_complete_runtime_and_model_asset_evidence() {
+        let annotation = annotation_for("case-1", "annotation-1", "xin chào");
+        let policy = BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1;
+        let result = senocr_quality_test_result("xin chào");
+
+        let complete_provider =
+            senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
+        let complete_evidence =
+            benchmark_quality_evidence(&complete_provider, Some(&senocr_quality_test_identity()))
+                .unwrap();
+        let (complete_metrics, complete_reason) = candidate_metrics_for_quality_evidence(
+            &result,
+            Some(&annotation),
+            Some(policy),
+            &complete_evidence,
+        );
+        assert_eq!(complete_metrics.len(), 1);
+        assert_eq!(
+            complete_metrics[0]
+                .nfc_unicode_scalar_cer
+                .as_ref()
+                .unwrap()
+                .errors,
+            0
+        );
+        assert!(complete_reason.is_none());
+
+        let partial_provider =
+            senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len() - 1);
+        let partial_evidence =
+            benchmark_quality_evidence(&partial_provider, Some(&senocr_quality_test_identity()))
+                .unwrap();
+        let (partial_metrics, partial_reason) = candidate_metrics_for_quality_evidence(
+            &result,
+            Some(&annotation),
+            Some(policy),
+            &partial_evidence,
+        );
+        assert!(partial_metrics.is_empty());
+        assert!(partial_reason.is_some());
+
+        let mut mismatched_identity = senocr_quality_test_identity();
+        mismatched_identity.resource_version = Some("different-runtime-profile".to_owned());
+        let mismatched_evidence =
+            benchmark_quality_evidence(&complete_provider, Some(&mismatched_identity)).unwrap();
+        let (mismatched_metrics, mismatched_reason) = candidate_metrics_for_quality_evidence(
+            &result,
+            Some(&annotation),
+            Some(policy),
+            &mismatched_evidence,
+        );
+        assert!(mismatched_metrics.is_empty());
+        assert!(mismatched_reason.is_some());
+        assert_eq!(result.candidates[0].recognized_text, "xin chào");
+    }
+
+    #[test]
+    fn unbound_provider_ground_truth_metrics_do_not_enter_paired_comparisons() {
+        let annotation = annotation_for("case-1", "annotation-1", "xin chào");
+        let policy = BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1;
+        let mut unbound_provider = senocr_quality_test_provider(0);
+        unbound_provider.provider_id = "mock-provider".to_owned();
+        unbound_provider.configuration_id = "mock-configuration".to_owned();
+        unbound_provider.configuration.configuration_id = "mock-configuration".to_owned();
+        let unbound_identity = ProviderIdentityV1 {
+            provider_id: "mock-provider".to_owned(),
+            provider_version: "test-only-mock".to_owned(),
+            model_version: None,
+            resource_version: None,
+        };
+        let unbound_evidence =
+            benchmark_quality_evidence(&unbound_provider, Some(&unbound_identity)).unwrap();
+        assert_eq!(
+            unbound_evidence.status,
+            BenchmarkQualityEvidenceStatusV1::ProviderPolicyNotApplicable
+        );
+        assert!(!quality_metrics_allowed(&unbound_evidence));
+
+        let mut unbound_result = senocr_quality_test_result("xin chào");
+        unbound_result.provider = unbound_identity;
+        unbound_result.provider_configuration_id = "mock-configuration".to_owned();
+        let (unbound_metrics, unbound_reason) = candidate_metrics_for_quality_evidence(
+            &unbound_result,
+            Some(&annotation),
+            Some(policy),
+            &unbound_evidence,
+        );
+        assert!(unbound_metrics.is_empty());
+        assert!(unbound_reason.is_some());
+
+        let senocr_provider =
+            senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
+        let senocr_evidence =
+            benchmark_quality_evidence(&senocr_provider, Some(&senocr_quality_test_identity()))
+                .unwrap();
+        let (senocr_metrics, senocr_reason) = candidate_metrics_for_quality_evidence(
+            &senocr_quality_test_result("xin chào"),
+            Some(&annotation),
+            Some(policy),
+            &senocr_evidence,
+        );
+        assert_eq!(senocr_metrics.len(), 1);
+        assert!(senocr_reason.is_none());
+
+        let observations = vec![
+            EvaluationObservation {
+                case_id: "case-1".to_owned(),
+                provider_id: "mock-provider".to_owned(),
+                configuration_id: "mock-configuration".to_owned(),
+                split: BenchmarkSplitV1::Evaluation,
+                writer_key: "writer-1".to_owned(),
+                session_key: "session-1".to_owned(),
+                cer: unbound_metrics
+                    .first()
+                    .and_then(|metrics| metrics.nfc_unicode_scalar_cer.clone()),
+                wer: unbound_metrics
+                    .first()
+                    .and_then(|metrics| metrics.whitespace_token_syllable_wer.clone()),
+            },
+            EvaluationObservation {
+                case_id: "case-1".to_owned(),
+                provider_id: SENOCR_REFERENCE_PROVIDER_ID.to_owned(),
+                configuration_id: SENOCR_REFERENCE_CONFIGURATION_ID.to_owned(),
+                split: BenchmarkSplitV1::Evaluation,
+                writer_key: "writer-1".to_owned(),
+                session_key: "session-1".to_owned(),
+                cer: senocr_metrics[0].nfc_unicode_scalar_cer.clone(),
+                wer: senocr_metrics[0].whitespace_token_syllable_wer.clone(),
+            },
+        ];
+        let corpus = BenchmarkCorpusManifestV1 {
+            schema_version: BENCHMARK_SCHEMA_VERSION,
+            corpus_id: "quality-gate-corpus".to_owned(),
+            split_key: BenchmarkSplitKeyV1::Session,
+            bootstrap_cluster: BenchmarkClusterKeyV1::Session,
+            bootstrap_seed: 1,
+            bootstrap_replicates: 100,
+            tokenization_policy: policy,
+            cases: vec![annotation],
+        };
+        let comparisons =
+            build_paired_comparisons_with_work_budget(&observations, &corpus, 10_000).unwrap();
+        assert_eq!(comparisons.len(), 1);
+        assert_eq!(comparisons[0].nfc_cer_paired_case_count, 0);
+        assert_eq!(comparisons[0].whitespace_syllable_wer_paired_case_count, 0);
+        assert!(comparisons[0].nfc_cer_rate_difference.is_none());
+        assert!(comparisons[0].whitespace_syllable_wer_rate_difference.is_none());
+        assert!(comparisons[0]
+            .nfc_cer_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no paired cases")));
+    }
+
+    #[test]
+    fn senocr_quality_evidence_withholds_metrics_for_missing_asset_identity_and_size_mismatches() {
+        let partial = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len() - 1);
+        let partial_evidence =
+            benchmark_quality_evidence(&partial, Some(&senocr_quality_test_identity())).unwrap();
+        assert_eq!(
+            partial_evidence.status,
+            BenchmarkQualityEvidenceStatusV1::IncompleteSenocrEvidence
+        );
+        let partial_coverage = partial_evidence.model_asset_coverage.as_ref().unwrap();
+        assert_eq!(partial_coverage.observed_asset_count, 11);
+        assert_eq!(partial_coverage.missing_asset_names.len(), 1);
+        assert_eq!(
+            partial_coverage.missing_asset_names[0],
+            SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES[11].0
+        );
+        assert!(!quality_metrics_allowed(&partial_evidence));
+
+        let complete = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
+        let mut wrong_identity = senocr_quality_test_identity();
+        wrong_identity.resource_version = Some("different-runtime-profile".to_owned());
+        let identity_evidence = benchmark_quality_evidence(&complete, Some(&wrong_identity)).unwrap();
+        assert_eq!(
+            identity_evidence.status,
+            BenchmarkQualityEvidenceStatusV1::MismatchedSenocrEvidence
+        );
+        assert!(identity_evidence.runtime_profile.is_none());
+        assert!(!quality_metrics_allowed(&identity_evidence));
+
+        let mut wrong_size = complete;
+        wrong_size.artifact_digests[1].byte_count += 1;
+        let size_evidence = benchmark_quality_evidence(
+            &wrong_size,
+            Some(&senocr_quality_test_identity()),
+        )
+        .unwrap();
+        assert_eq!(
+            size_evidence.status,
+            BenchmarkQualityEvidenceStatusV1::MismatchedSenocrEvidence
+        );
+        assert_eq!(
+            size_evidence.model_asset_coverage.as_ref().unwrap().status,
+            BenchmarkModelAssetCoverageStatusV1::MismatchedPrelaunchManifest
+        );
+        assert!(!quality_metrics_allowed(&size_evidence));
+    }
+
+    #[test]
+    fn senocr_quality_evidence_rejects_artifact_paths_outside_configured_root() {
+        let mut provider = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
+        let mut manifest = ApprovedBenchmarkProviderV1 {
+            provider_id: provider.provider_id.clone(),
+            executable_path: PathBuf::from(r"C:\python\python.exe"),
+            arguments: Vec::new(),
+            requested_input_modalities: Some(vec![ProviderInputCapabilityV1::Raster]),
+            protocol_configuration: provider.configuration.clone(),
+            artifacts: Vec::new(),
+            timeouts: None,
+        };
+        let root = PathBuf::from(r"C:\runner\models\senocr");
+        for (index, (asset_name, _)) in SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.iter().enumerate() {
+            manifest.artifacts.push(ProviderArtifactPathV1 {
+                artifact_id: format!("required-asset-{index:02}"),
+                role: ProviderArtifactRoleV1::Resource,
+                path: if index == 0 {
+                    PathBuf::from(r"C:\runner\different\added_tokens.json")
+                } else {
+                    root.join(*asset_name)
+                },
+            });
+        }
+        manifest.artifacts.insert(
+            0,
+            ProviderArtifactPathV1 {
+                artifact_id: "python-executable".to_owned(),
+                role: ProviderArtifactRoleV1::Executable,
+                path: PathBuf::from(r"C:\python\python.exe"),
+            },
+        );
+        provider.senocr_asset_plan = senocr_asset_plan_from_manifest(&manifest);
+        let evidence = benchmark_quality_evidence(&provider, Some(&senocr_quality_test_identity()))
+            .unwrap();
+        assert_eq!(
+            evidence.status,
+            BenchmarkQualityEvidenceStatusV1::MismatchedSenocrEvidence
+        );
+        assert!(!quality_metrics_allowed(&evidence));
+        let serialized = serde_json::to_string(&evidence).unwrap();
+        assert!(!serialized.contains(r"C:\runner\different"));
+    }
+
+    #[test]
+    fn legacy_benchmark_rows_default_to_unassessed_quality_evidence() {
+        #[derive(Deserialize)]
+        struct LegacyEvidenceField {
+            #[serde(default)]
+            quality_evidence: BenchmarkQualityEvidenceV1,
+        }
+
+        let legacy: LegacyEvidenceField = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            legacy.quality_evidence.status,
+            BenchmarkQualityEvidenceStatusV1::LegacyUnassessed
+        );
+        assert!(!quality_metrics_allowed(&legacy.quality_evidence));
+        assert!(legacy.quality_evidence.unavailable_reason.is_some());
+    }
+
+    #[test]
+    fn senocr_profile_binding_matches_the_checked_in_full_manifest() {
+        let manifest = load_senocr_runtime_profile_manifest().unwrap();
+        assert_eq!(
+            manifest.distribution_count,
+            SENOCR_REFERENCE_RUNTIME_DISTRIBUTION_COUNT
+        );
+        assert_eq!(
+            manifest.python_version,
+            SENOCR_REFERENCE_PYTHON_VERSION
+        );
+        assert_eq!(
+            manifest.platform,
+            SENOCR_REFERENCE_PLATFORM
+        );
+        assert_eq!(manifest.installed_distribution_closure.len(), 41);
+        assert_eq!(manifest.root_pins.len(), SENOCR_REFERENCE_ROOT_PIN_COUNT);
+
+        let provider = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
+        let evidence = benchmark_quality_evidence(&provider, Some(&senocr_quality_test_identity()))
+            .unwrap();
+        let serialized_artifact_evidence = serde_json::to_vec(&evidence).unwrap();
+        let restored: BenchmarkQualityEvidenceV1 =
+            serde_json::from_slice(&serialized_artifact_evidence).unwrap();
+        let restored_profile = restored.runtime_profile.unwrap();
+        assert_eq!(restored_profile.manifest_schema_version, manifest.schema_version);
+        assert_eq!(restored_profile.profile_manifest_sha256, SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256);
+        assert_eq!(restored_profile.distribution_count, 41);
+        assert_eq!(
+            restored_profile.installed_distribution_closure,
+            manifest.installed_distribution_closure
+        );
+        assert_eq!(restored_profile.root_pins, manifest.root_pins);
     }
 
     #[test]
