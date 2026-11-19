@@ -6407,7 +6407,11 @@ mod tests {
                         });
                     format!(
                         "provider_failure:{}",
-                        if safe_code { code.as_str() } else { "<redacted>" }
+                        if safe_code {
+                            code.as_str()
+                        } else {
+                            "<redacted>"
+                        }
                     )
                 }
                 ProviderErrorKind::InvalidConfiguration(_) => "invalid_configuration".to_owned(),
@@ -6423,14 +6427,18 @@ mod tests {
                 ProviderErrorKind::UnexpectedFrame(_) => "unexpected_frame".to_owned(),
                 ProviderErrorKind::UnsupportedCapability(_) => "unsupported_capability".to_owned(),
                 ProviderErrorKind::StaleSourceRevision => "stale_source_revision".to_owned(),
-                ProviderErrorKind::ProviderRequestMismatch => "provider_request_mismatch".to_owned(),
+                ProviderErrorKind::ProviderRequestMismatch => {
+                    "provider_request_mismatch".to_owned()
+                }
                 ProviderErrorKind::ProviderConfigurationMismatch => {
                     "provider_configuration_mismatch".to_owned()
                 }
                 ProviderErrorKind::WorkerThreadPanicked => "worker_thread_panicked".to_owned(),
                 ProviderErrorKind::UnsupportedPlatform => "unsupported_platform".to_owned(),
                 ProviderErrorKind::WorkerCapacityReached => "worker_capacity_reached".to_owned(),
-                ProviderErrorKind::WorkerSubsystemPoisoned => "worker_subsystem_poisoned".to_owned(),
+                ProviderErrorKind::WorkerSubsystemPoisoned => {
+                    "worker_subsystem_poisoned".to_owned()
+                }
                 ProviderErrorKind::ProcessCleanupFailed(_) => "process_cleanup_failed".to_owned(),
                 ProviderErrorKind::AllocationFailed => "allocation_failed".to_owned(),
             };
