@@ -6390,6 +6390,11 @@ mod tests {
             );
         }
         assert!(!benchmark_text.contains(&png_hex));
+        // The benchmark worker recreates this one-shot sidecar; the next
+        // guarded negative call correctly rejects a pre-existing sidecar.
+        assert!(sidecar_path.is_file());
+        fs::remove_file(&sidecar_path).unwrap();
+        assert!(!sidecar_path.exists());
 
         let expect_worker_failure = |request: RecognitionRequestV1, expected_code: &str| {
             let case_label = request.request_id.clone();
