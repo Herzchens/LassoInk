@@ -6287,7 +6287,7 @@ mod tests {
             schema_version: 1,
             providers: vec![ApprovedBenchmarkProviderV1 {
                 provider_id: "senocr-v1-fp32-local".to_owned(),
-                executable_path: python_executable,
+                executable_path: python_executable.clone(),
                 arguments: vec![worker_script.to_string_lossy().into_owned()],
                 requested_input_modalities: Some(vec![ProviderInputCapabilityV1::Raster]),
                 protocol_configuration: benchmark_configuration,
