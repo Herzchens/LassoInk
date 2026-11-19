@@ -21,7 +21,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 REPOSITORY = "Herzchens/LassoInk"
-REQUIRED_BRANCH = "feat/raster-reference-protocol"
+REQUIRED_BRANCH = "feat/benchmark-fidelity"
 MODEL_REPOSITORY = "VietAlphaLabs/SenOCR-Vi"
 MODEL_REVISION = "1e70dff4ef0429b0d88a2b873fb5d03300af1a41"
 MODEL_INDEX_FILE = "model.safetensors.index.json"

@@ -10,7 +10,6 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import hashlib
-import importlib.metadata
 import io
 import json
 import logging
@@ -32,6 +31,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools import raster_reference_protocol as protocol
+from tools import senocr_runtime_profile as runtime_profile
 
 
 MODEL_REPOSITORY = "VietAlphaLabs/SenOCR-Vi"
@@ -79,17 +79,17 @@ MAX_E2E_PROCESSOR_TENSOR_BYTES = 32 * 1024 * 1024
 MAX_E2E_SIDECAR_BYTES = 16 * 1024
 MAX_RASTER_PIXELS = protocol.MAX_TOTAL_RAW_SAMPLE_BYTES
 MAX_RASTER_BYTES = protocol.MAX_RASTER_INPUT_BYTES
-EXPECTED_PYTHON = (3, 13, 17)
-EXPECTED_TORCH = "2.15.0+cpu"
-EXPECTED_TRANSFORMERS = "5.23.0"
-EXPECTED_PILLOW = "13.0.0"
-EXPECTED_JINJA2 = "3.1.6"
+EXPECTED_PYTHON = tuple(
+    int(part) for part in runtime_profile.EXPECTED_PYTHON_VERSION.split(".")
+)
 
 SENOCR_PROVIDER_IDENTITY: dict[str, object] = {
     "provider_id": "senocr-v1-fp32-local",
     "provider_version": "stdlib-senocr-fp32-worker-v1",
     "model_version": MODEL_REVISION,
-    "resource_version": "transformers-5.23.0;torch-2.15.0+cpu;pillow-13.0.0",
+    # This identifies only the declared runtime package profile; it is not a
+    # wheel-authenticity or loaded-file-integrity assertion.
+    "resource_version": f"senocr-runtime-profile-v1-sha256-{runtime_profile.PROFILE_SHA256}",
 }
 SENOCR_CAPABILITIES: dict[str, object] = {
     "inputs": ["raster"],
@@ -97,7 +97,8 @@ SENOCR_CAPABILITIES: dict[str, object] = {
     "languages": ["vi-VN"],
 }
 SENOCR_PROVIDER_PROVENANCE = (
-    f"{MODEL_REPOSITORY}@{MODEL_REVISION}; full-precision; built-in CPU runtime"
+    f"{MODEL_REPOSITORY}@{MODEL_REVISION}; full-precision; built-in CPU runtime; "
+    f"runtime-profile-v1-sha256={runtime_profile.PROFILE_SHA256}"
 )
 
 
@@ -378,14 +379,10 @@ def _validate_runtime_versions() -> None:
     if sys.version_info[:3] != EXPECTED_PYTHON:
         raise protocol.WorkerFailure("runtime_version_mismatch")
     try:
-        if (
-            importlib.metadata.version("torch") != EXPECTED_TORCH
-            or importlib.metadata.version("transformers") != EXPECTED_TRANSFORMERS
-            or importlib.metadata.version("Pillow") != EXPECTED_PILLOW
-            or importlib.metadata.version("Jinja2") != EXPECTED_JINJA2
-        ):
-            raise protocol.WorkerFailure("runtime_version_mismatch")
-    except importlib.metadata.PackageNotFoundError:
+        profile, _profile_digest = runtime_profile.load_profile()
+        installed = runtime_profile.installed_distribution_versions()
+        runtime_profile.validate_installed_distribution_closure(profile, installed)
+    except runtime_profile.RuntimeProfileError:
         raise protocol.WorkerFailure("runtime_version_mismatch") from None
 
 
@@ -545,9 +542,9 @@ def _senocr_e2e_shared_files() -> tuple[Path, Path] | None:
         "RUNNER_ARCH": "X64",
         "GITHUB_REPOSITORY": "Herzchens/LassoInk",
         "GITHUB_EVENT_NAME": "pull_request",
-        "GITHUB_HEAD_REF": "feat/raster-reference-protocol",
+        "GITHUB_HEAD_REF": "feat/benchmark-fidelity",
         "LASSOINK_EXPECTED_HEAD_REPOSITORY": "Herzchens/LassoInk",
-        "LASSOINK_EXPECTED_HEAD_REF": "feat/raster-reference-protocol",
+        "LASSOINK_EXPECTED_HEAD_REF": "feat/benchmark-fidelity",
         "LASSOINK_RUN_SENOCR_CPU_COMPAT": "1",
     }
     if sys.platform != "win32" or platform.machine().lower() not in {"amd64", "x86_64"}:
@@ -902,6 +899,7 @@ def _process_senocr_request_after_context_guard(
 ) -> str:
     """Verify local artifacts, fully decode PNG, then lazily load/infer on CPU."""
     validate_senocr_provider_configuration(request["provider_configuration"])
+    _validate_runtime_versions()
     temp_parent = Path(tempfile.gettempdir())
     _validate_cpu_platform_and_resources(temp_parent)
     try:

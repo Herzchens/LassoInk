@@ -4368,12 +4368,12 @@ mod tests {
         );
         assert!(
             std::env::var("LASSOINK_EXPECTED_HEAD_REF")
-                .is_ok_and(|actual| actual == "feat/raster-reference-protocol")
+                .is_ok_and(|actual| actual == "feat/benchmark-fidelity")
         );
         assert!(std::env::var("GITHUB_EVENT_NAME").is_ok_and(|actual| actual == "pull_request"));
         assert!(
             std::env::var("GITHUB_HEAD_REF")
-                .is_ok_and(|actual| actual == "feat/raster-reference-protocol")
+                .is_ok_and(|actual| actual == "feat/benchmark-fidelity")
         );
         assert!(std::env::var("RUNNER_ARCH").is_ok_and(|actual| actual == "X64"));
     }
@@ -6191,16 +6191,269 @@ mod tests {
         );
         fs::remove_file(&sidecar_path).unwrap();
 
+        // Exercise the same production benchmark path with the real guarded
+        // local worker. The temporary artifact must bind the full frozen
+        // runtime profile and every required asset observation without
+        // copying the operator paths or raster bytes.
+        let benchmark_case_path = shared_dir.join("benchmark-case.json");
+        let benchmark_provider_path = shared_dir.join("benchmark-provider.json");
+        let benchmark_case = BenchmarkCaseManifestV1 {
+            schema_version: 1,
+            batch_id: "senocr-benchmark-e2e".to_owned(),
+            cases: vec![BenchmarkCaseSpecV1 {
+                case_id: "synthetic-case".to_owned(),
+                journal_path: journal_path.clone(),
+                expected_source_revision: source_revision.clone(),
+                region_id: "synthetic-senocr-region".to_owned(),
+                line_id: "synthetic-senocr-line".to_owned(),
+                coordinate_space: "canonical-raster-output-v1".to_owned(),
+                coordinate_units: "pixel".to_owned(),
+                language_hints: vec!["vi-VN".to_owned()],
+                requested_input_modalities: vec![ProviderInputCapabilityV1::Raster],
+                selected_strokes: vec![BenchmarkStrokeRefV1::from(&target)],
+                provenance: BenchmarkCaseProvenanceV1 {
+                    corpus_id: None,
+                    annotation_id: None,
+                    writer_key: "synthetic-writer".to_owned(),
+                    session_key: target.session_id.clone(),
+                    session_start_unix_ns: None,
+                    configuration_key: "synthetic-senocr-e2e-config".to_owned(),
+                    split: None,
+                    capture_api: None,
+                    capture_api_version: None,
+                    tablet_model: None,
+                    driver_version: None,
+                    windows_build: None,
+                    windows_ink_state: None,
+                    active_area: None,
+                    display_mapping: None,
+                    pressure_curve: None,
+                },
+                raster: None,
+                generated_raster: Some(BenchmarkGeneratedRasterSpecV1 {
+                    projection_schema_version: 1,
+                    output_width_px: width,
+                    output_height_px: height,
+                    source_crop: BenchmarkGeneratedRasterCropV1 {
+                        left_px: 0,
+                        top_px: 0,
+                        right_px_exclusive: 512,
+                        bottom_px_exclusive: 512,
+                    },
+                }),
+            }],
+        };
+        let benchmark_configuration = ProviderConfigurationV1 {
+            configuration_id: "senocr-v1-fp32-local".to_owned(),
+            values: BTreeMap::from([
+                (
+                    "asset_root".to_owned(),
+                    asset_root.to_string_lossy().into_owned(),
+                ),
+                ("model_id".to_owned(), "VietAlphaLabs/SenOCR-Vi".to_owned()),
+                (
+                    "model_revision".to_owned(),
+                    "1e70dff4ef0429b0d88a2b873fb5d03300af1a41".to_owned(),
+                ),
+            ]),
+        };
+        let mut benchmark_artifacts = vec![ProviderArtifactPathV1 {
+            artifact_id: "python-executable".to_owned(),
+            role: ProviderArtifactRoleV1::Executable,
+            path: python_executable.clone(),
+        }];
+        for (index, (asset_name, _expected_bytes)) in
+            benchmark::SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES
+                .iter()
+                .enumerate()
+        {
+            let role = match *asset_name {
+                "model-00001-of-00001.safetensors" => ProviderArtifactRoleV1::Model,
+                "added_tokens.json"
+                | "chat_template.jinja"
+                | "special_tokens_map.json"
+                | "tokenizer.json"
+                | "tokenizer.model"
+                | "tokenizer_config.json" => ProviderArtifactRoleV1::Tokenizer,
+                _ => ProviderArtifactRoleV1::Resource,
+            };
+            benchmark_artifacts.push(ProviderArtifactPathV1 {
+                artifact_id: format!("senocr-asset-{index:02}"),
+                role,
+                path: asset_root.join(*asset_name),
+            });
+        }
+        let benchmark_provider = BenchmarkProviderManifestV1 {
+            schema_version: 1,
+            providers: vec![ApprovedBenchmarkProviderV1 {
+                provider_id: "senocr-v1-fp32-local".to_owned(),
+                executable_path: python_executable.clone(),
+                arguments: vec![worker_script.to_string_lossy().into_owned()],
+                requested_input_modalities: Some(vec![ProviderInputCapabilityV1::Raster]),
+                protocol_configuration: benchmark_configuration,
+                artifacts: benchmark_artifacts,
+                timeouts: Some(BenchmarkTimeoutsV1 {
+                    handshake_ms: 30_000,
+                    recognition_ms: 120_000,
+                    shutdown_ms: 30_000,
+                }),
+            }],
+        };
+        fs::write(
+            &benchmark_case_path,
+            serde_json::to_vec(&benchmark_case).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &benchmark_provider_path,
+            serde_json::to_vec(&benchmark_provider).unwrap(),
+        )
+        .unwrap();
+        let benchmark_completion = benchmark::run_batch_cli_to_directory(
+            &benchmark_case_path,
+            &benchmark_provider_path,
+            None,
+            &shared_dir,
+        )
+        .unwrap_or_else(|_error| panic!("the guarded M5 benchmark run returned a failure"));
+        let benchmark_text = fs::read_to_string(&benchmark_completion.artifact_path).unwrap();
+        let benchmark_rows = benchmark_text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let run_row = benchmark_rows
+            .iter()
+            .find(|row| row["record_type"] == "run")
+            .expect("the benchmark artifact contains its run record");
+        let record = &run_row["record"];
+        let quality_evidence = &record["quality_evidence"];
+        assert_eq!(
+            quality_evidence["status"],
+            "eligible_by_declared_senocr_evidence"
+        );
+        assert_eq!(
+            quality_evidence["runtime_profile"]["profile_manifest_sha256"],
+            "3d6150df16fc91bf032638d88a02d30be6877f5b4e62da5682fa601d0fe1ac1c"
+        );
+        assert_eq!(
+            quality_evidence["runtime_profile"]["installed_distribution_closure"]
+                .as_array()
+                .unwrap()
+                .len(),
+            41
+        );
+        assert_eq!(
+            quality_evidence["model_asset_coverage"]["required_asset_count"],
+            12
+        );
+        assert_eq!(
+            quality_evidence["model_asset_coverage"]["observed_asset_count"],
+            12
+        );
+        assert_eq!(
+            quality_evidence["model_asset_coverage"]["status"],
+            "complete_prelaunch_observations"
+        );
+        assert_eq!(
+            quality_evidence["model_asset_coverage"]["observed_assets"]
+                .as_array()
+                .unwrap()
+                .len(),
+            12
+        );
+        assert!(record["candidate_metrics"].as_array().unwrap().is_empty());
+        assert_eq!(record["requested_input_modalities"][0], "raster");
+        assert_eq!(
+            record["provider_identity"]["provider_id"],
+            "senocr-v1-fp32-local"
+        );
+        let private_paths = vec![
+            asset_root.to_string_lossy().into_owned(),
+            python_executable.to_string_lossy().into_owned(),
+            worker_script.to_string_lossy().into_owned(),
+        ];
+        let injected_path_json = serde_json::to_string(&serde_json::json!({
+            "nested": {"paths": private_paths.clone()}
+        }))
+        .unwrap();
+        let injected_path_values: serde_json::Value =
+            serde_json::from_str(&injected_path_json).unwrap();
+        for private_path in &private_paths {
+            assert!(json_value_contains_string(
+                &injected_path_values,
+                private_path
+            ));
+            assert!(
+                !benchmark_rows
+                    .iter()
+                    .any(|row| json_value_contains_string(row, private_path))
+            );
+        }
+        assert!(!benchmark_text.contains(&png_hex));
+        // The benchmark worker recreates this one-shot sidecar; the next
+        // guarded negative call correctly rejects a pre-existing sidecar.
+        assert!(sidecar_path.is_file());
+        fs::remove_file(&sidecar_path).unwrap();
+        assert!(!sidecar_path.exists());
+
         let expect_worker_failure = |request: RecognitionRequestV1, expected_code: &str| {
+            let case_label = request.request_id.clone();
             let error = match run_senocr_worker_request(&python_executable, &worker_script, request)
             {
                 Ok(_execution) => panic!("invalid Raster request unexpectedly succeeded"),
                 Err(error) => error,
             };
-            assert!(matches!(
-                &error.kind,
-                ProviderErrorKind::ProviderFailure { code, .. } if code == expected_code
-            ));
+            let actual_error_kind_code = match &error.kind {
+                ProviderErrorKind::ProviderFailure { code, .. } => {
+                    let safe_code = !code.is_empty()
+                        && code.len() <= 64
+                        && code.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+                        });
+                    format!(
+                        "provider_failure:{}",
+                        if safe_code {
+                            code.as_str()
+                        } else {
+                            "<redacted>"
+                        }
+                    )
+                }
+                ProviderErrorKind::InvalidConfiguration(_) => "invalid_configuration".to_owned(),
+                ProviderErrorKind::InvalidRequest(_) => "invalid_request".to_owned(),
+                ProviderErrorKind::InvalidResponse(_) => "invalid_response".to_owned(),
+                ProviderErrorKind::ProtocolVersion { .. } => "protocol_version".to_owned(),
+                ProviderErrorKind::OversizedFrame { .. } => "oversized_frame".to_owned(),
+                ProviderErrorKind::TimedOut(_) => "timed_out".to_owned(),
+                ProviderErrorKind::Cancelled => "cancelled".to_owned(),
+                ProviderErrorKind::SpawnFailed(_) => "spawn_failed".to_owned(),
+                ProviderErrorKind::IoFailed { .. } => "io_failed".to_owned(),
+                ProviderErrorKind::WorkerExited { .. } => "worker_exited".to_owned(),
+                ProviderErrorKind::UnexpectedFrame(_) => "unexpected_frame".to_owned(),
+                ProviderErrorKind::UnsupportedCapability(_) => "unsupported_capability".to_owned(),
+                ProviderErrorKind::StaleSourceRevision => "stale_source_revision".to_owned(),
+                ProviderErrorKind::ProviderRequestMismatch => {
+                    "provider_request_mismatch".to_owned()
+                }
+                ProviderErrorKind::ProviderConfigurationMismatch => {
+                    "provider_configuration_mismatch".to_owned()
+                }
+                ProviderErrorKind::WorkerThreadPanicked => "worker_thread_panicked".to_owned(),
+                ProviderErrorKind::UnsupportedPlatform => "unsupported_platform".to_owned(),
+                ProviderErrorKind::WorkerCapacityReached => "worker_capacity_reached".to_owned(),
+                ProviderErrorKind::WorkerSubsystemPoisoned => {
+                    "worker_subsystem_poisoned".to_owned()
+                }
+                ProviderErrorKind::ProcessCleanupFailed(_) => "process_cleanup_failed".to_owned(),
+                ProviderErrorKind::AllocationFailed => "allocation_failed".to_owned(),
+            };
+            assert!(
+                matches!(
+                    &error.kind,
+                    ProviderErrorKind::ProviderFailure { code, .. } if code == expected_code
+                ),
+                "guarded Raster case {case_label} expected provider_failure:{expected_code}, got {actual_error_kind_code}"
+            );
             assert!(error.raw_response_transcript.capture_complete);
             assert_eq!(error.raw_response_transcript.frames.len(), 2);
             let failure_payload = &error.raw_response_transcript.frames[1].payload_bytes;
