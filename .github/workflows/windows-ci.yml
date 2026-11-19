@@ -128,7 +128,7 @@ jobs:
       github.repository == 'Herzchens/LassoInk' &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'feat/raster-reference-protocol'
+      github.event.pull_request.head.ref == 'feat/benchmark-fidelity'
     needs: verify
     runs-on: windows-2025
     timeout-minutes: 60
@@ -140,6 +140,7 @@ jobs:
     env:
       LASSOINK_RUN_SENOCR_CPU_COMPAT: '1'
       LASSOINK_RUN_SENOCR_M4_E2E: '1'
+      LASSOINK_RUN_RUNTIME_INVENTORY: '1'
     steps:
       - name: Guard hosted runner and explicit opt-in before checkout or network access
         shell: pwsh
@@ -151,6 +152,7 @@ jobs:
           EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
           LASSOINK_RUN_SENOCR_CPU_COMPAT: '1'
           LASSOINK_RUN_SENOCR_M4_E2E: '1'
+          LASSOINK_RUN_RUNTIME_INVENTORY: '1'
         run: |
           if ($env:EXPECTED_REPOSITORY -cne 'Herzchens/LassoInk') { throw 'Repository guard failed.' }
           if ($env:EXPECTED_EVENT -cne 'pull_request') { throw 'Pull request event is required.' }
@@ -159,7 +161,8 @@ jobs:
           if ($env:LASSOINK_RUN_SENOCR_CPU_COMPAT -cne '1') { throw 'Explicit opt-in is required.' }
           if ($env:LASSOINK_RUN_SENOCR_M4_E2E -cne '1') { throw 'Explicit M4 worker E2E opt-in is required.' }
           if ($env:EXPECTED_HEAD_SHA -notmatch '^[0-9a-f]{40}$') { throw 'Exact head SHA is invalid.' }
-          if ($env:EXPECTED_HEAD_REPOSITORY -cne 'Herzchens/LassoInk' -or $env:EXPECTED_HEAD_REF -cne 'feat/raster-reference-protocol') { throw 'Pull request source guard failed.' }
+          if ($env:EXPECTED_HEAD_REPOSITORY -cne 'Herzchens/LassoInk' -or $env:EXPECTED_HEAD_REF -cne 'feat/benchmark-fidelity') { throw 'Pull request source guard failed.' }
+          if ($env:LASSOINK_RUN_RUNTIME_INVENTORY -cne '1') { throw 'Explicit runtime profile opt-in is required.' }
 
       - name: Check out exact PR head or pushed commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -179,6 +182,26 @@ jobs:
           }
           Add-Content -Path $env:GITHUB_ENV -Value "LASSOINK_CHECKED_OUT_HEAD_SHA=$actual"
 
+      - name: Verify the stable runtime profile payload before setup or network
+        shell: pwsh
+        env:
+          EXPECTED_PROFILE_SHA256: '3d6150df16fc91bf032638d88a02d30be6877f5b4e62da5682fa601d0fe1ac1c'
+        run: |
+          $profileBytes = [IO.File]::ReadAllBytes('tests/fixtures/senocr_runtime_profile_v1.json')
+          if ($profileBytes.Length -gt 65536) { throw 'Runtime profile exceeds its size cap.' }
+          $payloadLength = $profileBytes.Length
+          if ($payloadLength -gt 0 -and $profileBytes[$payloadLength - 1] -eq 10) {
+            $payloadLength--
+            if ($payloadLength -gt 0 -and $profileBytes[$payloadLength - 1] -eq 13) { $payloadLength-- }
+          }
+          $sha = [Security.Cryptography.SHA256]::Create()
+          try {
+            $actualProfileSha = ([BitConverter]::ToString($sha.ComputeHash($profileBytes, 0, $payloadLength))).Replace('-', '').ToLowerInvariant()
+          } finally {
+            $sha.Dispose()
+          }
+          if ($actualProfileSha -cne $env:EXPECTED_PROFILE_SHA256) { throw 'Runtime profile payload digest mismatch.' }
+
       - name: Set up pinned Python x64
         id: setup-python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -187,16 +210,63 @@ jobs:
           architecture: x64
           check-latest: false
 
-      - name: Install pinned CPU runtime
+      - name: Install the checked-in runtime closure into an isolated venv
         shell: pwsh
         env:
+          BASE_PYTHON: ${{ steps.setup-python.outputs.python-path }}
           PIP_DISABLE_PIP_VERSION_CHECK: '1'
           PIP_NO_CACHE_DIR: '1'
         run: |
-          python -m pip install --quiet --disable-pip-version-check --no-cache-dir --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu 'torch==2.15.0+cpu'
+          $profile = Get-Content -LiteralPath tests/fixtures/senocr_runtime_profile_v1.json -Raw | ConvertFrom-Json
+          if ($profile.schema_version -ne 1 -or $profile.distribution_count -ne 41 -or @($profile.installed_distribution_closure).Count -ne 41) { throw 'Checked-in runtime profile shape/count is invalid.' }
+          if ($profile.python_version -cne '3.13.17' -or $profile.platform -cne 'windows-x64') { throw 'Checked-in runtime profile target is invalid.' }
+          $expectedPins = @{ jinja2='3.1.6'; pillow='13.0.0'; torch='2.15.0+cpu'; transformers='5.23.0' }
+          if (@($profile.root_pins).Count -ne $expectedPins.Count) { throw 'Checked-in root pin count is invalid.' }
+          foreach ($pin in $profile.root_pins) {
+            if (-not $expectedPins.ContainsKey($pin.name) -or $expectedPins[$pin.name] -cne $pin.version) { throw 'Checked-in runtime root pin is invalid.' }
+          }
+          $names = @{}
+          foreach ($package in $profile.installed_distribution_closure) {
+            if ($package.name -notmatch '^[a-z0-9][a-z0-9.-]*$' -or $package.version -notmatch '^[A-Za-z0-9][A-Za-z0-9.!+_-]*$' -or $names.ContainsKey($package.name)) { throw 'Checked-in distribution entry is invalid.' }
+            $names[$package.name] = $true
+          }
+          foreach ($name in @('pip', 'setuptools', 'torch')) { if (-not $names.ContainsKey($name)) { throw 'Checked-in tool/runtime bootstrap package is missing.' } }
+          $venv = Join-Path $env:RUNNER_TEMP 'lasso-senocr-runtime-profile-venv'
+          & $env:BASE_PYTHON -m venv $venv
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated runtime venv setup failed.' }
+          $venvPython = Join-Path $venv 'Scripts\python.exe'
+          $bootstrapSpecs = @($profile.installed_distribution_closure | Where-Object { $_.name -in @('pip', 'setuptools') } | ForEach-Object { "$($_.name)==$($_.version)" })
+          $torchSpec = @($profile.installed_distribution_closure | Where-Object { $_.name -ceq 'torch' } | ForEach-Object { "$($_.name)==$($_.version)" })
+          $remainingSpecs = @($profile.installed_distribution_closure | Where-Object { $_.name -notin @('pip', 'setuptools', 'torch') } | ForEach-Object { "$($_.name)==$($_.version)" })
+          if ($bootstrapSpecs.Count -ne 2 -or $torchSpec.Count -ne 1 -or $remainingSpecs.Count -ne 38) { throw 'Checked-in package groups are incomplete.' }
+          & $venvPython -m pip install --quiet --disable-pip-version-check --no-cache-dir --no-deps --only-binary=:all: --index-url https://pypi.org/simple $bootstrapSpecs
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned pip/setuptools bootstrap installation failed.' }
+          & $venvPython -m pip install --quiet --disable-pip-version-check --no-cache-dir --no-deps --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu $torchSpec
           if ($LASTEXITCODE -ne 0) { throw 'Pinned CPU PyTorch installation failed.' }
-          python -m pip install --quiet --disable-pip-version-check --no-cache-dir --only-binary=:all: --index-url https://pypi.org/simple 'transformers==5.23.0' 'Pillow==13.0.0' 'Jinja2==3.1.6'
-          if ($LASTEXITCODE -ne 0) { throw 'Pinned Transformers/Pillow/template installation failed.' }
+          & $venvPython -m pip install --quiet --disable-pip-version-check --no-cache-dir --no-deps --only-binary=:all: --index-url https://pypi.org/simple $remainingSpecs
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned runtime closure installation failed.' }
+          Add-Content -Path $env:GITHUB_ENV -Value "LASSOINK_SENOCR_PYTHON=$venvPython"
+
+      - name: Inventory and validate exact installed runtime closure
+        shell: pwsh
+        env:
+          LASSOINK_RUN_RUNTIME_INVENTORY: '1'
+          LASSOINK_EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LASSOINK_EXPECTED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          LASSOINK_EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          $venvPython = Join-Path $env:RUNNER_TEMP 'lasso-senocr-runtime-profile-venv\Scripts\python.exe'
+          & $venvPython tests/fixtures/senocr_runtime_inventory.py
+          if ($LASTEXITCODE -ne 0) { throw 'Exact runtime closure validation failed.' }
+
+      - name: Upload only the bounded JSON runtime profile inventory
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: senocr-runtime-inventory
+          path: '${{ runner.temp }}\senocr-runtime-inventory.json'
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Run guarded PNG and absolute-path worker checks before model fetch
         shell: pwsh
@@ -209,7 +279,10 @@ jobs:
           LASSOINK_RUN_SENOCR_M4_E2E: '1'
           LASSOINK_SENOCR_APNG_FIXTURE: '${{ runner.temp }}\senocr-apng-negative.png'
           PYTHONDONTWRITEBYTECODE: '1'
-        run: python -m unittest discover -s tests -p test_raster_reference_protocol.py
+        run: |
+          $venvPython = Join-Path $env:RUNNER_TEMP 'lasso-senocr-runtime-profile-venv\Scripts\python.exe'
+          & $venvPython -m unittest discover -s tests -p test_raster_reference_protocol.py
+          if ($LASTEXITCODE -ne 0) { throw 'Guarded PNG and absolute-path worker checks failed.' }
 
       - name: Run compatibility-only synthetic CPU probe
         shell: pwsh
@@ -233,7 +306,10 @@ jobs:
           MKL_NUM_THREADS: '2'
           OPENBLAS_NUM_THREADS: '1'
           PYTHONUNBUFFERED: '1'
-        run: python tests/fixtures/senocr_full_precision_cpu_compat.py
+        run: |
+          $venvPython = Join-Path $env:RUNNER_TEMP 'lasso-senocr-runtime-profile-venv\Scripts\python.exe'
+          & $venvPython tests/fixtures/senocr_full_precision_cpu_compat.py
+          if ($LASTEXITCODE -ne 0) { throw 'Compatibility-only synthetic CPU probe failed.' }
 
       - name: Install pinned Rust toolchain for the actual M4 parent test
         shell: pwsh
@@ -248,7 +324,6 @@ jobs:
           LASSOINK_EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           LASSOINK_EXPECTED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || '' }}
           LASSOINK_EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
-          LASSOINK_SENOCR_PYTHON: ${{ steps.setup-python.outputs.python-path }}
           LASSOINK_SENOCR_ASSET_ROOT: '${{ runner.temp }}\lasso-senocr-worker-assets'
           LASSOINK_SENOCR_E2E_SHARED_DIR: '${{ runner.temp }}\lasso-senocr-worker-e2e'
           LASSOINK_SENOCR_APNG_FIXTURE: '${{ runner.temp }}\senocr-apng-negative.png'
@@ -269,7 +344,7 @@ jobs:
         shell: pwsh
         run: |
           $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
-          foreach ($name in @('lasso-senocr-worker-assets', 'lasso-senocr-worker-e2e')) {
+          foreach ($name in @('lasso-senocr-worker-assets', 'lasso-senocr-worker-e2e', 'lasso-senocr-runtime-profile-venv', 'senocr-runtime-inventory.json')) {
             $target = [IO.Path]::GetFullPath((Join-Path $runnerTemp $name))
             if ([IO.Path]::GetDirectoryName($target) -cne $runnerTemp) { throw 'Temporary cleanup path escaped RUNNER_TEMP.' }
             if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
@@ -277,105 +352,3 @@ jobs:
           $apngFixture = [IO.Path]::GetFullPath((Join-Path $runnerTemp 'senocr-apng-negative.png'))
           if ([IO.Path]::GetDirectoryName($apngFixture) -cne $runnerTemp) { throw 'APNG cleanup path escaped RUNNER_TEMP.' }
           if (Test-Path -LiteralPath $apngFixture) { Remove-Item -LiteralPath $apngFixture -Force }
-
-  benchmark-runtime-inventory:
-    name: Opt-in SenOCR runtime inventory on Windows x64
-    if: >-
-      github.repository == 'Herzchens/LassoInk' &&
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'feat/benchmark-fidelity'
-    needs: verify
-    runs-on: windows-2025
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    env:
-      LASSOINK_RUN_RUNTIME_INVENTORY: '1'
-    steps:
-      - name: Guard hosted runner and explicit opt-in before checkout or network access
-        shell: pwsh
-        env:
-          EXPECTED_REPOSITORY: ${{ github.repository }}
-          EXPECTED_EVENT: ${{ github.event_name }}
-          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          EXPECTED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || '' }}
-          EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
-          LASSOINK_RUN_RUNTIME_INVENTORY: '1'
-        run: |
-          if ($env:EXPECTED_REPOSITORY -cne 'Herzchens/LassoInk') { throw 'Repository guard failed.' }
-          if ($env:EXPECTED_EVENT -cne 'pull_request') { throw 'Pull request event is required.' }
-          if ($env:CI -cne 'true' -or $env:GITHUB_ACTIONS -cne 'true') { throw 'Actions guard failed.' }
-          if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64') { throw 'Hosted Windows x64 guard failed.' }
-          if ($env:LASSOINK_RUN_RUNTIME_INVENTORY -cne '1') { throw 'Explicit runtime inventory opt-in is required.' }
-          if ($env:EXPECTED_HEAD_SHA -notmatch '^[0-9a-f]{40}$') { throw 'Exact head SHA is invalid.' }
-          if ($env:EXPECTED_HEAD_REPOSITORY -cne 'Herzchens/LassoInk' -or $env:EXPECTED_HEAD_REF -cne 'feat/benchmark-fidelity') { throw 'Pull request source guard failed.' }
-
-      - name: Check out exact PR head
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
-
-      - name: Verify checked-out exact head
-        shell: pwsh
-        env:
-          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          $actual = (git rev-parse HEAD).Trim()
-          if ($actual -ne $env:EXPECTED_HEAD_SHA) { throw 'Checked-out head SHA mismatch.' }
-          Add-Content -Path $env:GITHUB_ENV -Value "LASSOINK_CHECKED_OUT_HEAD_SHA=$actual"
-
-      - name: Set up pinned Python x64
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.13.17'
-          architecture: x64
-          check-latest: false
-
-      - name: Install accepted runtime roots into an isolated temporary venv
-        shell: pwsh
-        env:
-          PIP_DISABLE_PIP_VERSION_CHECK: '1'
-          PIP_NO_CACHE_DIR: '1'
-        run: |
-          $venv = Join-Path $env:RUNNER_TEMP 'lasso-senocr-runtime-inventory-venv'
-          python -m venv $venv
-          if ($LASTEXITCODE -ne 0) { throw 'Isolated runtime venv setup failed.' }
-          $venvPython = Join-Path $venv 'Scripts\python.exe'
-          & $venvPython -m pip install --quiet --disable-pip-version-check --no-cache-dir --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu 'torch==2.15.0+cpu'
-          if ($LASTEXITCODE -ne 0) { throw 'Pinned CPU PyTorch installation failed.' }
-          & $venvPython -m pip install --quiet --disable-pip-version-check --no-cache-dir --only-binary=:all: --index-url https://pypi.org/simple 'transformers==5.23.0' 'Pillow==13.0.0' 'Jinja2==3.1.6'
-          if ($LASTEXITCODE -ne 0) { throw 'Pinned Transformers/Pillow/template installation failed.' }
-
-      - name: Generate bounded installed-distribution inventory
-        shell: pwsh
-        env:
-          LASSOINK_RUN_RUNTIME_INVENTORY: '1'
-          LASSOINK_EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          LASSOINK_EXPECTED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          LASSOINK_EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-        run: |
-          $venvPython = Join-Path $env:RUNNER_TEMP 'lasso-senocr-runtime-inventory-venv\Scripts\python.exe'
-          & $venvPython tests/fixtures/senocr_runtime_inventory.py
-          if ($LASTEXITCODE -ne 0) { throw 'Runtime inventory generation failed.' }
-
-      - name: Upload only the bounded JSON inventory
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: senocr-runtime-inventory
-          path: '${{ runner.temp }}\senocr-runtime-inventory.json'
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Remove runtime venv and inventory file
-        if: always()
-        shell: pwsh
-        run: |
-          $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
-          foreach ($name in @('lasso-senocr-runtime-inventory-venv', 'senocr-runtime-inventory.json')) {
-            $target = [IO.Path]::GetFullPath((Join-Path $runnerTemp $name))
-            if ([IO.Path]::GetDirectoryName($target) -cne $runnerTemp) { throw 'Cleanup path escaped RUNNER_TEMP.' }
-            if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
-          }

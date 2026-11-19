@@ -17,6 +17,7 @@ from pathlib import Path
 
 from tools import raster_reference_protocol as protocol
 from tools import senocr_fp32_worker as senocr
+from tools import senocr_runtime_profile as runtime_profile
 
 
 def require_senocr_hosted_e2e_guard(test_case: unittest.TestCase) -> None:
@@ -29,9 +30,9 @@ def require_senocr_hosted_e2e_guard(test_case: unittest.TestCase) -> None:
         "RUNNER_ARCH": "X64",
         "GITHUB_REPOSITORY": "Herzchens/LassoInk",
         "GITHUB_EVENT_NAME": "pull_request",
-        "GITHUB_HEAD_REF": "feat/raster-reference-protocol",
+        "GITHUB_HEAD_REF": "feat/benchmark-fidelity",
         "LASSOINK_EXPECTED_HEAD_REPOSITORY": "Herzchens/LassoInk",
-        "LASSOINK_EXPECTED_HEAD_REF": "feat/raster-reference-protocol",
+        "LASSOINK_EXPECTED_HEAD_REF": "feat/benchmark-fidelity",
         "LASSOINK_RUN_SENOCR_CPU_COMPAT": "1",
         "LASSOINK_RUN_SENOCR_M4_E2E": "1",
     }
@@ -747,6 +748,55 @@ class OneShotRasterSessionTests(unittest.TestCase):
 
 
 class SenOCRWorkerTests(unittest.TestCase):
+    def test_runtime_profile_digest_and_package_normalization_are_stable(self) -> None:
+        profile, profile_digest = runtime_profile.load_profile()
+        self.assertEqual(profile_digest, runtime_profile.PROFILE_SHA256)
+        self.assertEqual(
+            hashlib.sha256(runtime_profile.canonical_profile_payload(profile)).hexdigest(),
+            profile_digest,
+        )
+        self.assertEqual(
+            senocr.SENOCR_PROVIDER_IDENTITY["resource_version"],
+            f"senocr-runtime-profile-v1-sha256-{profile_digest}",
+        )
+        self.assertIn(profile_digest, senocr.SENOCR_PROVIDER_PROVENANCE)
+        self.assertEqual(set(profile), runtime_profile.PROFILE_FIELDS)
+        self.assertEqual(profile["schema_version"], 1)
+        self.assertEqual(profile["python_version"], "3.13.17")
+        self.assertEqual(profile["platform"], "windows-x64")
+        self.assertEqual(profile["distribution_count"], 41)
+        self.assertEqual(
+            runtime_profile.normalize_distribution_name("Pillow"), "pillow"
+        )
+        self.assertEqual(
+            runtime_profile.normalize_distribution_name("Typing_Extras"),
+            "typing-extras",
+        )
+
+    def test_runtime_profile_rejects_missing_extra_duplicate_and_wrong_versions(self) -> None:
+        profile, _profile_digest = runtime_profile.load_profile()
+        expected = [
+            (item["name"], item["version"])
+            for item in profile["installed_distribution_closure"]
+        ]
+        runtime_profile.validate_installed_distribution_closure(profile, expected)
+        invalid_closures = [
+            expected[:-1],
+            expected + [("unprofiled-package", "1.0.0")],
+            expected + [expected[0]],
+            [
+                (name, "0.0.0" if name == "torch" else version)
+                for name, version in expected
+            ],
+        ]
+        for closure in invalid_closures:
+            with self.subTest(package_count=len(closure)), self.assertRaises(
+                runtime_profile.RuntimeProfileError
+            ):
+                runtime_profile.validate_installed_distribution_closure(
+                    profile, closure
+                )
+
     def configuration(self) -> dict[str, object]:
         return {
             "configuration_id": senocr.EXPECTED_PROVIDER_CONFIGURATION_ID,

@@ -7,29 +7,20 @@ packages, reads model files, or records machine paths, URLs, or secrets.
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import json
 import os
 import platform
-import re
 import sys
 from pathlib import Path
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-EXPECTED_PYTHON = (3, 13, 17)
-ROOT_PINS = (
-    ("jinja2", "3.1.6"),
-    ("pillow", "13.0.0"),
-    ("torch", "2.15.0+cpu"),
-    ("transformers", "5.23.0"),
-)
+from tools import senocr_runtime_profile as runtime_profile
+
 MAX_PACKAGE_COUNT = 512
-MAX_NAME_BYTES = 128
-MAX_VERSION_BYTES = 128
 MAX_INVENTORY_BYTES = 256 * 1024
 OUTPUT_NAME = "senocr-runtime-inventory.json"
-NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
-VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.!+_-]*$")
 
 
 class InventoryError(Exception):
@@ -39,24 +30,6 @@ class InventoryError(Exception):
 def _require(condition: bool) -> None:
     if not condition:
         raise InventoryError
-
-
-def _normalize_name(name: object) -> str:
-    _require(type(name) is str and name.isascii() and bool(NAME_PATTERN.fullmatch(name)))
-    _require(len(name.encode("ascii")) <= MAX_NAME_BYTES)
-    normalized = re.sub(r"[-_.]+", "-", name).lower()
-    _require(bool(normalized))
-    return normalized
-
-
-def _bounded_version(version: object) -> str:
-    _require(
-        type(version) is str
-        and version.isascii()
-        and bool(VERSION_PATTERN.fullmatch(version))
-        and len(version.encode("ascii")) <= MAX_VERSION_BYTES
-    )
-    return version
 
 
 def _check_hosted_context() -> tuple[Path, str]:
@@ -87,31 +60,29 @@ def _check_hosted_context() -> tuple[Path, str]:
 
 
 def _collect_inventory() -> dict[str, object]:
-    _require(sys.version_info[:3] == EXPECTED_PYTHON)
-    installed: dict[str, str] = {}
-    for distribution in importlib.metadata.distributions():
-        name = _normalize_name(distribution.metadata.get("Name"))
-        version = _bounded_version(distribution.version)
-        _require(name not in installed)
-        installed[name] = version
-        _require(len(installed) <= MAX_PACKAGE_COUNT)
-
-    root_pins = [{"name": name, "version": version} for name, version in ROOT_PINS]
-    for pin in root_pins:
-        _require(installed.get(pin["name"]) == pin["version"])
+    try:
+        profile, profile_sha256 = runtime_profile.load_profile()
+        python_version = ".".join(str(value) for value in sys.version_info[:3])
+        _require(python_version == profile["python_version"])
+        installed = runtime_profile.installed_distribution_versions()
+        runtime_profile.validate_installed_distribution_closure(profile, installed)
+    except runtime_profile.RuntimeProfileError:
+        raise InventoryError from None
 
     packages = [
         {"name": name, "version": version}
-        for name, version in sorted(installed.items())
+        for name, version in sorted(installed)
     ]
+    _require(len(packages) <= MAX_PACKAGE_COUNT)
     return {
         "schema_version": 1,
-        "python_version": ".".join(str(value) for value in EXPECTED_PYTHON),
-        "platform": "windows-x64",
+        "python_version": profile["python_version"],
+        "platform": profile["platform"],
         "artifact_file_count": 1,
-        "root_pins": root_pins,
+        "root_pins": profile["root_pins"],
         "installed_distribution_closure": packages,
         "distribution_count": len(packages),
+        "runtime_profile_sha256": profile_sha256,
         "closure_scope": "all distributions installed in the isolated venv, including pip bootstrap",
         "wheel_authenticity_claim": False,
     }

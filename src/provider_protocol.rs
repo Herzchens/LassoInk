@@ -4368,12 +4368,12 @@ mod tests {
         );
         assert!(
             std::env::var("LASSOINK_EXPECTED_HEAD_REF")
-                .is_ok_and(|actual| actual == "feat/raster-reference-protocol")
+                .is_ok_and(|actual| actual == "feat/benchmark-fidelity")
         );
         assert!(std::env::var("GITHUB_EVENT_NAME").is_ok_and(|actual| actual == "pull_request"));
         assert!(
             std::env::var("GITHUB_HEAD_REF")
-                .is_ok_and(|actual| actual == "feat/raster-reference-protocol")
+                .is_ok_and(|actual| actual == "feat/benchmark-fidelity")
         );
         assert!(std::env::var("RUNNER_ARCH").is_ok_and(|actual| actual == "X64"));
     }
