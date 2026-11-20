@@ -20,8 +20,8 @@ use canvas::{
 };
 use journal::{
     EditCommand, JournalEvent, JournalHeader, JournalMetadata, JournalRecord, JournalWriter,
-    MetadataScope, StrokeInterruptionReason, StrokeViewFrame, migrate_schema_one_to_three,
-    migrate_schema_two_to_three, read_journal,
+    MetadataScope, StrokeInterruptionReason, StrokeViewFrame, migrate_schema_one_to_four,
+    migrate_schema_three_to_four, migrate_schema_two_to_four, read_journal,
 };
 use process_cpu::{
     PROCESS_CPU_SCOPE, measure as measure_process_cpu, snapshot as process_cpu_snapshot,
@@ -2193,10 +2193,11 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
         if source.schema_version != journal::JOURNAL_SCHEMA_VERSION {
             let source_path = project_path.clone();
             let source_schema_version = source.schema_version;
-            project_path = schema_three_project_path(&source_path);
+            project_path = schema_four_project_path(&source_path);
             let migration = match source_schema_version {
-                1 => migrate_schema_one_to_three(&source_path, project_path.clone())?,
-                2 => migrate_schema_two_to_three(&source_path, project_path.clone())?,
+                1 => migrate_schema_one_to_four(&source_path, project_path.clone())?,
+                2 => migrate_schema_two_to_four(&source_path, project_path.clone())?,
+                3 => migrate_schema_three_to_four(&source_path, project_path.clone())?,
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -2654,7 +2655,7 @@ fn default_project_path(directory: &Path) -> PathBuf {
     directory.join(format!("project-{timestamp}-{}.inkj", process::id()))
 }
 
-fn schema_three_project_path(source: &Path) -> PathBuf {
+fn schema_four_project_path(source: &Path) -> PathBuf {
     let stem = source
         .file_stem()
         .and_then(|value| value.to_str())
@@ -2663,7 +2664,7 @@ fn schema_three_project_path(source: &Path) -> PathBuf {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
-        .join(format!("{stem}.schema3.inkj"))
+        .join(format!("{stem}.schema4.inkj"))
 }
 
 fn legacy_migration_recovery_note(
@@ -2680,14 +2681,14 @@ fn legacy_migration_recovery_note(
 
 fn active_project_recovery_note(project_path: &Path) -> String {
     format!(
-        "active schema-3 project {} ended in a torn final record; only the validated prefix was retained and the torn tail was truncated before append",
+        "active schema-4 project {} ended in a torn final record; only the validated prefix was retained and the torn tail was truncated before append",
         project_path.display()
     )
 }
 
 fn project_recovery_status(note: &str) -> String {
     let legacy_source = note.contains("legacy schema");
-    let active_project = note.contains("active schema-3 project");
+    let active_project = note.contains("active schema-4 project");
     let summary = match (legacy_source, active_project) {
         (true, true) => {
             "PROJECT RECOVERY: truncated tails omitted; validated prefixes retained; legacy source unchanged."
@@ -2834,14 +2835,14 @@ mod project_recovery_note_tests {
     fn legacy_truncated_migration_note_names_validated_prefix_and_unchanged_source() {
         let note = legacy_migration_recovery_note(
             Path::new("selected-legacy.inkj"),
-            Path::new("selected-legacy.schema3.inkj"),
+            Path::new("selected-legacy.schema4.inkj"),
             2,
         );
         assert!(note.contains("schema 2"));
         assert!(note.contains("only its validated prefix was migrated"));
         assert!(note.contains("selected source file remains unchanged"));
         assert!(note.contains("selected-legacy.inkj"));
-        assert!(note.contains("selected-legacy.schema3.inkj"));
+        assert!(note.contains("selected-legacy.schema4.inkj"));
         let status = super::project_recovery_status(&note);
         assert!(status.contains("validated legacy prefix migrated"));
         assert!(status.contains("source unchanged"));
@@ -2851,9 +2852,9 @@ mod project_recovery_note_tests {
     }
 
     #[test]
-    fn torn_schema_three_append_note_names_recovered_prefix_and_truncated_tail() {
+    fn torn_schema_four_append_note_names_recovered_prefix_and_truncated_tail() {
         let note = active_project_recovery_note(Path::new("active-project.inkj"));
-        assert!(note.contains("schema-3"));
+        assert!(note.contains("schema-4"));
         assert!(note.contains("only the validated prefix was retained"));
         assert!(note.contains("torn tail was truncated before append"));
         assert!(note.contains("active-project.inkj"));

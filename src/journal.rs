@@ -9,6 +9,7 @@
 //! derived state and reload the journal before accepting more edits, because a
 //! failed final write may have reached disk completely or as a truncated tail.
 
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Display, Formatter},
@@ -17,9 +18,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(crate) const JOURNAL_SCHEMA_VERSION: u32 = 3;
+pub(crate) const JOURNAL_SCHEMA_VERSION: u32 = 4;
 const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_JOURNAL_SCHEMA_VERSION: u32 = 2;
+const THIRD_JOURNAL_SCHEMA_VERSION: u32 = 3;
 const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_JOURNAL_LINE_BYTES: usize = 64 * 1024;
 const MAX_JOURNAL_RECORDS: usize = 131_072;
@@ -27,6 +29,15 @@ const MAX_SNAPSHOT_STATE_ENTRIES: usize = MAX_JOURNAL_RECORDS * 2 + 1;
 const MAX_JOURNAL_TEXT_BYTES: usize = 4096;
 const MAX_RAW_PAYLOAD_BYTES: usize = 8192;
 const MAX_METADATA_TEXT_BYTES: usize = 4096;
+const MAX_RECOGNITION_PROJECTIONS: usize = 16_384;
+const MAX_REGION_CORRECTIONS: usize = 16_384;
+const MAX_PROJECTION_CANDIDATES: usize = 128;
+const MAX_PROJECTION_STROKES: usize = 512;
+const MAX_PROJECTION_SAMPLES: usize = 4096;
+const MAX_PROJECTION_RANGES: usize = 4096;
+const MAX_PROJECTION_ID_BYTES: usize = 128;
+const MAX_PROJECTION_SOURCE_ID_BYTES: usize = 256;
+const SHA256_HEX_BYTES: usize = 64;
 pub(crate) const MAX_EDIT_TARGETS: usize = 256;
 const STROKE_VIEW_FRAME_WIDTH: usize = 7;
 const FNV_OFFSET_BASIS: u64 = 14_695_981_039_346_656_037;
@@ -44,7 +55,8 @@ pub(crate) struct JournalHeader {
     pub tilt_supported_declared: Option<bool>,
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StrokeRef {
     /// Project journal identity; kept explicit so targets cannot cross projects.
     pub journal_id: String,
@@ -59,7 +71,8 @@ pub(crate) struct StrokeRef {
 /// Exact per-stroke coordinate frame observed at native pen-down. Screen
 /// positions remain raw in `PhysicalSample`; this frame documents the client
 /// origin and canvas view used to derive replay geometry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StrokeViewFrame {
     pub screen_origin_x_px: i64,
     pub screen_origin_y_px: i64,
@@ -71,6 +84,96 @@ pub(crate) struct StrokeViewFrame {
     pub canvas_pan_x_bits: u64,
     pub canvas_pan_y_bits: u64,
     pub toolbar_height_px: u32,
+}
+
+/// The exact journal prefix and selected ink/view that an external recognizer
+/// result describes. The opaque input-view ID and SHA-256 are provenance
+/// bindings; this journal cannot independently authenticate provider pixels.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectionInkBindingV1 {
+    pub journal_id: String,
+    pub logical_revision: u64,
+    pub last_sequence: u64,
+    pub region_id: String,
+    pub line_id: Option<String>,
+    pub input_view_id: String,
+    pub ink_binding_sha256: String,
+    pub selected_strokes: Vec<StrokeRef>,
+    pub source_sample_sequences: Vec<u64>,
+    pub stroke_views: Vec<ProjectionStrokeViewV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectionStrokeViewV1 {
+    pub stroke: StrokeRef,
+    pub frame: StrokeViewFrame,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectionProviderProvenanceV1 {
+    pub provider_id: String,
+    pub provider_version: String,
+    /// M4's optional model version/revision, not a configured repository name.
+    pub model_version: Option<String>,
+    pub resource_version: Option<String>,
+    pub configuration_id: String,
+    /// The exact M4 provider-configuration fingerprint; it is an identifier,
+    /// not an authentication or file-integrity guarantee.
+    pub configuration_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectionStrokeRangeV1 {
+    pub stroke: StrokeRef,
+    pub first_journal_sequence: u64,
+    pub last_journal_sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecognitionCandidateV1 {
+    pub rank: u16,
+    pub recognized_text: String,
+    /// Native, uncalibrated provider score serialized as a JSON number string.
+    pub native_score_raw: Option<String>,
+    pub stroke_ranges: Vec<ProjectionStrokeRangeV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecognitionProjectionV1 {
+    pub projection_id: String,
+    pub ink: ProjectionInkBindingV1,
+    pub provider: ProjectionProviderProvenanceV1,
+    pub candidates: Vec<RecognitionCandidateV1>,
+}
+
+/// A region-level user correction attached to one exact stored projection.
+/// It is derived annotation history, not a canonical physical sample or a
+/// replacement for the immutable provider result.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "action",
+    content = "text",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub(crate) enum RegionCorrectionActionV1 {
+    SetText(String),
+    Reset,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RegionCorrectionV1 {
+    pub correction_id: String,
+    pub projection_id: String,
+    pub ink: ProjectionInkBindingV1,
+    pub action: RegionCorrectionActionV1,
 }
 
 impl Default for StrokeViewFrame {
@@ -262,6 +365,14 @@ pub(crate) enum JournalEvent {
         target: StrokeRef,
         corrected_text: String,
     },
+    RecognitionProjection {
+        app_arrival_elapsed_ns: u128,
+        projection: RecognitionProjectionV1,
+    },
+    RegionCorrection {
+        app_arrival_elapsed_ns: u128,
+        correction: RegionCorrectionV1,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -416,6 +527,22 @@ pub(crate) struct StoredCorrection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredRecognitionProjection {
+    pub sequence: u64,
+    pub app_epoch_id: String,
+    pub app_arrival_elapsed_ns: u128,
+    pub projection: RecognitionProjectionV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredRegionCorrection {
+    pub sequence: u64,
+    pub app_epoch_id: String,
+    pub app_arrival_elapsed_ns: u128,
+    pub correction: RegionCorrectionV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredTombstone {
     pub sequence: u64,
     pub logical_revision: u64,
@@ -445,6 +572,8 @@ pub(crate) struct JournalReplayState {
     pub tombstone_history: Vec<StoredTombstone>,
     pub moves: Vec<StoredMove>,
     pub corrections: Vec<StoredCorrection>,
+    pub recognition_projections: Vec<StoredRecognitionProjection>,
+    pub region_corrections: Vec<StoredRegionCorrection>,
     session_ids: HashSet<String>,
     stroke_start_set: HashSet<StrokeRef>,
     undo_stack: Vec<u64>,
@@ -452,6 +581,9 @@ pub(crate) struct JournalReplayState {
     stroke_domains: HashMap<StrokeRef, HashSet<(String, String)>>,
     tombstone_set: HashSet<StrokeRef>,
     move_totals: HashMap<StrokeRef, ProjectedTransform>,
+    recognition_projection_ids: HashSet<String>,
+    region_correction_ids: HashSet<String>,
+    derived_event_sequences: HashSet<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -617,6 +749,7 @@ struct MaterializedState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedSnapshot {
+    schema_version: u32,
     journal_id: String,
     prefix_bytes: u64,
     prefix_sequence: u64,
@@ -836,6 +969,29 @@ impl JournalReplayState {
         self.stroke_domains.contains_key(target)
     }
 
+    fn stroke_is_visible(&self, target: &StrokeRef) -> bool {
+        let mut visible = !self.session_requires_stroke_commit(&target.session_id)
+            && !self.tombstone_set.contains(target);
+        for action in self.edit_actions.iter().filter(|action| action.active) {
+            match &action.command {
+                EditCommand::Tombstone { targets } if targets.contains(target) => {
+                    visible = false;
+                }
+                EditCommand::Restore { targets } if targets.contains(target) => {
+                    visible = true;
+                }
+                EditCommand::StrokeVisibility {
+                    targets,
+                    visible: value,
+                } if targets.contains(target) => {
+                    visible = *value;
+                }
+                _ => {}
+            }
+        }
+        visible
+    }
+
     fn session_requires_stroke_commit(&self, session_id: &str) -> bool {
         self.session_epochs
             .iter()
@@ -986,6 +1142,201 @@ impl JournalReplayState {
             .expect("move delta was checked during record validation");
     }
 
+    fn validate_selected_ink_suffix(
+        &self,
+        source_last_sequence: u64,
+        selected_strokes: &[StrokeRef],
+    ) -> Result<(), JournalError> {
+        if source_last_sequence > self.last_sequence {
+            return Err(JournalError::invalid(
+                "derived result source prefix is ahead of the current journal",
+            ));
+        }
+        let selected_contains = |target: &StrokeRef| selected_strokes.contains(target);
+        if self
+            .stroke_interruptions
+            .iter()
+            .any(|event| event.sequence > source_last_sequence && selected_contains(&event.target))
+            || self.tombstone_history.iter().any(|event| {
+                event.sequence > source_last_sequence && selected_contains(&event.target)
+            })
+            || self.moves.iter().any(|event| {
+                event.sequence > source_last_sequence && selected_contains(&event.target)
+            })
+            || self.corrections.iter().any(|event| {
+                event.sequence > source_last_sequence && selected_contains(&event.target)
+            })
+        {
+            return Err(JournalError::invalid(
+                "derived result is stale because a selected stroke changed after its source prefix",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_ink_binding(
+        &self,
+        binding: &ProjectionInkBindingV1,
+    ) -> Result<HashMap<u64, StrokeRef>, JournalError> {
+        validate_ink_binding_fields(binding)?;
+        // Keep the exact M4 prefix as provenance. Later unrelated journal
+        // rows may exist; freshness is based on the unchanged selected ink,
+        // captured frames, and logical revision rather than rebinding it.
+        if binding.journal_id != self.journal_id
+            || binding.logical_revision != self.logical_revision
+            || binding.last_sequence > self.last_sequence
+        {
+            return Err(JournalError::invalid(
+                "projection source journal or logical revision is stale or mismatched",
+            ));
+        }
+        self.validate_selected_ink_suffix(binding.last_sequence, &binding.selected_strokes)?;
+
+        let mut selected = HashSet::new();
+        selected
+            .try_reserve(binding.selected_strokes.len())
+            .map_err(JournalError::allocation)?;
+        for stroke in &binding.selected_strokes {
+            if stroke.journal_id != self.journal_id {
+                return Err(JournalError::invalid(
+                    "projection selected stroke belongs to a different project",
+                ));
+            }
+            self.validate_edit_target(stroke)?;
+            if !self.stroke_is_visible(stroke) {
+                return Err(JournalError::invalid(
+                    "projection selected stroke is not visible in the current logical view",
+                ));
+            }
+            if !selected.insert(stroke.clone()) {
+                return Err(JournalError::invalid(
+                    "projection repeats a selected stroke identity",
+                ));
+            }
+        }
+
+        let mut observed_sequences = Vec::new();
+        observed_sequences
+            .try_reserve(self.physical_samples.len().min(MAX_PROJECTION_SAMPLES + 1))
+            .map_err(JournalError::allocation)?;
+        let mut observed_stroke_order = Vec::new();
+        observed_stroke_order
+            .try_reserve(binding.selected_strokes.len())
+            .map_err(JournalError::allocation)?;
+        let mut seen_strokes = HashSet::new();
+        seen_strokes
+            .try_reserve(binding.selected_strokes.len())
+            .map_err(JournalError::allocation)?;
+        let mut sample_strokes = HashMap::new();
+        sample_strokes
+            .try_reserve(binding.source_sample_sequences.len())
+            .map_err(JournalError::allocation)?;
+        for stored in &self.physical_samples {
+            let Some(stroke) = stored.sample.stroke_ref(&self.journal_id) else {
+                continue;
+            };
+            if !selected.contains(&stroke) {
+                continue;
+            }
+            if stored.sequence > binding.last_sequence {
+                return Err(JournalError::invalid(
+                    "projection source is stale because a selected stroke gained samples",
+                ));
+            }
+            if observed_sequences.len() >= MAX_PROJECTION_SAMPLES {
+                return Err(JournalError::limit(
+                    "projection selected sample count exceeds its fixed cap",
+                ));
+            }
+            observed_sequences.push(stored.sequence);
+            sample_strokes.insert(stored.sequence, stroke.clone());
+            if seen_strokes.insert(stroke.clone()) {
+                observed_stroke_order.push(stroke);
+            }
+        }
+        if observed_sequences != binding.source_sample_sequences
+            || observed_stroke_order != binding.selected_strokes
+        {
+            return Err(JournalError::invalid(
+                "projection sample sequence or canonical stroke order differs from journal history",
+            ));
+        }
+
+        for (index, stroke_view) in binding.stroke_views.iter().enumerate() {
+            let selected_stroke = &binding.selected_strokes[index];
+            if &stroke_view.stroke != selected_stroke || !stroke_view.frame.is_valid() {
+                return Err(JournalError::invalid(
+                    "projection stroke view order or frame is invalid",
+                ));
+            }
+            let observed = self
+                .stroke_starts
+                .iter()
+                .find(|start| &start.target == selected_stroke)
+                .ok_or_else(|| {
+                    JournalError::invalid(
+                        "projection requires a durable captured view frame for every stroke",
+                    )
+                })?;
+            if observed.sequence > binding.last_sequence || observed.view_frame != stroke_view.frame
+            {
+                return Err(JournalError::invalid(
+                    "projection view frame differs from its captured journal frame",
+                ));
+            }
+            if self
+                .stroke_interruptions
+                .iter()
+                .any(|interruption| interruption.target == *selected_stroke)
+            {
+                return Err(JournalError::invalid(
+                    "projection cannot bind a durably interrupted stroke",
+                ));
+            }
+        }
+        Ok(sample_strokes)
+    }
+
+    fn validate_recognition_projection(
+        &self,
+        projection: &RecognitionProjectionV1,
+    ) -> Result<(), JournalError> {
+        validate_recognition_projection_fields(projection)?;
+        let sample_strokes = self.validate_ink_binding(&projection.ink)?;
+        for candidate in &projection.candidates {
+            for range in &candidate.stroke_ranges {
+                if !projection.ink.selected_strokes.contains(&range.stroke)
+                    || sample_strokes.get(&range.first_journal_sequence) != Some(&range.stroke)
+                    || sample_strokes.get(&range.last_journal_sequence) != Some(&range.stroke)
+                {
+                    return Err(JournalError::invalid(
+                        "provider range is not contained in the bound selected stroke samples",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_region_correction(
+        &self,
+        correction: &RegionCorrectionV1,
+    ) -> Result<(), JournalError> {
+        validate_region_correction_fields(correction)?;
+        self.validate_ink_binding(&correction.ink)?;
+        let projection = self
+            .recognition_projections
+            .iter()
+            .find(|stored| stored.projection.projection_id == correction.projection_id)
+            .ok_or_else(|| JournalError::invalid("correction target projection is unknown"))?;
+        if projection.projection.ink != correction.ink {
+            return Err(JournalError::invalid(
+                "region correction does not match its exact projection ink binding",
+            ));
+        }
+        Ok(())
+    }
+
     fn prepare_record(
         &mut self,
         _header: &JournalHeader,
@@ -1125,7 +1476,9 @@ impl JournalReplayState {
             } => {
                 if !matches!(
                     *source_schema_version,
-                    LEGACY_JOURNAL_SCHEMA_VERSION | PREVIOUS_JOURNAL_SCHEMA_VERSION
+                    LEGACY_JOURNAL_SCHEMA_VERSION
+                        | PREVIOUS_JOURNAL_SCHEMA_VERSION
+                        | THIRD_JOURNAL_SCHEMA_VERSION
                 ) {
                     return Err(JournalError::invalid(
                         "migration provenance has an unsupported source schema",
@@ -1264,6 +1617,52 @@ impl JournalReplayState {
                 self.validate_logical_target(*logical_revision, target)?;
                 validate_optional_text(Some(corrected_text), "corrected text")?;
                 self.corrections
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+            }
+            JournalEvent::RecognitionProjection { projection, .. } => {
+                if self.recognition_projections.len() >= MAX_RECOGNITION_PROJECTIONS {
+                    return Err(JournalError::limit(
+                        "recognition projection history cap reached",
+                    ));
+                }
+                self.validate_recognition_projection(projection)?;
+                if self
+                    .recognition_projection_ids
+                    .contains(&projection.projection_id)
+                {
+                    return Err(JournalError::invalid(
+                        "recognition projection ID already exists",
+                    ));
+                }
+                self.recognition_projections
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                self.recognition_projection_ids
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                self.derived_event_sequences
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+            }
+            JournalEvent::RegionCorrection { correction, .. } => {
+                if self.region_corrections.len() >= MAX_REGION_CORRECTIONS {
+                    return Err(JournalError::limit("region correction history cap reached"));
+                }
+                self.validate_region_correction(correction)?;
+                if self
+                    .region_correction_ids
+                    .contains(&correction.correction_id)
+                {
+                    return Err(JournalError::invalid("correction ID already exists"));
+                }
+                self.region_corrections
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                self.region_correction_ids
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                self.derived_event_sequences
                     .try_reserve(1)
                     .map_err(JournalError::allocation)?;
             }
@@ -1482,6 +1881,35 @@ impl JournalReplayState {
                 target,
                 corrected_text,
             }),
+            JournalEvent::RecognitionProjection {
+                app_arrival_elapsed_ns,
+                projection,
+            } => {
+                self.recognition_projection_ids
+                    .insert(projection.projection_id.clone());
+                self.derived_event_sequences.insert(sequence);
+                self.recognition_projections
+                    .push(StoredRecognitionProjection {
+                        sequence,
+                        app_epoch_id: app_epoch_id.clone(),
+                        app_arrival_elapsed_ns,
+                        projection,
+                    });
+            }
+            JournalEvent::RegionCorrection {
+                app_arrival_elapsed_ns,
+                correction,
+            } => {
+                self.region_correction_ids
+                    .insert(correction.correction_id.clone());
+                self.derived_event_sequences.insert(sequence);
+                self.region_corrections.push(StoredRegionCorrection {
+                    sequence,
+                    app_epoch_id: app_epoch_id.clone(),
+                    app_arrival_elapsed_ns,
+                    correction,
+                });
+            }
         }
         self.last_sequence = sequence;
     }
@@ -1721,7 +2149,7 @@ impl JournalWriter {
         let parsed = parse_journal(&mut file)?;
         if parsed.schema_version != JOURNAL_SCHEMA_VERSION {
             return Err(JournalError::invalid(
-                "legacy journal is read-only; migrate into a schema 3 project journal before append",
+                "legacy journal is read-only; migrate into a schema 4 project journal before append",
             ));
         }
         let recovered_truncated_final_record = parsed.recovery.truncated_final_record;
@@ -1897,6 +2325,28 @@ impl JournalWriter {
         metadata: JournalMetadata,
     ) -> Result<u64, JournalError> {
         self.append_event(JournalEvent::Metadata(metadata))
+    }
+
+    pub(crate) fn append_recognition_projection(
+        &mut self,
+        projection: RecognitionProjectionV1,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<u64, JournalError> {
+        self.append_event(JournalEvent::RecognitionProjection {
+            app_arrival_elapsed_ns,
+            projection,
+        })
+    }
+
+    pub(crate) fn append_region_correction(
+        &mut self,
+        correction: RegionCorrectionV1,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<u64, JournalError> {
+        self.append_event(JournalEvent::RegionCorrection {
+            app_arrival_elapsed_ns,
+            correction,
+        })
     }
 
     pub(crate) fn apply_edit_action(
@@ -2173,10 +2623,10 @@ pub(crate) fn read_journal(path: &Path) -> Result<JournalReadResult, JournalErro
     parse_journal(file)
 }
 
-/// Migrates a readable older journal into schema 3 while preserving its
+/// Migrates a readable older journal into schema 4 while preserving its
 /// logical project identity and every validated physical field. The source
 /// file remains untouched; the migration row records the source prefix.
-pub(crate) fn migrate_schema_one_to_three(
+pub(crate) fn migrate_schema_one_to_four(
     source_path: &Path,
     destination_path: PathBuf,
 ) -> Result<JournalMigrationResult, JournalError> {
@@ -2186,10 +2636,10 @@ pub(crate) fn migrate_schema_one_to_three(
             "only schema 1 journals can be migrated by this function",
         ));
     }
-    migrate_parsed_journal_to_three(source, destination_path)
+    migrate_parsed_journal_to_four(source, destination_path)
 }
 
-pub(crate) fn migrate_schema_two_to_three(
+pub(crate) fn migrate_schema_two_to_four(
     source_path: &Path,
     destination_path: PathBuf,
 ) -> Result<JournalMigrationResult, JournalError> {
@@ -2199,10 +2649,23 @@ pub(crate) fn migrate_schema_two_to_three(
             "only schema 2 journals can be migrated by this function",
         ));
     }
-    migrate_parsed_journal_to_three(source, destination_path)
+    migrate_parsed_journal_to_four(source, destination_path)
 }
 
-fn migrate_parsed_journal_to_three(
+pub(crate) fn migrate_schema_three_to_four(
+    source_path: &Path,
+    destination_path: PathBuf,
+) -> Result<JournalMigrationResult, JournalError> {
+    let source = read_journal(source_path)?;
+    if source.schema_version != THIRD_JOURNAL_SCHEMA_VERSION {
+        return Err(JournalError::invalid(
+            "only schema 3 journals can be migrated by this function",
+        ));
+    }
+    migrate_parsed_journal_to_four(source, destination_path)
+}
+
+fn migrate_parsed_journal_to_four(
     source: JournalReadResult,
     destination_path: PathBuf,
 ) -> Result<JournalMigrationResult, JournalError> {
@@ -2487,7 +2950,13 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
         let fields = text.split('\t').collect::<Vec<_>>();
         if is_header {
             require_fields(&fields, 8, "LASSOINK-SNAPSHOT")?;
-            if fields[0] != "LASSOINK-SNAPSHOT" || fields[1] != "3" {
+            let snapshot_schema_version = parse_u32(fields[1], "snapshot schema version")?;
+            if fields[0] != "LASSOINK-SNAPSHOT"
+                || !matches!(
+                    snapshot_schema_version,
+                    THIRD_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+                )
+            {
                 return Err(JournalError::invalid("unsupported snapshot header"));
             }
             let prefix_fingerprint = parse_hex_u64(fields[6], "snapshot prefix fingerprint")?;
@@ -2495,6 +2964,7 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
                 parse_hex_u64(fields[7], "snapshot state fingerprint")?;
             let journal_id = decode_field(fields[2])?;
             parsed = Some(ParsedSnapshot {
+                schema_version: snapshot_schema_version,
                 journal_id: journal_id.clone(),
                 prefix_bytes: parse_u64(fields[3], "snapshot prefix byte length")?,
                 prefix_sequence: parse_u64(fields[4], "snapshot prefix sequence")?,
@@ -3034,6 +3504,136 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
                         source_record_count: parse_u64(fields[7], "snapshot source record count")?,
                     });
             }
+            "SPJ" if snapshot.schema_version >= JOURNAL_SCHEMA_VERSION => {
+                require_fields(&fields, 5, "SPJ")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
+                    return Err(JournalError::limit("snapshot state entry cap reached"));
+                }
+                let sequence = parse_u64(fields[1], "snapshot projection sequence")?;
+                let app_epoch_id = decode_field(fields[2])?;
+                let app_arrival_elapsed_ns =
+                    parse_u128(fields[3], "snapshot projection app arrival")?;
+                if sequence == 0
+                    || sequence > snapshot.prefix_sequence
+                    || !snapshot.state.session_ids.contains(&app_epoch_id)
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot projection is past its prefix or has unknown epoch",
+                    ));
+                }
+                let projection: RecognitionProjectionV1 =
+                    decode_json_payload(fields[4], "snapshot recognition projection")?;
+                validate_recognition_projection_fields(&projection)?;
+                if snapshot.state.recognition_projections.len() >= MAX_RECOGNITION_PROJECTIONS {
+                    return Err(JournalError::limit(
+                        "snapshot recognition projection count exceeds its cap",
+                    ));
+                }
+                if snapshot
+                    .state
+                    .recognition_projection_ids
+                    .contains(&projection.projection_id)
+                    || snapshot.state.derived_event_sequences.contains(&sequence)
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot recognition projection is duplicated",
+                    ));
+                }
+                snapshot
+                    .state
+                    .recognition_projections
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                snapshot
+                    .state
+                    .recognition_projection_ids
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                snapshot
+                    .state
+                    .derived_event_sequences
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                snapshot
+                    .state
+                    .recognition_projection_ids
+                    .insert(projection.projection_id.clone());
+                snapshot.state.derived_event_sequences.insert(sequence);
+                snapshot
+                    .state
+                    .recognition_projections
+                    .push(StoredRecognitionProjection {
+                        sequence,
+                        app_epoch_id,
+                        app_arrival_elapsed_ns,
+                        projection,
+                    });
+            }
+            "SRC" if snapshot.schema_version >= JOURNAL_SCHEMA_VERSION => {
+                require_fields(&fields, 5, "SRC")?;
+                if total_state_entries >= MAX_SNAPSHOT_STATE_ENTRIES {
+                    return Err(JournalError::limit("snapshot state entry cap reached"));
+                }
+                let sequence = parse_u64(fields[1], "snapshot region correction sequence")?;
+                let app_epoch_id = decode_field(fields[2])?;
+                let app_arrival_elapsed_ns =
+                    parse_u128(fields[3], "snapshot region correction app arrival")?;
+                if sequence == 0
+                    || sequence > snapshot.prefix_sequence
+                    || !snapshot.state.session_ids.contains(&app_epoch_id)
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot region correction is past its prefix or has unknown epoch",
+                    ));
+                }
+                let correction: RegionCorrectionV1 =
+                    decode_json_payload(fields[4], "snapshot region correction")?;
+                validate_region_correction_fields(&correction)?;
+                if snapshot.state.region_corrections.len() >= MAX_REGION_CORRECTIONS {
+                    return Err(JournalError::limit(
+                        "snapshot region correction count exceeds its cap",
+                    ));
+                }
+                if snapshot
+                    .state
+                    .region_correction_ids
+                    .contains(&correction.correction_id)
+                    || snapshot.state.derived_event_sequences.contains(&sequence)
+                {
+                    return Err(JournalError::invalid(
+                        "snapshot region correction is duplicated",
+                    ));
+                }
+                snapshot
+                    .state
+                    .region_corrections
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                snapshot
+                    .state
+                    .region_correction_ids
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                snapshot
+                    .state
+                    .derived_event_sequences
+                    .try_reserve(1)
+                    .map_err(JournalError::allocation)?;
+                snapshot
+                    .state
+                    .region_correction_ids
+                    .insert(correction.correction_id.clone());
+                snapshot.state.derived_event_sequences.insert(sequence);
+                snapshot
+                    .state
+                    .region_corrections
+                    .push(StoredRegionCorrection {
+                        sequence,
+                        app_epoch_id,
+                        app_arrival_elapsed_ns,
+                        correction,
+                    });
+            }
             "ENDSNAP" => {
                 require_fields(&fields, 1, "ENDSNAP")?;
                 saw_end = true;
@@ -3075,6 +3675,10 @@ fn parse_snapshot(reader: impl Read) -> Result<ParsedSnapshot, JournalError> {
     }
     snapshot.state.last_sequence = snapshot.prefix_sequence;
     snapshot.state.logical_revision = snapshot.logical_revision;
+    // Historical projections/corrections may be stale relative to later ink
+    // edits in this snapshot prefix. Their validity is checked at their
+    // original journal event during replay, and load_with_snapshot requires
+    // exact equality with that replayed prefix before using this state.
     let expected = expected_state_fingerprint
         .take()
         .ok_or_else(|| JournalError::invalid("snapshot fingerprint header is missing"))?;
@@ -3257,11 +3861,35 @@ fn encode_snapshot(materialized: &MaterializedState) -> Result<Vec<u8>, JournalE
             ],
         )?;
     }
+    for stored in &materialized.state.recognition_projections {
+        append_encoded_row(
+            &mut body,
+            &[
+                "SPJ".to_owned(),
+                stored.sequence.to_string(),
+                encode_field(&stored.app_epoch_id),
+                stored.app_arrival_elapsed_ns.to_string(),
+                encode_json_payload(&stored.projection, "snapshot recognition projection")?,
+            ],
+        )?;
+    }
+    for stored in &materialized.state.region_corrections {
+        append_encoded_row(
+            &mut body,
+            &[
+                "SRC".to_owned(),
+                stored.sequence.to_string(),
+                encode_field(&stored.app_epoch_id),
+                stored.app_arrival_elapsed_ns.to_string(),
+                encode_json_payload(&stored.correction, "snapshot region correction")?,
+            ],
+        )?;
+    }
     append_encoded_row(&mut body, &["ENDSNAP".to_owned()])?;
     let state_fingerprint = fnv_update(FNV_OFFSET_BASIS, &body);
     let header = vec![
         "LASSOINK-SNAPSHOT".to_owned(),
-        "3".to_owned(),
+        JOURNAL_SCHEMA_VERSION.to_string(),
         encode_field(&materialized.journal_id),
         materialized.prefix_bytes.to_string(),
         materialized.prefix_sequence.to_string(),
@@ -3323,7 +3951,10 @@ fn parse_header_fields(fields: &[&str]) -> Result<(u32, JournalHeader), JournalE
     let version = parse_u32(fields[1], "journal schema version")?;
     if !matches!(
         version,
-        LEGACY_JOURNAL_SCHEMA_VERSION | PREVIOUS_JOURNAL_SCHEMA_VERSION | JOURNAL_SCHEMA_VERSION
+        LEGACY_JOURNAL_SCHEMA_VERSION
+            | PREVIOUS_JOURNAL_SCHEMA_VERSION
+            | THIRD_JOURNAL_SCHEMA_VERSION
+            | JOURNAL_SCHEMA_VERSION
     ) {
         return Err(JournalError::invalid(format!(
             "unsupported journal schema version {version}"
@@ -3402,6 +4033,12 @@ fn validate_record_before_encoding(
         } => {
             validate_stroke_ref(target)?;
             validate_optional_text(Some(corrected_text), "corrected text")
+        }
+        JournalEvent::RecognitionProjection { projection, .. } => {
+            validate_recognition_projection_fields(projection)
+        }
+        JournalEvent::RegionCorrection { correction, .. } => {
+            validate_region_correction_fields(correction)
         }
     }
 }
@@ -3640,6 +4277,270 @@ fn validate_stroke_ref(target: &StrokeRef) -> Result<(), JournalError> {
     Ok(())
 }
 
+fn validate_sha256(value: &str, label: &str) -> Result<(), JournalError> {
+    if value.len() != SHA256_HEX_BYTES || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(JournalError::invalid(format!(
+            "{label} must be a 64-character hexadecimal SHA-256 digest"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_input_view_id(value: &str) -> Result<(), JournalError> {
+    const PREFIX: &str = "input-view-v1-";
+    let Some(fingerprint) = value.strip_prefix(PREFIX) else {
+        return Err(JournalError::invalid(
+            "projection input-view ID is not an M4 input-view-v1 identity",
+        ));
+    };
+    if fingerprint.len() != 16
+        || !fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(JournalError::invalid(
+            "projection input-view ID has an invalid M4 fingerprint",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_configuration_fingerprint(value: &str) -> Result<(), JournalError> {
+    const PREFIX: &str = "provider-config-v1-fnv64-";
+    let Some(fingerprint) = value.strip_prefix(PREFIX) else {
+        return Err(JournalError::invalid(
+            "projection provider configuration fingerprint is not an M4 identifier",
+        ));
+    };
+    if fingerprint.len() != 16
+        || !fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(JournalError::invalid(
+            "projection provider configuration fingerprint is malformed",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ink_binding_fields(binding: &ProjectionInkBindingV1) -> Result<(), JournalError> {
+    validate_text(&binding.journal_id, "projection journal ID", 128)?;
+    validate_text(
+        &binding.region_id,
+        "projection region ID",
+        MAX_PROJECTION_SOURCE_ID_BYTES,
+    )?;
+    validate_text(
+        binding.line_id.as_deref().unwrap_or_default(),
+        "projection line ID",
+        MAX_PROJECTION_SOURCE_ID_BYTES,
+    )?;
+    validate_text(
+        &binding.input_view_id,
+        "projection input-view ID",
+        MAX_PROJECTION_SOURCE_ID_BYTES,
+    )?;
+    validate_input_view_id(&binding.input_view_id)?;
+    validate_sha256(&binding.ink_binding_sha256, "projection ink binding")?;
+    if binding.journal_id.is_empty()
+        || binding.region_id.is_empty()
+        || binding.input_view_id.is_empty()
+        || binding.line_id.as_deref() == Some("")
+    {
+        return Err(JournalError::invalid(
+            "projection journal, region, view, and present line IDs must be nonempty",
+        ));
+    }
+    if binding.selected_strokes.is_empty()
+        || binding.selected_strokes.len() > MAX_PROJECTION_STROKES
+        || binding.source_sample_sequences.is_empty()
+        || binding.source_sample_sequences.len() > MAX_PROJECTION_SAMPLES
+        || binding.stroke_views.len() != binding.selected_strokes.len()
+    {
+        return Err(JournalError::limit(
+            "projection stroke, sample, or view-frame count is empty or exceeds its cap",
+        ));
+    }
+    let mut unique_strokes = HashSet::new();
+    unique_strokes
+        .try_reserve(binding.selected_strokes.len())
+        .map_err(JournalError::allocation)?;
+    for stroke in &binding.selected_strokes {
+        validate_stroke_ref(stroke)?;
+        if stroke.journal_id != binding.journal_id || !unique_strokes.insert(stroke) {
+            return Err(JournalError::invalid(
+                "projection selected strokes contain a duplicate or cross-project identity",
+            ));
+        }
+    }
+    let mut previous_sequence = 0u64;
+    for sequence in &binding.source_sample_sequences {
+        if *sequence == 0 || *sequence <= previous_sequence {
+            return Err(JournalError::invalid(
+                "projection source sample sequences must be positive and strictly ordered",
+            ));
+        }
+        previous_sequence = *sequence;
+    }
+    for (stroke, view) in binding.selected_strokes.iter().zip(&binding.stroke_views) {
+        if &view.stroke != stroke || !view.frame.is_valid() {
+            return Err(JournalError::invalid(
+                "projection view frames must match selected stroke order and be valid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_recognition_projection_fields(
+    projection: &RecognitionProjectionV1,
+) -> Result<(), JournalError> {
+    validate_text(
+        &projection.projection_id,
+        "recognition projection ID",
+        MAX_PROJECTION_ID_BYTES,
+    )?;
+    if projection.projection_id.is_empty() {
+        return Err(JournalError::invalid(
+            "recognition projection ID must be nonempty",
+        ));
+    }
+    validate_ink_binding_fields(&projection.ink)?;
+    for (value, label, maximum) in [
+        (&projection.provider.provider_id, "provider ID", 256usize),
+        (
+            &projection.provider.provider_version,
+            "provider version",
+            256usize,
+        ),
+        (
+            &projection.provider.configuration_id,
+            "provider configuration ID",
+            256usize,
+        ),
+    ] {
+        validate_text(value, label, maximum)?;
+        if value.is_empty() {
+            return Err(JournalError::invalid(format!("{label} must be nonempty")));
+        }
+    }
+    for (value, label) in [
+        (&projection.provider.model_version, "model version"),
+        (&projection.provider.resource_version, "resource version"),
+    ] {
+        if let Some(value) = value {
+            validate_text(value, label, 512)?;
+            if value.is_empty() {
+                return Err(JournalError::invalid(format!(
+                    "{label} must be nonempty when present"
+                )));
+            }
+        }
+    }
+    validate_text(
+        &projection.provider.configuration_fingerprint,
+        "provider configuration fingerprint",
+        256,
+    )?;
+    validate_provider_configuration_fingerprint(&projection.provider.configuration_fingerprint)?;
+    if projection.candidates.len() > MAX_PROJECTION_CANDIDATES {
+        return Err(JournalError::limit(
+            "recognition candidate count exceeds its fixed cap",
+        ));
+    }
+    let mut range_count = 0usize;
+    for (index, candidate) in projection.candidates.iter().enumerate() {
+        if usize::from(candidate.rank) != index {
+            return Err(JournalError::invalid(
+                "recognition candidate ranks must be contiguous and ordered from zero",
+            ));
+        }
+        validate_text(
+            &candidate.recognized_text,
+            "recognized candidate text",
+            MAX_JOURNAL_TEXT_BYTES,
+        )?;
+        if let Some(score) = &candidate.native_score_raw {
+            validate_text(score, "native recognition score", 256)?;
+            if serde_json::from_str::<serde_json::Number>(score).is_err() {
+                return Err(JournalError::invalid(
+                    "native recognition score is not a JSON number",
+                ));
+            }
+        }
+        range_count = range_count
+            .checked_add(candidate.stroke_ranges.len())
+            .ok_or_else(|| JournalError::limit("recognition range count overflow"))?;
+        if range_count > MAX_PROJECTION_RANGES {
+            return Err(JournalError::limit(
+                "recognition stroke-range count exceeds its fixed cap",
+            ));
+        }
+        for range in &candidate.stroke_ranges {
+            validate_stroke_ref(&range.stroke)?;
+            if range.first_journal_sequence == 0
+                || range.first_journal_sequence > range.last_journal_sequence
+            {
+                return Err(JournalError::invalid(
+                    "recognition stroke range is empty or reversed",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_region_correction_fields(correction: &RegionCorrectionV1) -> Result<(), JournalError> {
+    validate_text(
+        &correction.correction_id,
+        "region correction ID",
+        MAX_PROJECTION_ID_BYTES,
+    )?;
+    validate_text(
+        &correction.projection_id,
+        "region correction projection ID",
+        MAX_PROJECTION_ID_BYTES,
+    )?;
+    if correction.correction_id.is_empty() || correction.projection_id.is_empty() {
+        return Err(JournalError::invalid(
+            "region correction and projection IDs must be nonempty",
+        ));
+    }
+    validate_ink_binding_fields(&correction.ink)?;
+    if let RegionCorrectionActionV1::SetText(text) = &correction.action {
+        // Empty text is a valid explicit SetText value; Reset remains a
+        // separate enum variant and is never conflated with it.
+        validate_text(text, "region correction text", MAX_JOURNAL_TEXT_BYTES)?;
+    }
+    Ok(())
+}
+
+fn encode_json_payload<T: Serialize>(payload: &T, label: &str) -> Result<String, JournalError> {
+    let json = serde_json::to_string(payload)
+        .map_err(|error| JournalError::invalid(format!("{label} JSON encoding failed: {error}")))?;
+    if json.len() > MAX_JOURNAL_LINE_BYTES {
+        return Err(JournalError::limit(format!(
+            "{label} JSON exceeds the row cap"
+        )));
+    }
+    Ok(encode_field(&json))
+}
+
+fn decode_json_payload<T: for<'de> Deserialize<'de>>(
+    field: &str,
+    label: &str,
+) -> Result<T, JournalError> {
+    let json = decode_field(field)?;
+    if json.len() > MAX_JOURNAL_LINE_BYTES {
+        return Err(JournalError::limit(format!(
+            "{label} JSON exceeds the row cap"
+        )));
+    }
+    serde_json::from_str(&json)
+        .map_err(|error| JournalError::invalid(format!("{label} JSON is malformed: {error}")))
+}
+
 fn encode_record_fields(record: &JournalRecord, version: u32) -> Result<Vec<String>, JournalError> {
     let mut fields = match &record.event {
         JournalEvent::PhysicalSample(sample) => {
@@ -3805,8 +4706,40 @@ fn encode_record_fields(record: &JournalRecord, version: u32) -> Result<Vec<Stri
             fields.push(encode_field(corrected_text));
             fields
         }
+        JournalEvent::RecognitionProjection {
+            app_arrival_elapsed_ns,
+            projection,
+        } => {
+            if version < JOURNAL_SCHEMA_VERSION {
+                return Err(JournalError::invalid(
+                    "recognition projections require journal schema 4",
+                ));
+            }
+            vec![
+                "RPROJ".to_owned(),
+                record.sequence.to_string(),
+                app_arrival_elapsed_ns.to_string(),
+                encode_json_payload(projection, "recognition projection")?,
+            ]
+        }
+        JournalEvent::RegionCorrection {
+            app_arrival_elapsed_ns,
+            correction,
+        } => {
+            if version < JOURNAL_SCHEMA_VERSION {
+                return Err(JournalError::invalid(
+                    "region corrections require journal schema 4",
+                ));
+            }
+            vec![
+                "RCOR".to_owned(),
+                record.sequence.to_string(),
+                app_arrival_elapsed_ns.to_string(),
+                encode_json_payload(correction, "region correction")?,
+            ]
+        }
     };
-    if version >= JOURNAL_SCHEMA_VERSION {
+    if version >= THIRD_JOURNAL_SCHEMA_VERSION {
         fields.insert(2, encode_field(&record.app_epoch_id));
     }
     Ok(fields)
@@ -3994,7 +4927,7 @@ fn encode_sample_fields(
 
 fn encode_stroke_ref_fields(target: &StrokeRef, version: u32) -> Vec<String> {
     let mut fields = Vec::new();
-    if version >= JOURNAL_SCHEMA_VERSION {
+    if version >= THIRD_JOURNAL_SCHEMA_VERSION {
         fields.extend([
             encode_field(&target.journal_id),
             encode_field(&target.session_id),
@@ -4145,7 +5078,7 @@ fn parse_record_fields(
         .first()
         .copied()
         .ok_or_else(|| JournalError::invalid("empty journal record"))?;
-    let (app_epoch_id, body_fields) = if version >= JOURNAL_SCHEMA_VERSION {
+    let (app_epoch_id, body_fields) = if version >= THIRD_JOURNAL_SCHEMA_VERSION {
         require_at_least_fields(fields, 3, tag)?;
         let app_epoch_id = decode_field(fields[2])?;
         let mut shifted = Vec::new();
@@ -4160,7 +5093,7 @@ fn parse_record_fields(
     };
     let fields = body_fields.as_slice();
     let sequence = || parse_u64(fields[1], "journal event sequence");
-    let stroke_ref_width = if version >= JOURNAL_SCHEMA_VERSION {
+    let stroke_ref_width = if version >= THIRD_JOURNAL_SCHEMA_VERSION {
         6
     } else {
         4
@@ -4173,14 +5106,14 @@ fn parse_record_fields(
     {
         "P" => JournalEvent::PhysicalSample(Box::new(parse_sample_fields(
             fields,
-            if version >= JOURNAL_SCHEMA_VERSION {
+            if version >= THIRD_JOURNAL_SCHEMA_VERSION {
                 PREVIOUS_JOURNAL_SCHEMA_VERSION
             } else {
                 version
             },
         )?)),
         "META" => JournalEvent::Metadata(parse_metadata_fields(fields)?),
-        "EPOCH" if version >= JOURNAL_SCHEMA_VERSION => {
+        "EPOCH" if version >= THIRD_JOURNAL_SCHEMA_VERSION => {
             require_fields(fields, 7, "EPOCH")?;
             JournalEvent::SessionEpochStarted {
                 epoch: SessionEpoch {
@@ -4199,7 +5132,7 @@ fn parse_record_fields(
                 app_arrival_elapsed_ns: parse_u128(fields[2], "session epoch app arrival")?,
             }
         }
-        "SBEG" if version >= JOURNAL_SCHEMA_VERSION => {
+        "SBEG" if version >= THIRD_JOURNAL_SCHEMA_VERSION => {
             require_fields(
                 fields,
                 3 + STROKE_VIEW_FRAME_WIDTH + stroke_ref_width,
@@ -4218,7 +5151,7 @@ fn parse_record_fields(
                 )?,
             }
         }
-        "SINT" if version >= JOURNAL_SCHEMA_VERSION => {
+        "SINT" if version >= THIRD_JOURNAL_SCHEMA_VERSION => {
             require_fields(fields, 4 + stroke_ref_width, "SINT")?;
             JournalEvent::StrokeInterrupted {
                 app_arrival_elapsed_ns: parse_u128(fields[2], "stroke interruption app arrival")?,
@@ -4232,7 +5165,7 @@ fn parse_record_fields(
                 )?,
             }
         }
-        "ACT" if version >= JOURNAL_SCHEMA_VERSION => {
+        "ACT" if version >= THIRD_JOURNAL_SCHEMA_VERSION => {
             require_at_least_fields(fields, 6, "ACT")?;
             let revision_id = parse_u64(fields[2], "edit action revision")?;
             let app_arrival_elapsed_ns = parse_u128(fields[3], "edit action app arrival")?;
@@ -4351,7 +5284,7 @@ fn parse_record_fields(
                 command,
             }
         }
-        "UNDO" | "REDO" if version >= JOURNAL_SCHEMA_VERSION => {
+        "UNDO" | "REDO" if version >= THIRD_JOURNAL_SCHEMA_VERSION => {
             require_fields(fields, 5, "undo/redo")?;
             let action_id = parse_u64(fields[4], "undo/redo target action ID")?;
             let revision_id = parse_u64(fields[2], "undo/redo revision")?;
@@ -4370,7 +5303,7 @@ fn parse_record_fields(
                 }
             }
         }
-        "MIGR" if version >= JOURNAL_SCHEMA_VERSION => {
+        "MIGR" if version >= THIRD_JOURNAL_SCHEMA_VERSION => {
             require_fields(fields, 7, "MIGR")?;
             JournalEvent::MigrationProvenance {
                 app_arrival_elapsed_ns: parse_option_u128(fields[2], "migration app arrival")?,
@@ -4378,6 +5311,23 @@ fn parse_record_fields(
                 source_journal_id: decode_field(fields[4])?,
                 source_prefix_fingerprint: parse_hex_u64(fields[5], "migration source prefix")?,
                 source_record_count: parse_u64(fields[6], "migration source record count")?,
+            }
+        }
+        "RPROJ" if version >= JOURNAL_SCHEMA_VERSION => {
+            require_fields(fields, 4, "RPROJ")?;
+            JournalEvent::RecognitionProjection {
+                app_arrival_elapsed_ns: parse_u128(
+                    fields[2],
+                    "recognition projection app arrival",
+                )?,
+                projection: decode_json_payload(fields[3], "recognition projection")?,
+            }
+        }
+        "RCOR" if version >= JOURNAL_SCHEMA_VERSION => {
+            require_fields(fields, 4, "RCOR")?;
+            JournalEvent::RegionCorrection {
+                app_arrival_elapsed_ns: parse_u128(fields[2], "region correction app arrival")?,
+                correction: decode_json_payload(fields[3], "region correction")?,
             }
         }
         "REV" => {
@@ -4604,16 +5554,16 @@ fn parse_stroke_ref_fields(
     journal_id: &str,
     default_session_id: &str,
 ) -> Result<StrokeRef, JournalError> {
-    let (target_journal_id, target_session_id, source_offset) = if version >= JOURNAL_SCHEMA_VERSION
-    {
-        (
-            decode_field(fields[start])?,
-            decode_field(fields[start + 1])?,
-            2,
-        )
-    } else {
-        (journal_id.to_owned(), default_session_id.to_owned(), 0)
-    };
+    let (target_journal_id, target_session_id, source_offset) =
+        if version >= THIRD_JOURNAL_SCHEMA_VERSION {
+            (
+                decode_field(fields[start])?,
+                decode_field(fields[start + 1])?,
+                2,
+            )
+        } else {
+            (journal_id.to_owned(), default_session_id.to_owned(), 0)
+        };
     let target = StrokeRef {
         journal_id: target_journal_id,
         session_id: target_session_id,
@@ -5000,9 +5950,655 @@ mod tests {
         sample.stroke_ref(journal_id).unwrap()
     }
 
+    fn append_projection_test_stroke(
+        writer: &mut JournalWriter,
+        stroke_id: &str,
+    ) -> (
+        StrokeRef,
+        Vec<u64>,
+        StrokeViewFrame,
+        PhysicalSample,
+        PhysicalSample,
+    ) {
+        let first = sample("direct-wm-pointer", stroke_id, 1, 10, Some(100), true, 10);
+        let target = target_of(&first, &writer.header.journal_id);
+        let frame = StrokeViewFrame::default();
+        writer.start_stroke(target.clone(), frame, 5).unwrap();
+        let first_record = writer.append_sample_record(first.clone()).unwrap();
+        let second = sample("direct-wm-pointer", stroke_id, 2, 20, Some(200), true, 20);
+        let second_record = writer.append_sample_record(second.clone()).unwrap();
+        (
+            target,
+            vec![first_record.sequence, second_record.sequence],
+            frame,
+            first,
+            second,
+        )
+    }
+
+    fn projection_test_binding(
+        state: &JournalReplayState,
+        target: &StrokeRef,
+        source_sample_sequences: Vec<u64>,
+    ) -> ProjectionInkBindingV1 {
+        let start = state
+            .stroke_starts
+            .iter()
+            .find(|start| &start.target == target)
+            .unwrap();
+        ProjectionInkBindingV1 {
+            journal_id: state.journal_id.clone(),
+            logical_revision: state.logical_revision,
+            last_sequence: state.last_sequence,
+            region_id: "region-1".to_owned(),
+            line_id: Some("line-1".to_owned()),
+            input_view_id: "input-view-v1-0000000000000001".to_owned(),
+            ink_binding_sha256: "a".repeat(SHA256_HEX_BYTES),
+            selected_strokes: vec![target.clone()],
+            source_sample_sequences,
+            stroke_views: vec![ProjectionStrokeViewV1 {
+                stroke: target.clone(),
+                frame: start.view_frame,
+            }],
+        }
+    }
+
+    fn projection_test_record(
+        projection_id: &str,
+        ink: ProjectionInkBindingV1,
+        first_sample_sequence: u64,
+        last_sample_sequence: u64,
+    ) -> RecognitionProjectionV1 {
+        RecognitionProjectionV1 {
+            projection_id: projection_id.to_owned(),
+            ink: ink.clone(),
+            provider: ProjectionProviderProvenanceV1 {
+                provider_id: "senocr-reference".to_owned(),
+                provider_version: "1.0".to_owned(),
+                model_version: Some("model-r1".to_owned()),
+                resource_version: Some("assets-r1".to_owned()),
+                configuration_id: "config-r1".to_owned(),
+                configuration_fingerprint: "provider-config-v1-fnv64-5d449396c33394f8".to_owned(),
+            },
+            candidates: vec![RecognitionCandidateV1 {
+                rank: 0,
+                recognized_text: "recognized text".to_owned(),
+                native_score_raw: Some("0.75".to_owned()),
+                stroke_ranges: vec![ProjectionStrokeRangeV1 {
+                    stroke: ink.selected_strokes[0].clone(),
+                    first_journal_sequence: first_sample_sequence,
+                    last_journal_sequence: last_sample_sequence,
+                }],
+            }],
+        }
+    }
+
+    fn region_correction_test_record(
+        correction_id: &str,
+        projection_id: &str,
+        ink: ProjectionInkBindingV1,
+        action: RegionCorrectionActionV1,
+    ) -> RegionCorrectionV1 {
+        RegionCorrectionV1 {
+            correction_id: correction_id.to_owned(),
+            projection_id: projection_id.to_owned(),
+            ink,
+            action,
+        }
+    }
+
     fn cleanup_journal(path: &Path) {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(default_snapshot_path(path));
+    }
+
+    #[test]
+    fn schema_four_projection_correction_history_reopens_and_snapshot_replays_tail() {
+        let path = temp_path("projection-correction-history");
+        let snapshot_path = default_snapshot_path(&path);
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-derived-history")).unwrap();
+        let (target, source_sequences, _frame, first, second) =
+            append_projection_test_stroke(&mut writer, "stroke-derived");
+        let source_raw = writer.state.physical_samples.clone();
+        let binding = projection_test_binding(&writer.state, &target, source_sequences.clone());
+        let projection = projection_test_record(
+            "projection-1",
+            binding.clone(),
+            source_sequences[0],
+            source_sequences[1],
+        );
+        let projection_sequence = writer
+            .append_recognition_projection(projection, 30)
+            .unwrap();
+        assert_eq!(projection_sequence, 4);
+        assert_eq!(writer.logical_revision(), 0);
+        assert_eq!(writer.state.physical_samples, source_raw);
+        assert_eq!(
+            writer.state.physical_samples[0].sample.raw_payload,
+            first.raw_payload
+        );
+        assert_eq!(
+            writer.state.physical_samples[1].sample.raw_payload,
+            second.raw_payload
+        );
+
+        writer
+            .append_region_correction(
+                region_correction_test_record(
+                    "correction-empty",
+                    "projection-1",
+                    binding.clone(),
+                    RegionCorrectionActionV1::SetText(String::new()),
+                ),
+                31,
+            )
+            .unwrap();
+        writer
+            .append_region_correction(
+                region_correction_test_record(
+                    "correction-reset",
+                    "projection-1",
+                    binding.clone(),
+                    RegionCorrectionActionV1::Reset,
+                ),
+                32,
+            )
+            .unwrap();
+        assert_eq!(writer.logical_revision(), 0);
+        assert!(matches!(
+            writer.state.region_corrections[0].correction.action,
+            RegionCorrectionActionV1::SetText(ref text) if text.is_empty()
+        ));
+        assert_eq!(
+            writer.state.region_corrections[1].correction.action,
+            RegionCorrectionActionV1::Reset
+        );
+        assert_eq!(writer.state.recognition_projections.len(), 1);
+        assert_eq!(writer.state.region_corrections.len(), 2);
+        assert_eq!(writer.state.physical_samples, source_raw);
+        writer.write_snapshot(&snapshot_path).unwrap();
+
+        writer
+            .append_region_correction(
+                region_correction_test_record(
+                    "correction-after-snapshot",
+                    "projection-1",
+                    binding,
+                    RegionCorrectionActionV1::SetText("corrected".to_owned()),
+                ),
+                33,
+            )
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let reopened = read_journal(&path).unwrap();
+        assert_eq!(reopened.state.recognition_projections.len(), 1);
+        assert_eq!(reopened.state.region_corrections.len(), 3);
+        assert_eq!(reopened.state.logical_revision, 0);
+        assert_eq!(reopened.state.physical_samples, source_raw);
+        assert_eq!(
+            reopened.state.region_corrections[0].correction.action,
+            RegionCorrectionActionV1::SetText(String::new())
+        );
+        let replay = load_with_snapshot(&path, &snapshot_path).unwrap();
+        assert_eq!(replay.disposition, SnapshotDisposition::Used);
+        assert_eq!(replay.replayed_tail_records, 1);
+        assert_eq!(replay.state, reopened.state);
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn projection_roundtrip_preserves_unavailable_optional_model_and_resource_versions() {
+        let path = temp_path("projection-missing-version");
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-missing-version")).unwrap();
+        let (target, source_sequences, _frame, _first, _second) =
+            append_projection_test_stroke(&mut writer, "stroke-missing-version");
+        let binding = projection_test_binding(&writer.state, &target, source_sequences.clone());
+        let mut projection = projection_test_record(
+            "projection-missing-version",
+            binding,
+            source_sequences[0],
+            source_sequences[1],
+        );
+        projection.provider.model_version = None;
+        projection.provider.resource_version = None;
+        writer
+            .append_recognition_projection(projection, 30)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let mut reopened = JournalWriter::open_append(path.clone()).unwrap();
+        let stored = &reopened.state.recognition_projections[0]
+            .projection
+            .provider;
+        assert_eq!(stored.model_version.as_deref(), None);
+        assert_eq!(stored.resource_version.as_deref(), None);
+        reopened.flush().unwrap();
+        drop(reopened);
+        let read_back = read_journal(&path).unwrap();
+        assert_eq!(
+            read_back.state.recognition_projections[0]
+                .projection
+                .provider
+                .model_version
+                .as_deref(),
+            None
+        );
+        assert_eq!(
+            read_back.state.recognition_projections[0]
+                .projection
+                .provider
+                .resource_version
+                .as_deref(),
+            None
+        );
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn projection_and_correction_allow_unrelated_appends_without_rebinding_source() {
+        let path = temp_path("projection-unrelated-appends");
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-unrelated-appends")).unwrap();
+        let (target, source_sequences, _frame, first, second) =
+            append_projection_test_stroke(&mut writer, "stroke-frozen");
+        let source_raw = writer.state.physical_samples.clone();
+        let binding = projection_test_binding(&writer.state, &target, source_sequences.clone());
+
+        let mut hover = sample("direct-wm-pointer", "ignored-hover", 1, 25, None, false, 90);
+        hover.stroke_id = None;
+        hover.source_device_id = None;
+        hover.pointer_id = None;
+        writer.append_sample(hover.clone()).unwrap();
+        writer
+            .append_metadata(JournalMetadata {
+                scope: MetadataScope::Session,
+                scope_id: "session-1".to_owned(),
+                source_api: None,
+                device_id: None,
+                key: "unrelated-observation".to_owned(),
+                value: "after-frozen-request".to_owned(),
+                provenance: "test-observation".to_owned(),
+                app_arrival_elapsed_ns: 26,
+            })
+            .unwrap();
+
+        let projection = projection_test_record(
+            "projection-with-unrelated-tail",
+            binding.clone(),
+            source_sequences[0],
+            source_sequences[1],
+        );
+        writer
+            .append_recognition_projection(projection, 30)
+            .unwrap();
+        assert_eq!(
+            writer.state.recognition_projections[0]
+                .projection
+                .ink
+                .last_sequence,
+            3
+        );
+
+        let mut later_hover = sample(
+            "direct-wm-pointer",
+            "ignored-hover-2",
+            2,
+            35,
+            None,
+            false,
+            91,
+        );
+        later_hover.stroke_id = None;
+        later_hover.source_device_id = None;
+        later_hover.pointer_id = None;
+        writer.append_sample(later_hover.clone()).unwrap();
+        writer
+            .append_metadata(JournalMetadata {
+                scope: MetadataScope::Session,
+                scope_id: "session-1".to_owned(),
+                source_api: None,
+                device_id: None,
+                key: "another-unrelated-observation".to_owned(),
+                value: "still-after-frozen-request".to_owned(),
+                provenance: "test-observation".to_owned(),
+                app_arrival_elapsed_ns: 36,
+            })
+            .unwrap();
+        writer
+            .append_region_correction(
+                region_correction_test_record(
+                    "correction-after-unrelated-tail",
+                    "projection-with-unrelated-tail",
+                    binding.clone(),
+                    RegionCorrectionActionV1::SetText("user annotation".to_owned()),
+                ),
+                40,
+            )
+            .unwrap();
+
+        assert_eq!(writer.logical_revision(), 0);
+        assert_eq!(
+            writer.state.recognition_projections[0].projection.ink,
+            binding
+        );
+        assert_eq!(
+            writer.state.region_corrections[0]
+                .correction
+                .ink
+                .last_sequence,
+            3
+        );
+        assert_eq!(writer.state.physical_samples[0].sample, first);
+        assert_eq!(writer.state.physical_samples[1].sample, second);
+        assert_eq!(writer.state.physical_samples[2].sample, hover);
+        assert_eq!(writer.state.physical_samples[3].sample, later_hover);
+        assert_eq!(writer.state.metadata_history.len(), 2);
+        assert_eq!(&writer.state.physical_samples[..2], source_raw.as_slice());
+        writer.flush().unwrap();
+        drop(writer);
+
+        let reopened = read_journal(&path).unwrap();
+        assert_eq!(reopened.state.recognition_projections.len(), 1);
+        assert_eq!(reopened.state.region_corrections.len(), 1);
+        assert_eq!(reopened.state.logical_revision, 0);
+        assert_eq!(
+            reopened.state.recognition_projections[0]
+                .projection
+                .ink
+                .last_sequence,
+            3
+        );
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn projection_rejects_a_logical_edit_after_its_frozen_source_prefix() {
+        let path = temp_path("projection-logical-edit-stale");
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-logical-edit-stale")).unwrap();
+        let (target, source_sequences, _frame, _first, _second) =
+            append_projection_test_stroke(&mut writer, "stroke-edited");
+        let binding = projection_test_binding(&writer.state, &target, source_sequences.clone());
+        writer
+            .begin_revision(30, "a later logical edit".to_owned())
+            .unwrap();
+        let error = writer
+            .append_recognition_projection(
+                projection_test_record(
+                    "projection-after-edit",
+                    binding,
+                    source_sequences[0],
+                    source_sequences[1],
+                ),
+                31,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, JournalErrorKind::InvalidData);
+        assert_eq!(writer.state.logical_revision, 1);
+        assert!(writer.state.recognition_projections.is_empty());
+        writer.flush().unwrap();
+        drop(writer);
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn stale_projection_history_survives_snapshot_but_cannot_receive_new_correction() {
+        let path = temp_path("stale-projection-history");
+        let snapshot_path = default_snapshot_path(&path);
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-stale-projection-history"))
+                .unwrap();
+        let (target, source_sequences, _frame, _first, _second) =
+            append_projection_test_stroke(&mut writer, "stroke-later-edited");
+        let binding = projection_test_binding(&writer.state, &target, source_sequences.clone());
+        writer
+            .append_recognition_projection(
+                projection_test_record(
+                    "projection-before-later-ink",
+                    binding.clone(),
+                    source_sequences[0],
+                    source_sequences[1],
+                ),
+                30,
+            )
+            .unwrap();
+        writer
+            .append_region_correction(
+                region_correction_test_record(
+                    "correction-before-later-ink",
+                    "projection-before-later-ink",
+                    binding.clone(),
+                    RegionCorrectionActionV1::SetText("historic annotation".to_owned()),
+                ),
+                31,
+            )
+            .unwrap();
+        let later_sample = sample(
+            "direct-wm-pointer",
+            "stroke-later-edited",
+            3,
+            40,
+            Some(300),
+            true,
+            30,
+        );
+        writer.append_sample(later_sample).unwrap();
+        writer.write_snapshot(&snapshot_path).unwrap();
+        writer
+            .append_metadata(JournalMetadata {
+                scope: MetadataScope::Session,
+                scope_id: "session-1".to_owned(),
+                source_api: None,
+                device_id: None,
+                key: "post-stale-snapshot-tail".to_owned(),
+                value: "retained".to_owned(),
+                provenance: "stale-history-test".to_owned(),
+                app_arrival_elapsed_ns: 45,
+            })
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let full = read_journal(&path).unwrap();
+        let snapshot_replay = load_with_snapshot(&path, &snapshot_path).unwrap();
+        assert_eq!(snapshot_replay.disposition, SnapshotDisposition::Used);
+        assert_eq!(snapshot_replay.replayed_tail_records, 1);
+        assert_eq!(snapshot_replay.state, full.state);
+        assert_eq!(snapshot_replay.state.recognition_projections.len(), 1);
+        assert_eq!(snapshot_replay.state.region_corrections.len(), 1);
+        assert_eq!(snapshot_replay.state.logical_revision, 0);
+
+        let mut reopened = JournalWriter::open_append(path.clone()).unwrap();
+        let stale_projection = reopened
+            .append_recognition_projection(
+                projection_test_record(
+                    "auto-carried-stale-projection",
+                    binding.clone(),
+                    source_sequences[0],
+                    source_sequences[1],
+                ),
+                40,
+            )
+            .unwrap_err();
+        assert_eq!(stale_projection.kind, JournalErrorKind::InvalidData);
+        assert_eq!(reopened.state.recognition_projections.len(), 1);
+        let stale_correction = reopened
+            .append_region_correction(
+                region_correction_test_record(
+                    "correction-after-later-ink",
+                    "projection-before-later-ink",
+                    binding,
+                    RegionCorrectionActionV1::SetText("must not carry forward".to_owned()),
+                ),
+                41,
+            )
+            .unwrap_err();
+        assert_eq!(stale_correction.kind, JournalErrorKind::InvalidData);
+        assert_eq!(reopened.state.region_corrections.len(), 1);
+        assert_eq!(reopened.state.recognition_projections.len(), 1);
+        reopened.flush().unwrap();
+        drop(reopened);
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn derived_correction_rejects_project_mismatch_and_new_ink_without_self_staling() {
+        let path = temp_path("projection-stale-binding");
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-stale-binding")).unwrap();
+        let (target, source_sequences, _frame, _first, _second) =
+            append_projection_test_stroke(&mut writer, "stroke-stale");
+        let binding = projection_test_binding(&writer.state, &target, source_sequences.clone());
+        writer
+            .append_recognition_projection(
+                projection_test_record(
+                    "projection-stale",
+                    binding.clone(),
+                    source_sequences[0],
+                    source_sequences[1],
+                ),
+                30,
+            )
+            .unwrap();
+
+        let mut other_project = binding.clone();
+        other_project.journal_id = "different-project".to_owned();
+        assert!(
+            writer
+                .append_region_correction(
+                    region_correction_test_record(
+                        "wrong-project-correction",
+                        "projection-stale",
+                        other_project,
+                        RegionCorrectionActionV1::Reset,
+                    ),
+                    31,
+                )
+                .is_err()
+        );
+        assert_eq!(writer.state.region_corrections.len(), 0);
+
+        let mut changed_view = binding.clone();
+        changed_view.input_view_id = "input-view-v1-0000000000000002".to_owned();
+        assert!(
+            writer
+                .append_region_correction(
+                    region_correction_test_record(
+                        "wrong-view-correction",
+                        "projection-stale",
+                        changed_view,
+                        RegionCorrectionActionV1::Reset,
+                    ),
+                    32,
+                )
+                .is_err()
+        );
+        assert_eq!(writer.state.region_corrections.len(), 0);
+
+        let extra = sample(
+            "direct-wm-pointer",
+            "stroke-stale",
+            3,
+            40,
+            Some(300),
+            true,
+            30,
+        );
+        writer.append_sample(extra).unwrap();
+        let stale_error = writer
+            .append_region_correction(
+                region_correction_test_record(
+                    "stale-correction",
+                    "projection-stale",
+                    binding,
+                    RegionCorrectionActionV1::SetText("stale".to_owned()),
+                ),
+                41,
+            )
+            .unwrap_err();
+        assert_eq!(stale_error.kind, JournalErrorKind::InvalidData);
+        assert_eq!(writer.state.region_corrections.len(), 0);
+        assert_eq!(writer.logical_revision(), 0);
+        writer.flush().unwrap();
+        drop(writer);
+        let parsed = read_journal(&path).unwrap();
+        assert_eq!(parsed.state.physical_samples.len(), 3);
+        assert_eq!(parsed.state.recognition_projections.len(), 1);
+        assert_eq!(parsed.state.region_corrections.len(), 0);
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn projection_payload_limits_and_truncated_rows_do_not_create_fake_success() {
+        let path = temp_path("projection-malformed-row");
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-malformed-row")).unwrap();
+        let (target, source_sequences, _frame, _first, _second) =
+            append_projection_test_stroke(&mut writer, "stroke-malformed");
+        let binding = projection_test_binding(&writer.state, &target, source_sequences.clone());
+        let mut oversized = projection_test_record(
+            "projection-too-long",
+            binding.clone(),
+            source_sequences[0],
+            source_sequences[1],
+        );
+        oversized.candidates[0].recognized_text = "x".repeat(MAX_JOURNAL_TEXT_BYTES + 1);
+        let before_sequence = writer.state.last_sequence;
+        assert!(writer.append_recognition_projection(oversized, 30).is_err());
+        assert_eq!(writer.state.last_sequence, before_sequence);
+        assert!(writer.state.recognition_projections.is_empty());
+
+        let valid = projection_test_record(
+            "projection-valid",
+            binding,
+            source_sequences[0],
+            source_sequences[1],
+        );
+        writer.append_recognition_projection(valid, 31).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        rewrite_record_field(&path, "RPROJ", 4, &encode_field("not-json"));
+        assert!(read_journal(&path).is_err());
+        cleanup_journal(&path);
+
+        let truncated_path = temp_path("projection-truncated-row");
+        let mut writer =
+            JournalWriter::create(truncated_path.clone(), header("journal-truncated-row")).unwrap();
+        let (target, source_sequences, _frame, _first, _second) =
+            append_projection_test_stroke(&mut writer, "stroke-truncated");
+        let binding = projection_test_binding(&writer.state, &target, source_sequences.clone());
+        writer.flush().unwrap();
+        drop(writer);
+        let mut bytes = fs::read(&truncated_path).unwrap();
+        let projection = projection_test_record(
+            "projection-truncated",
+            binding,
+            source_sequences[0],
+            source_sequences[1],
+        );
+        let record = JournalRecord {
+            sequence: 4,
+            app_epoch_id: "session-1".to_owned(),
+            event: JournalEvent::RecognitionProjection {
+                app_arrival_elapsed_ns: 50,
+                projection,
+            },
+        };
+        let line =
+            encode_row(&encode_record_fields(&record, JOURNAL_SCHEMA_VERSION).unwrap()).unwrap();
+        bytes.extend_from_slice(&line[..line.len() - 1]);
+        fs::write(&truncated_path, bytes).unwrap();
+        let recovered = read_journal(&truncated_path).unwrap();
+        assert!(recovered.recovery.truncated_final_record);
+        assert!(recovered.state.recognition_projections.is_empty());
+        assert_eq!(recovered.state.last_sequence, 3);
+        cleanup_journal(&truncated_path);
     }
 
     fn rewrite_record_field(path: &Path, tag: &str, field_index: usize, replacement: &str) {
@@ -6056,7 +7652,7 @@ mod tests {
         );
         fs::write(&source_path, &source_bytes).unwrap();
 
-        let result = migrate_schema_one_to_three(&source_path, destination_path.clone()).unwrap();
+        let result = migrate_schema_one_to_four(&source_path, destination_path.clone()).unwrap();
         let mut migrated_writer = JournalWriter::open_append(destination_path.clone()).unwrap();
         migrated_writer
             .append_metadata(JournalMetadata {
@@ -6123,7 +7719,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_two_to_three_migration_preserves_raw_order_and_logical_view() {
+    fn schema_two_to_four_migration_preserves_raw_order_and_logical_view() {
         let source_path = temp_path("schema-two-source");
         let destination_path = temp_path("schema-two-migrated");
         let legacy_header = header("project-schema-two");
@@ -6183,7 +7779,7 @@ mod tests {
         assert_eq!(before.schema_version, PREVIOUS_JOURNAL_SCHEMA_VERSION);
         assert!(before.recovery.truncated_final_record);
         assert!(before.state.projected_samples().unwrap().is_empty());
-        let result = migrate_schema_two_to_three(&source_path, destination_path.clone()).unwrap();
+        let result = migrate_schema_two_to_four(&source_path, destination_path.clone()).unwrap();
         let after = read_journal(&destination_path).unwrap();
         let source_after = fs::read(&source_path).unwrap();
 
@@ -6209,6 +7805,190 @@ mod tests {
         assert_eq!(after.state.migration_provenance.len(), 1);
         assert_eq!(after.state.migration_provenance[0].source_record_count, 3);
         assert_eq!(source_after, source_bytes);
+        cleanup_journal(&source_path);
+        cleanup_journal(&destination_path);
+    }
+
+    #[test]
+    fn schema_three_golden_migration_preserves_multiepoch_history_and_snapshot_tail() {
+        let source_path = temp_path("schema-three-source");
+        let destination_path = temp_path("schema-three-migrated");
+        // Literal v3 wire-format fixture from the pre-v4 schema: header,
+        // session epochs, framed stroke starts, raw samples, edit actions,
+        // legacy logical move/correction rows, and undo/redo controls. This
+        // intentionally does not use the current schema encoders. V3 places
+        // the app epoch after each sequence, stores journal/session IDs in
+        // target references, and uses the v2 physical-sample field layout.
+        const SCHEMA_THREE_BYTES: &[u8] = b"LASSOINK-JOURNAL\t3\tproject-v3-golden\tsession-1\tcfg-a\towner-device\tfalse\n\
+P\t1\tsession-1\tsession-1\tdirect-wm-pointer\tdevice-a\t7\tlegacy-stroke\t1\tcfg-a\t100\tdevice-output\traw-units\t10\t20\traw-u32\traw-pressure\t512\t1\t~\t~\tqpc\tticks\t123\t10000000\tcontact\t3\t-2\t4\t5\t0102\n\
+EPOCH\t2\tsession-2\t200\t1800000000000000000\tcfg-b\tresume\ttrue\n\
+SBEG\t3\tsession-2\t210\t100\t200\t3FF0000000000000\t3FF0000000000000\t0000000000000000\t0000000000000000\t40\tproject-v3-golden\tsession-2\tdirect-wm-pointer\tdevice-b\t9\tnew-stroke\n\
+P\t4\tsession-2\tsession-2\tdirect-wm-pointer\tdevice-b\t9\tnew-stroke\t1\tcfg-b\t220\tdevice-output\traw-units\t10\t20\traw-u32\traw-pressure\t600\t1\t~\t~\tqpc\tticks\t2000\t10000000\tcontact\t3\t~\t~\t~\tA0B0\n\
+REV\t5\tsession-2\t230\t1\t0\tinitial-revision\n\
+MOVE\t6\tsession-2\t240\t1\tproject-v3-golden\tsession-2\tdirect-wm-pointer\tdevice-b\t9\tnew-stroke\t5\t-2\tdevice-output\traw-units\n\
+CORR\t7\tsession-2\t250\t1\tproject-v3-golden\tsession-2\tdirect-wm-pointer\tdevice-b\t9\tnew-stroke\tlegacy-correction\n\
+ACT\t8\tsession-2\t2\t260\t8\tvisibility\ttrue\t1\tproject-v3-golden\tsession-2\tdirect-wm-pointer\tdevice-b\t9\tnew-stroke\n\
+ACT\t9\tsession-2\t3\t270\t9\tmove\tproject-v3-golden\tsession-2\tdirect-wm-pointer\tdevice-b\t9\tnew-stroke\t2\t-1\tdevice-output\traw-units\n\
+ACT\t10\tsession-2\t4\t280\t10\tcorrection\tproject-v3-golden\tsession-2\tdirect-wm-pointer\tdevice-b\t9\tnew-stroke\tedit-correction\n\
+UNDO\t11\tsession-2\t5\t290\t10\n\
+REDO\t12\tsession-2\t6\t300\t10\n";
+        fs::write(&source_path, SCHEMA_THREE_BYTES).unwrap();
+
+        let before = read_journal(&source_path).unwrap();
+        assert_eq!(before.schema_version, THIRD_JOURNAL_SCHEMA_VERSION);
+        assert_eq!(before.records.len(), 12);
+        assert_eq!(before.state.session_epochs.len(), 2);
+        assert_eq!(before.state.session_epochs[0].epoch.session_id, "session-1");
+        assert_eq!(before.state.session_epochs[1].epoch.session_id, "session-2");
+        assert_eq!(
+            before.state.session_epochs[1].epoch.started_at_unix_ns,
+            Some(1_800_000_000_000_000_000)
+        );
+        assert_eq!(before.state.stroke_starts.len(), 1);
+        assert_eq!(before.state.stroke_starts[0].sequence, 3);
+        assert_eq!(
+            before.state.stroke_starts[0].view_frame.screen_origin_x_px,
+            100
+        );
+        assert_eq!(
+            before.state.stroke_starts[0].view_frame.screen_origin_y_px,
+            200
+        );
+        assert_eq!(
+            before.state.stroke_starts[0]
+                .view_frame
+                .dpi_scale_factor_bits,
+            1.0_f64.to_bits()
+        );
+        assert_eq!(
+            before.state.stroke_starts[0].view_frame.canvas_zoom_bits,
+            1.0_f64.to_bits()
+        );
+        assert_eq!(
+            before.state.stroke_starts[0].view_frame.canvas_pan_x_bits,
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            before.state.stroke_starts[0].view_frame.canvas_pan_y_bits,
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            before.state.stroke_starts[0].view_frame.toolbar_height_px,
+            40
+        );
+        assert_eq!(before.state.physical_samples.len(), 2);
+        assert_eq!(before.state.physical_samples[0].sequence, 1);
+        assert_eq!(before.state.physical_samples[0].sample.source_sequence, 1);
+        assert_eq!(
+            before.state.physical_samples[0].sample.raw_payload,
+            [0x01, 0x02]
+        );
+        assert_eq!(before.state.physical_samples[0].sample.tilt_x_raw, Some(-2));
+        assert_eq!(
+            before.state.physical_samples[0].sample.rotation_raw,
+            Some(5)
+        );
+        assert_eq!(before.state.physical_samples[1].sequence, 4);
+        assert_eq!(
+            before.state.physical_samples[1].sample.raw_payload,
+            [0xA0, 0xB0]
+        );
+        assert_eq!(before.state.moves.len(), 1);
+        assert_eq!(before.state.corrections.len(), 1);
+        assert_eq!(
+            before.state.corrections[0].corrected_text,
+            "legacy-correction"
+        );
+        assert_eq!(before.state.edit_actions.len(), 3);
+        assert_eq!(before.state.edit_controls.len(), 2);
+        assert!(!before.state.edit_controls[0].redo);
+        assert!(before.state.edit_controls[1].redo);
+        assert_eq!(before.state.logical_revision, 6);
+        assert_eq!(before.state.undo_stack.as_slice(), &[8, 9, 10]);
+        assert!(before.state.redo_stack.is_empty());
+        let before_view = before.state.projected_samples().unwrap();
+        assert_eq!(before_view.len(), 2);
+        assert_eq!(before_view[0].sequence, 1);
+        assert_eq!(
+            before_view[0].effective_position.as_ref().unwrap().x_raw,
+            10
+        );
+        assert_eq!(
+            before_view[0].effective_position.as_ref().unwrap().y_raw,
+            20
+        );
+        assert_eq!(before_view[1].sequence, 4);
+        assert_eq!(
+            before_view[1].effective_position.as_ref().unwrap().x_raw,
+            17
+        );
+        assert_eq!(
+            before_view[1].effective_position.as_ref().unwrap().y_raw,
+            17
+        );
+
+        let migrated =
+            migrate_schema_three_to_four(&source_path, destination_path.clone()).unwrap();
+        let after = read_journal(&destination_path).unwrap();
+        assert_eq!(after.schema_version, JOURNAL_SCHEMA_VERSION);
+        assert_eq!(after.records.len(), before.records.len() + 1);
+        assert_eq!(
+            &after.records[..before.records.len()],
+            before.records.as_slice()
+        );
+        assert_eq!(after.state.session_epochs, before.state.session_epochs);
+        assert_eq!(after.state.stroke_starts, before.state.stroke_starts);
+        assert_eq!(after.state.physical_samples, before.state.physical_samples);
+        assert_eq!(after.state.moves, before.state.moves);
+        assert_eq!(after.state.corrections, before.state.corrections);
+        assert_eq!(after.state.edit_actions, before.state.edit_actions);
+        assert_eq!(after.state.edit_controls, before.state.edit_controls);
+        assert_eq!(after.state.undo_stack, before.state.undo_stack);
+        assert_eq!(after.state.redo_stack, before.state.redo_stack);
+        assert_eq!(after.state.logical_revision, before.state.logical_revision);
+        assert_eq!(after.state.projected_samples().unwrap(), before_view);
+        assert_eq!(migrated.migrated_records, 12);
+        assert_eq!(after.state.migration_provenance.len(), 1);
+        assert_eq!(
+            after.state.migration_provenance[0].source_schema_version,
+            THIRD_JOURNAL_SCHEMA_VERSION
+        );
+        assert_eq!(
+            fs::read(&source_path).unwrap().as_slice(),
+            SCHEMA_THREE_BYTES
+        );
+
+        let snapshot_path = default_snapshot_path(&destination_path);
+        let mut reopened = JournalWriter::open_append(destination_path.clone()).unwrap();
+        assert_eq!(reopened.state, after.state);
+        reopened.write_snapshot(&snapshot_path).unwrap();
+        reopened
+            .append_metadata(JournalMetadata {
+                scope: MetadataScope::Session,
+                scope_id: "session-2".to_owned(),
+                source_api: None,
+                device_id: None,
+                key: "post-migration-tail".to_owned(),
+                value: "retained".to_owned(),
+                provenance: "golden-migration-test".to_owned(),
+                app_arrival_elapsed_ns: 310,
+            })
+            .unwrap();
+        reopened.flush().unwrap();
+        drop(reopened);
+        let full = read_journal(&destination_path).unwrap();
+        let snapshot = load_with_snapshot(&destination_path, &snapshot_path).unwrap();
+        assert_eq!(snapshot.disposition, SnapshotDisposition::Used);
+        assert_eq!(snapshot.replayed_tail_records, 1);
+        assert_eq!(snapshot.state, full.state);
+        assert_eq!(snapshot.state.session_epochs.len(), 2);
+        assert_eq!(snapshot.state.edit_controls.len(), 2);
+        assert_eq!(snapshot.state.projected_samples().unwrap(), before_view);
+        assert_eq!(
+            fs::read(&source_path).unwrap().as_slice(),
+            SCHEMA_THREE_BYTES
+        );
+
         cleanup_journal(&source_path);
         cleanup_journal(&destination_path);
     }
