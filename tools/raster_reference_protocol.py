@@ -52,6 +52,14 @@ JsonValue: TypeAlias = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderTextOutputV1:
+    """A text result plus its provider-specific raw-candidate diagnostic object."""
+
+    text: str
+    raw_candidate: dict[str, JsonValue]
+
+
 class ProtocolError(ValueError):
     """A bounded framing, JSON, envelope, or configuration error."""
 
@@ -998,8 +1006,10 @@ def build_text_response_frame(
     provider: dict[str, JsonValue],
     provider_provenance: str,
     raw_text: str,
+    *,
+    raw_candidate: dict[str, JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
-    """Build an identity-preserving Text response from caller-supplied raw text."""
+    """Build an identity-preserving Text response and optional raw diagnostic."""
     request = validate_raster_recognition_request(request)
     configuration = validate_provider_configuration(request["provider_configuration"])
     if request["provider_configuration_fingerprint"] != provider_configuration_fingerprint(
@@ -1014,6 +1024,11 @@ def build_text_response_frame(
         raise ProtocolError("provider provenance exceeds its byte cap")
     if type(raw_text) is not str or _utf8_length(raw_text, "provider text") > MAX_TEXT_BYTES:
         raise ProtocolError("provider text is invalid or oversized")
+    if raw_candidate is None:
+        raw_candidate = {}
+    if type(raw_candidate) is not dict or any(type(key) is not str for key in raw_candidate):
+        raise ProtocolError("provider raw-candidate diagnostic must be a JSON object")
+    _validate_decoded_json(raw_candidate)
     return {
         "kind": "recognition",
         "protocol_version": PROTOCOL_VERSION,
@@ -1035,7 +1050,7 @@ def build_text_response_frame(
                     "recognized_text": raw_text,
                     "native_score_raw": None,
                     "stroke_ranges": [],
-                    "raw_candidate": {},
+                    "raw_candidate": raw_candidate,
                 }
             ],
         },
@@ -1049,12 +1064,15 @@ def run_one_shot_raster_session(
     provider_identity: object,
     capabilities: object,
     provider_provenance: str,
-    processor: Callable[[dict[str, JsonValue]], str],
+    processor: Callable[
+        [dict[str, JsonValue]], str | ProviderTextOutputV1
+    ],
 ) -> None:
-    """Run exactly one M4 handshake/request exchange without a default handler.
+    """Run one M4 exchange without a default handler or synthetic success.
 
     Protocol errors propagate to the caller; no synthetic failure/success frame
-    is emitted. The caller owns the process exit policy and any real processor.
+    is emitted. A processor may return text alone or typed text with its raw
+    candidate diagnostics. The caller owns process exit policy and processing.
     """
     handshake = read_json_frame(input_stream, MAX_HANDSHAKE_FRAME_BYTES)
     if handshake is None:
@@ -1086,7 +1104,7 @@ def run_one_shot_raster_session(
     # The processor receives a bounded detached copy; it cannot rewrite the
     # request provenance that is echoed into the response.
     try:
-        raw_text = processor(copy.deepcopy(request))
+        processed = processor(copy.deepcopy(request))
     except WorkerFailure as failure:
         write_json_frame(
             output_stream,
@@ -1099,10 +1117,17 @@ def run_one_shot_raster_session(
             MAX_RESPONSE_FRAME_BYTES,
         )
         return
+    if type(processed) is ProviderTextOutputV1:
+        raw_text = processed.text
+        raw_candidate = processed.raw_candidate
+    else:
+        raw_text = processed
+        raw_candidate = None
     response = build_text_response_frame(
         request,
         provider,
         provider_provenance,
         raw_text,
+        raw_candidate=raw_candidate,
     )
     write_json_frame(output_stream, response, MAX_RESPONSE_FRAME_BYTES)

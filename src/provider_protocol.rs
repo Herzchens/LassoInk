@@ -4379,7 +4379,9 @@ mod tests {
         assert!(
             matches!(
                 expected_head_ref.as_str(),
-                "feat/benchmark-fidelity" | "feat/benchmark-observability"
+                "feat/benchmark-fidelity"
+                    | "feat/benchmark-observability"
+                    | "feat/benchmark-resources"
             ),
             "the guarded worker PR branch is not allowlisted"
         );
@@ -6522,6 +6524,26 @@ mod tests {
         assert_eq!(execution.raw_response_transcript.frames.len(), 2);
         assert!(execution.timing.process_create_call_to_recognition_ns > 0);
         assert!(execution.timing.model_cold_start_ns.is_none());
+        let model_initialization =
+            &result.candidates[0].raw_candidate["senocr_model_initialization_v1"];
+        assert_eq!(model_initialization["schema_version"].as_u64(), Some(1));
+        assert_eq!(
+            model_initialization["scope"],
+            "senocr_v1_cpu_fp32_lazy_import_processor_model_eval_conformance"
+        );
+        assert!(
+            model_initialization["elapsed_ns"]
+                .as_u64()
+                .is_some_and(|ns| ns > 0)
+        );
+        assert_eq!(
+            model_initialization["model_revision"],
+            "1e70dff4ef0429b0d88a2b873fb5d03300af1a41"
+        );
+        assert_eq!(
+            model_initialization["runtime_profile_sha256"],
+            "3d6150df16fc91bf032638d88a02d30be6877f5b4e62da5682fa601d0fe1ac1c"
+        );
         if let Some(process_resources) = execution.process_resources.as_ref() {
             assert_eq!(
                 process_resources.scope,
@@ -6871,6 +6893,29 @@ mod tests {
                 .len(),
             12
         );
+        for record in [record, later_record] {
+            let model_initialization = &record["provider_declared_model_initialization"];
+            assert_eq!(
+                model_initialization["scope"],
+                "senocr_v1_cpu_fp32_lazy_import_processor_model_eval_conformance"
+            );
+            assert_eq!(
+                model_initialization["model_revision"],
+                "1e70dff4ef0429b0d88a2b873fb5d03300af1a41"
+            );
+            assert_eq!(
+                model_initialization["runtime_profile_sha256"],
+                "3d6150df16fc91bf032638d88a02d30be6877f5b4e62da5682fa601d0fe1ac1c"
+            );
+            let elapsed_ns = model_initialization["elapsed_ns"].as_u64().unwrap();
+            assert!(elapsed_ns > 0);
+            assert!(record["provider_declared_model_initialization_unavailable_reason"].is_null());
+            assert_eq!(
+                record["result"]["candidates"][0]["raw_candidate"]["senocr_model_initialization_v1"]
+                    ["elapsed_ns"],
+                elapsed_ns
+            );
+        }
         let primary_metrics = record["candidate_metrics"].as_array().unwrap();
         assert_eq!(primary_metrics.len(), 1);
         assert_eq!(primary_metrics[0]["candidate_rank"].as_u64(), Some(0));
@@ -6914,6 +6959,38 @@ mod tests {
             provider_summaries[0]["completed_run_count"].as_u64(),
             Some(2)
         );
+        let model_initialization_summary =
+            &provider_summaries[0]["provider_declared_model_initialization"];
+        assert_eq!(
+            model_initialization_summary["scope"],
+            "senocr_v1_cpu_fp32_lazy_import_processor_model_eval_conformance"
+        );
+        assert_eq!(
+            model_initialization_summary["model_revision"],
+            "1e70dff4ef0429b0d88a2b873fb5d03300af1a41"
+        );
+        assert_eq!(
+            model_initialization_summary["runtime_profile_sha256"],
+            "3d6150df16fc91bf032638d88a02d30be6877f5b4e62da5682fa601d0fe1ac1c"
+        );
+        let model_initialization_percentiles = &model_initialization_summary["elapsed_ns"];
+        assert_eq!(model_initialization_percentiles["unit"], "nanoseconds");
+        assert_eq!(
+            model_initialization_percentiles["sample_count"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            model_initialization_percentiles["missing_observation_count"].as_u64(),
+            Some(0)
+        );
+        assert!(
+            model_initialization_percentiles["p50"]
+                .as_u64()
+                .is_some_and(|ns| ns > 0)
+        );
+        let cold_start_summary = &provider_summaries[0]["model_cold_start_ns"];
+        assert_eq!(cold_start_summary["sample_count"].as_u64(), Some(0));
+        assert!(cold_start_summary["unavailable_reason"].as_str().is_some());
         let reported_direct_working_set =
             &provider_summaries[0]["peak_direct_process_working_set_bytes_raw"];
         let observed_direct_working_set_count = run_records

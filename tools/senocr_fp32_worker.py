@@ -75,12 +75,17 @@ MIN_AVAILABLE_MEMORY_BYTES = 10 * 1024**3
 MIN_TEMP_DISK_BYTES = 1 * 1024**3
 MAX_GENERATION_SECONDS = 90
 MAX_GENERATED_TOKENS = 256
+MAX_U64 = (1 << 64) - 1
 MAX_E2E_PROCESSOR_TENSOR_BYTES = 32 * 1024 * 1024
 MAX_E2E_SIDECAR_BYTES = 16 * 1024
 MAX_RASTER_PIXELS = protocol.MAX_TOTAL_RAW_SAMPLE_BYTES
 MAX_RASTER_BYTES = protocol.MAX_RASTER_INPUT_BYTES
 EXPECTED_PYTHON = tuple(
     int(part) for part in runtime_profile.EXPECTED_PYTHON_VERSION.split(".")
+)
+MODEL_INITIALIZATION_RAW_CANDIDATE_KEY_V1 = "senocr_model_initialization_v1"
+MODEL_INITIALIZATION_SCOPE_V1 = (
+    "senocr_v1_cpu_fp32_lazy_import_processor_model_eval_conformance"
 )
 
 SENOCR_PROVIDER_IDENTITY: dict[str, object] = {
@@ -531,7 +536,11 @@ def _decode_png_rgb(
 
 
 SENOCR_E2E_ALLOWED_HEAD_REFS = frozenset(
-    {"feat/benchmark-fidelity", "feat/benchmark-observability"}
+    {
+        "feat/benchmark-fidelity",
+        "feat/benchmark-observability",
+        "feat/benchmark-resources",
+    }
 )
 
 
@@ -853,7 +862,8 @@ def _execute_senocr_pipeline(
     image_decoder: Callable[[dict[str, protocol.JsonValue]], object],
     model_loader: Callable[[Path], object],
     generator: Callable[[object, object], str],
-) -> str:
+    monotonic_ns: Callable[[], int] | None = None,
+) -> protocol.ProviderTextOutputV1:
     request = protocol.validate_raster_recognition_request(request)
     model_root = validate_senocr_provider_configuration(request["provider_configuration"])
     if request["provider_configuration_fingerprint"] != protocol.provider_configuration_fingerprint(
@@ -875,12 +885,24 @@ def _execute_senocr_pipeline(
     except Exception:
         raise protocol.WorkerFailure("raster_decode_failed") from None
     resource_guard()
+    clock_ns = monotonic_ns or time.monotonic_ns
+    # Asset hashing and full PNG decode are complete; the loader includes lazy
+    # ML imports, strict processor/model loading, CPU FP32/eval checks, and
+    # parameter conformance. Inference/generation starts only after this timer.
+    try:
+        model_load_started_ns = clock_ns()
+    except Exception:
+        model_load_started_ns = None
     try:
         runtime = model_loader(model_root)
     except protocol.WorkerFailure:
         raise
     except Exception:
         raise protocol.WorkerFailure("model_load_failed") from None
+    try:
+        model_load_finished_ns = clock_ns()
+    except Exception:
+        model_load_finished_ns = None
     try:
         raw_text = generator(runtime, image)
     except protocol.WorkerFailure:
@@ -889,20 +911,42 @@ def _execute_senocr_pipeline(
         raise protocol.WorkerFailure("inference_failed") from None
     if type(raw_text) is not str or len(raw_text.encode("utf-8", errors="strict")) > protocol.MAX_TEXT_BYTES:
         raise protocol.WorkerFailure("inference_failed")
-    return raw_text
+    elapsed_ns: int | None = None
+    if (
+        type(model_load_started_ns) is int
+        and type(model_load_finished_ns) is int
+        and 0 <= model_load_started_ns <= model_load_finished_ns <= MAX_U64
+    ):
+        elapsed_ns = model_load_finished_ns - model_load_started_ns
+    return protocol.ProviderTextOutputV1(
+        text=raw_text,
+        raw_candidate={
+            MODEL_INITIALIZATION_RAW_CANDIDATE_KEY_V1: {
+                "schema_version": 1,
+                "scope": MODEL_INITIALIZATION_SCOPE_V1,
+                "elapsed_ns": elapsed_ns,
+                "model_revision": MODEL_REVISION,
+                "runtime_profile_sha256": runtime_profile.PROFILE_SHA256,
+            }
+        },
+    )
 
 
 def _run_after_senocr_e2e_context_guard(
     request: dict[str, protocol.JsonValue],
     *,
     context_guard: Callable[[], object],
-    request_processor: Callable[[dict[str, protocol.JsonValue]], str],
-) -> str:
+    request_processor: Callable[
+        [dict[str, protocol.JsonValue]], str | protocol.ProviderTextOutputV1
+    ],
+) -> str | protocol.ProviderTextOutputV1:
     context_guard()
     return request_processor(request)
 
 
-def process_senocr_request(request: dict[str, protocol.JsonValue]) -> str:
+def process_senocr_request(
+    request: dict[str, protocol.JsonValue],
+) -> protocol.ProviderTextOutputV1:
     """Guard test-only context before resource, asset, decode, or model work."""
     return _run_after_senocr_e2e_context_guard(
         request,
@@ -913,7 +957,7 @@ def process_senocr_request(request: dict[str, protocol.JsonValue]) -> str:
 
 def _process_senocr_request_after_context_guard(
     request: dict[str, protocol.JsonValue],
-) -> str:
+) -> protocol.ProviderTextOutputV1:
     """Verify local artifacts, fully decode PNG, then lazily load/infer on CPU."""
     validate_senocr_provider_configuration(request["provider_configuration"])
     _validate_runtime_versions()

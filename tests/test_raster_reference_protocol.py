@@ -20,7 +20,11 @@ from tools import senocr_fp32_worker as senocr
 from tools import senocr_runtime_profile as runtime_profile
 
 SENOCR_E2E_ALLOWED_HEAD_REFS = frozenset(
-    {"feat/benchmark-fidelity", "feat/benchmark-observability"}
+    {
+        "feat/benchmark-fidelity",
+        "feat/benchmark-observability",
+        "feat/benchmark-resources",
+    }
 )
 
 
@@ -563,7 +567,9 @@ class OneShotRasterSessionTests(unittest.TestCase):
         output = io.BytesIO()
         processed: list[dict[str, object]] = []
 
-        def recording_processor(request: dict[str, object]) -> str:
+        def recording_processor(
+            request: dict[str, object],
+        ) -> str | protocol.ProviderTextOutputV1:
             processed.append(request)
             return processor(request)
 
@@ -630,6 +636,37 @@ class OneShotRasterSessionTests(unittest.TestCase):
         self.assertEqual(result["candidates"][0]["recognized_text"], "synthetic raw text")
         self.assertIsNone(result["candidates"][0]["native_score_raw"])
         self.assertEqual(result["candidates"][0]["stroke_ranges"], [])
+        self.assertEqual(result["candidates"][0]["raw_candidate"], {})
+
+    def test_one_shot_preserves_provider_declared_raw_candidate_diagnostic(self) -> None:
+        request = fixture_raster_request()
+        diagnostic = {
+            "senocr_model_initialization_v1": {
+                "schema_version": 1,
+                "scope": "senocr_v1_cpu_fp32_lazy_import_processor_model_eval_conformance",
+                "elapsed_ns": 123_456,
+                "model_revision": "1e70dff4ef0429b0d88a2b873fb5d03300af1a41",
+                "runtime_profile_sha256": "3d6150df16fc91bf032638d88a02d30be6877f5b4e62da5682fa601d0fe1ac1c",
+            }
+        }
+        output, _processed = self.call_session(
+            run_session_input(request),
+            lambda _request: protocol.ProviderTextOutputV1(
+                text="synthetic raw text",
+                raw_candidate=diagnostic,
+            ),
+        )
+        output.seek(0)
+        protocol.read_json_frame(output, protocol.MAX_HANDSHAKE_FRAME_BYTES)
+        response = protocol.read_json_frame(output, protocol.MAX_RESPONSE_FRAME_BYTES)
+        self.assertEqual(
+            response["result"]["candidates"][0]["recognized_text"],
+            "synthetic raw text",
+        )
+        self.assertEqual(
+            response["result"]["candidates"][0]["raw_candidate"],
+            diagnostic,
+        )
 
     def test_processor_cannot_mutate_original_canonical_sample_provenance(self) -> None:
         request = fixture_raster_request()
@@ -1168,6 +1205,77 @@ class SenOCRWorkerTests(unittest.TestCase):
         self.assertEqual(
             stages,
             ["resources", "runtime", "assets", "decode", "resources", "load"],
+        )
+
+    def test_model_initialization_timer_covers_only_lazy_loader_phase(self) -> None:
+        request = fixture_raster_request()
+        configuration = self.configuration()
+        request["provider_configuration"] = configuration
+        request["provider_configuration_fingerprint"] = protocol.provider_configuration_fingerprint(
+            configuration
+        )
+        stages = []
+        clock_values = iter((1_000, 1_550))
+
+        def clock_ns():
+            stages.append("clock")
+            return next(clock_values)
+
+        def load_model(_root):
+            stages.append("model_load")
+            return object()
+
+        def generate_text(_runtime, _image):
+            stages.append("generate")
+            return "synthetic raw text"
+
+        result = senocr._execute_senocr_pipeline(
+            request,
+            asset_verifier=lambda _root: stages.append("asset_hash"),
+            resource_guard=lambda: stages.append("resource_guard"),
+            runtime_guard=lambda: stages.append("runtime_guard"),
+            image_decoder=lambda _raster: stages.append("png_decode"),
+            model_loader=load_model,
+            generator=generate_text,
+            monotonic_ns=clock_ns,
+        )
+        self.assertEqual(result.text, "synthetic raw text")
+        self.assertEqual(
+            stages,
+            [
+                "resource_guard",
+                "runtime_guard",
+                "asset_hash",
+                "png_decode",
+                "resource_guard",
+                "clock",
+                "model_load",
+                "clock",
+                "generate",
+            ],
+        )
+        diagnostic = result.raw_candidate["senocr_model_initialization_v1"]
+        self.assertEqual(diagnostic["scope"], senocr.MODEL_INITIALIZATION_SCOPE_V1)
+        self.assertEqual(diagnostic["elapsed_ns"], 550)
+        self.assertEqual(diagnostic["model_revision"], senocr.MODEL_REVISION)
+        self.assertEqual(
+            diagnostic["runtime_profile_sha256"], runtime_profile.PROFILE_SHA256
+        )
+
+        invalid_clock_values = iter((2_000, 1_999))
+        unchanged_result = senocr._execute_senocr_pipeline(
+            request,
+            asset_verifier=lambda _root: None,
+            resource_guard=lambda: None,
+            runtime_guard=lambda: None,
+            image_decoder=lambda _raster: object(),
+            model_loader=lambda _root: object(),
+            generator=lambda _runtime, _image: "synthetic raw text",
+            monotonic_ns=lambda: next(invalid_clock_values),
+        )
+        self.assertEqual(unchanged_result.text, "synthetic raw text")
+        self.assertIsNone(
+            unchanged_result.raw_candidate["senocr_model_initialization_v1"]["elapsed_ns"]
         )
 
     def test_runtime_mismatch_fails_before_assets_or_png_decode(self) -> None:

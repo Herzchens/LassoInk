@@ -22,7 +22,11 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 REPOSITORY = "Herzchens/LassoInk"
 ALLOWED_BRANCHES = frozenset(
-    {"feat/benchmark-fidelity", "feat/benchmark-observability"}
+    {
+        "feat/benchmark-fidelity",
+        "feat/benchmark-observability",
+        "feat/benchmark-resources",
+    }
 )
 MODEL_REPOSITORY = "VietAlphaLabs/SenOCR-Vi"
 MODEL_REVISION = "1e70dff4ef0429b0d88a2b873fb5d03300af1a41"

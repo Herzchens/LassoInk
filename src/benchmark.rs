@@ -93,6 +93,9 @@ const SENOCR_REFERENCE_PYTHON_VERSION: &str = "3.13.17";
 const SENOCR_REFERENCE_PLATFORM: &str = "windows-x64";
 const MAX_SENOCR_RUNTIME_PROFILE_BYTES: usize = 64 * 1024;
 const SENOCR_REFERENCE_ROOT_PIN_COUNT: usize = 4;
+const SENOCR_MODEL_INITIALIZATION_RAW_CANDIDATE_KEY_V1: &str = "senocr_model_initialization_v1";
+const SENOCR_MODEL_INITIALIZATION_SCOPE_V1: &str =
+    "senocr_v1_cpu_fp32_lazy_import_processor_model_eval_conformance";
 const SENOCR_RUNTIME_PROFILE_DOCUMENT: &[u8] =
     include_bytes!("../tools/senocr_runtime_profile_v1.json");
 pub(crate) const SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES: [(&str, u64); 12] = [
@@ -655,6 +658,14 @@ pub(crate) struct BenchmarkRunRecordV1 {
     pub elapsed_app_batch_call_wall_ns: u64,
     pub timing: Option<crate::provider_protocol::ProviderExecutionTimingV1>,
     pub timing_unavailable_reason: Option<String>,
+    /// Provider-declared local model/processor initialization timing. This is
+    /// distinct from M4 cold-cache model timing, which remains unavailable.
+    #[serde(default)]
+    pub provider_declared_model_initialization:
+        Option<BenchmarkProviderDeclaredModelInitializationV1>,
+    #[serde(default)]
+    pub provider_declared_model_initialization_unavailable_reason:
+        Option<BenchmarkProviderDeclaredModelInitializationUnavailableReasonV1>,
     pub process_resources: Option<ProviderProcessResourcesV1>,
     pub process_resources_unavailable_reason: Option<String>,
     pub job_process_tree_cpu_core_equivalent_percent: Option<f64>,
@@ -672,6 +683,45 @@ pub(crate) struct BenchmarkRunRecordV1 {
     pub stderr_truncated: bool,
     pub status: BenchmarkRunStatusV1,
     pub failure_category: Option<BenchmarkFailureCategoryV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkProviderDeclaredModelInitializationV1 {
+    pub schema_version: u32,
+    pub scope: String,
+    pub elapsed_ns: u64,
+    pub model_revision: String,
+    pub runtime_profile_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkProviderDeclaredModelInitializationSummaryV1 {
+    pub scope: String,
+    pub model_revision: String,
+    pub runtime_profile_sha256: String,
+    pub elapsed_ns: BenchmarkU64PercentilesV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BenchmarkProviderDeclaredModelInitializationUnavailableReasonV1 {
+    NotApplicable,
+    FailedAttempt,
+    MissingRecognitionResult,
+    MismatchedProviderIdentity,
+    IncompleteRuntimeOrAssetEvidence,
+    MismatchedRuntimeOrAssetEvidence,
+    MissingRecognitionCandidate,
+    MissingDiagnostic,
+    InvalidDiagnosticShape,
+    MissingDiagnosticScope,
+    UnsupportedScope,
+    MismatchedModelRevision,
+    MismatchedRuntimeProfile,
+    MissingElapsedNanoseconds,
+    InvalidElapsedNanoseconds,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -870,6 +920,11 @@ pub(crate) struct BenchmarkProviderSummaryV1 {
     /// recognition process's resident working set separately from Job commit.
     #[serde(default)]
     pub peak_direct_process_working_set_bytes_raw: Option<BenchmarkU64PercentilesV1>,
+    /// Provider-declared SenOCR model/processor initialization timing; this is
+    /// not the M4 cold-cache model-start field.
+    #[serde(default)]
+    pub provider_declared_model_initialization:
+        Option<BenchmarkProviderDeclaredModelInitializationSummaryV1>,
     pub model_cold_start_ns: BenchmarkU64PercentilesV1,
     pub gpu_memory_bytes_raw: BenchmarkU64PercentilesV1,
 }
@@ -2225,6 +2280,7 @@ struct ProviderSummaryAccumulator {
     peak_job_memory_bytes: Vec<u64>,
     peak_process_memory_bytes: Vec<u64>,
     peak_direct_process_working_set_bytes: Vec<u64>,
+    provider_declared_model_initialization_ns: Vec<u64>,
     model_cold_start_ns: Vec<u64>,
     gpu_memory_bytes: Vec<u64>,
 }
@@ -2247,6 +2303,7 @@ impl ProviderSummaryAccumulator {
             peak_job_memory_bytes: Vec::new(),
             peak_process_memory_bytes: Vec::new(),
             peak_direct_process_working_set_bytes: Vec::new(),
+            provider_declared_model_initialization_ns: Vec::new(),
             model_cold_start_ns: Vec::new(),
             gpu_memory_bytes: Vec::new(),
         };
@@ -2258,6 +2315,7 @@ impl ProviderSummaryAccumulator {
             &mut summary.peak_job_memory_bytes,
             &mut summary.peak_process_memory_bytes,
             &mut summary.peak_direct_process_working_set_bytes,
+            &mut summary.provider_declared_model_initialization_ns,
             &mut summary.model_cold_start_ns,
             &mut summary.gpu_memory_bytes,
         ] {
@@ -2336,6 +2394,10 @@ impl ProviderSummaryAccumulator {
                 self.peak_direct_process_working_set_bytes.push(peak);
             }
         }
+        if let Some(observation) = &run.provider_declared_model_initialization {
+            self.provider_declared_model_initialization_ns
+                .push(observation.elapsed_ns);
+        }
         if let Some(gpu_bytes) = run.gpu_memory_bytes {
             self.gpu_memory_bytes.push(gpu_bytes);
         }
@@ -2349,6 +2411,24 @@ impl ProviderSummaryAccumulator {
         let orthographic_whitespace_boundary_by_split = finish_aligned_boundaries_by_split(
             std::mem::take(&mut self.aligned_boundary_by_split),
         )?;
+        let provider_declared_model_initialization = if self.provider_id
+            == SENOCR_REFERENCE_PROVIDER_ID
+            && self.configuration_id == SENOCR_REFERENCE_CONFIGURATION_ID
+        {
+            Some(BenchmarkProviderDeclaredModelInitializationSummaryV1 {
+                scope: SENOCR_MODEL_INITIALIZATION_SCOPE_V1.to_owned(),
+                model_revision: SENOCR_REFERENCE_MODEL_REVISION.to_owned(),
+                runtime_profile_sha256: SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256.to_owned(),
+                elapsed_ns: u64_percentiles(
+                    &mut self.provider_declared_model_initialization_ns,
+                    attempted_run_count,
+                    "nanoseconds",
+                    "no eligible provider-declared SenOCR model-initialization observations were available",
+                )?,
+            })
+        } else {
+            None
+        };
         Ok(BenchmarkProviderSummaryV1 {
             provider_id: self.provider_id,
             configuration_id: self.configuration_id,
@@ -2407,6 +2487,7 @@ impl ProviderSummaryAccumulator {
                 "bytes_raw",
                 "GetProcessMemoryInfo did not return a usable direct-process PeakWorkingSetSize",
             )?),
+            provider_declared_model_initialization,
             model_cold_start_ns: u64_percentiles(
                 &mut self.model_cold_start_ns,
                 attempted_run_count,
@@ -3061,7 +3142,8 @@ fn successful_run_record(
     annotation: Option<&BenchmarkAnnotationCaseV1>,
     tokenization_policy: Option<BenchmarkTokenizationPolicyV1>,
 ) -> Result<BenchmarkRunRecordV1, io::Error> {
-    let quality_evidence = benchmark_quality_evidence(base.provider, Some(&execution.provider))?;
+    let provider = base.provider;
+    let quality_evidence = benchmark_quality_evidence(provider, Some(&execution.provider))?;
     let (candidate_metrics, metric_evaluation_unavailable_reason) = if base.repeat_index == 0 {
         candidate_metrics_for_quality_evidence(
             &execution.result,
@@ -3083,7 +3165,7 @@ fn successful_run_record(
     let transcript = execution.raw_response_transcript;
     let raw_response_frames = encode_response_frames(transcript.frames)?;
     let (model_artifact_digests, model_artifact_hash_unavailable_reason) =
-        model_artifact_hash_status(&base.provider.artifact_digests)?;
+        model_artifact_hash_status(&provider.artifact_digests)?;
     let (job_cpu_ratio, job_cpu_ratio_unavailable_reason) = job_cpu_core_equivalent_percent(
         execution.process_resources.as_ref(),
         Some(&execution.timing),
@@ -3138,6 +3220,8 @@ fn successful_run_record(
         elapsed_app_batch_call_wall_ns,
         timing: Some(execution.timing),
         timing_unavailable_reason: None,
+        provider_declared_model_initialization: None,
+        provider_declared_model_initialization_unavailable_reason: None,
         process_resources: execution.process_resources,
         process_resources_unavailable_reason: None,
         job_process_tree_cpu_core_equivalent_percent: job_cpu_ratio,
@@ -3166,6 +3250,10 @@ fn successful_run_record(
                 .to_owned(),
         );
     }
+    let (model_initialization, unavailable_reason) =
+        provider_declared_model_initialization_from_run(provider, &run);
+    run.provider_declared_model_initialization = model_initialization;
+    run.provider_declared_model_initialization_unavailable_reason = unavailable_reason;
     Ok(run)
 }
 
@@ -3212,11 +3300,18 @@ fn failed_run_record(
     elapsed_app_batch_call_wall_ns: u64,
     annotation: Option<&BenchmarkAnnotationCaseV1>,
 ) -> Result<BenchmarkRunRecordV1, io::Error> {
+    let provider = base.provider;
     let category = failure_category(&error.kind);
     let transcript = error.raw_response_transcript;
-    let quality_evidence = benchmark_quality_evidence(base.provider, None)?;
+    let quality_evidence = benchmark_quality_evidence(provider, None)?;
     let (model_artifact_digests, model_artifact_hash_unavailable_reason) =
-        model_artifact_hash_status(&base.provider.artifact_digests)?;
+        model_artifact_hash_status(&provider.artifact_digests)?;
+    let model_initialization_unavailable_reason =
+        if senocr_evidence_candidate(&provider.provider_id, &provider.configuration_id, None) {
+            BenchmarkProviderDeclaredModelInitializationUnavailableReasonV1::FailedAttempt
+        } else {
+            BenchmarkProviderDeclaredModelInitializationUnavailableReasonV1::NotApplicable
+        };
     Ok(BenchmarkRunRecordV1 {
         case_id: base.case.case_id.clone(),
         repeat_index: base.repeat_index,
@@ -3269,6 +3364,10 @@ fn failed_run_record(
         timing_unavailable_reason: Some(
             "complete process-phase checkpoints were not returned; app provider-call wall time remains available"
                 .to_owned(),
+        ),
+        provider_declared_model_initialization: None,
+        provider_declared_model_initialization_unavailable_reason: Some(
+            model_initialization_unavailable_reason,
         ),
         process_resources: None,
         process_resources_unavailable_reason: Some(
@@ -4043,6 +4142,306 @@ fn benchmark_quality_evidence(
 fn quality_metrics_allowed(evidence: &BenchmarkQualityEvidenceV1) -> bool {
     // Do not treat missing policy/evidence as an implicit approval.
     evidence.status == BenchmarkQualityEvidenceStatusV1::EligibleByDeclaredSenocrEvidence
+}
+
+fn provider_declared_model_initialization_from_run(
+    provider: &PreparedBenchmarkProvider,
+    run: &BenchmarkRunRecordV1,
+) -> (
+    Option<BenchmarkProviderDeclaredModelInitializationV1>,
+    Option<BenchmarkProviderDeclaredModelInitializationUnavailableReasonV1>,
+) {
+    use BenchmarkProviderDeclaredModelInitializationUnavailableReasonV1 as Reason;
+
+    let senocr_candidate = senocr_evidence_candidate(
+        &run.provider_id,
+        &run.provider_configuration_id,
+        run.provider_identity.as_ref(),
+    );
+    if !senocr_candidate {
+        return (None, Some(Reason::NotApplicable));
+    }
+    let expected_resource_version = format!(
+        "{SENOCR_REFERENCE_RUNTIME_PROFILE_ID}-sha256-{SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256}"
+    );
+    let Some(identity) = run.provider_identity.as_ref() else {
+        return (None, Some(Reason::MismatchedProviderIdentity));
+    };
+    if provider.provider_id != SENOCR_REFERENCE_PROVIDER_ID
+        || provider.configuration_id != SENOCR_REFERENCE_CONFIGURATION_ID
+        || provider.configuration.configuration_id != SENOCR_REFERENCE_CONFIGURATION_ID
+        || run.provider_id != SENOCR_REFERENCE_PROVIDER_ID
+        || run.provider_configuration_id != SENOCR_REFERENCE_CONFIGURATION_ID
+        || identity.provider_id != SENOCR_REFERENCE_PROVIDER_ID
+        || identity.provider_version != SENOCR_REFERENCE_PROVIDER_VERSION
+        || identity.model_version.as_deref() != Some(SENOCR_REFERENCE_MODEL_REVISION)
+        || identity.resource_version.as_deref() != Some(expected_resource_version.as_str())
+    {
+        return (None, Some(Reason::MismatchedProviderIdentity));
+    }
+    let configuration_values = &provider.configuration.values;
+    let asset_root_valid = configuration_values
+        .get("asset_root")
+        .map(|value| PathBuf::from(value.as_str()))
+        .is_some_and(|path| require_local_absolute_path(&path, "SenOCR model asset root").is_ok());
+    if configuration_values.len() != 3
+        || configuration_values.get("model_id").map(String::as_str)
+            != Some("VietAlphaLabs/SenOCR-Vi")
+        || configuration_values
+            .get("model_revision")
+            .map(String::as_str)
+            != Some(SENOCR_REFERENCE_MODEL_REVISION)
+        || !asset_root_valid
+        || provider.senocr_asset_plan.as_ref().is_none_or(|plan| {
+            plan.mismatch_reason.is_some()
+                || plan.artifact_id_by_asset_name.len()
+                    != SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len()
+        })
+        || run.artifact_digests != provider.artifact_digests
+    {
+        return (None, Some(Reason::MismatchedRuntimeOrAssetEvidence));
+    }
+    let Some(result) = run.result.as_ref() else {
+        return (None, Some(Reason::MissingRecognitionResult));
+    };
+    if &result.provider != identity
+        || result.provider_configuration_id != run.provider_configuration_id
+        || result.provider_configuration_fingerprint != run.provider_configuration_fingerprint
+        || result.source_revision != run.source_revision
+        || result.input_view_id != run.input_view_id
+        || result.region_id != run.region_id
+        || result.line_id != run.line_id
+        || run.requested_input_modalities.len() != 1
+        || run.requested_input_modalities[0] != ProviderInputCapabilityV1::Raster
+        || result.consumed_input_modalities.len() != 1
+        || result.consumed_input_modalities[0] != ProviderInputCapabilityV1::Raster
+    {
+        return (None, Some(Reason::MismatchedProviderIdentity));
+    }
+    let Some(capabilities) = run.provider_capabilities.as_ref() else {
+        return (None, Some(Reason::MismatchedProviderIdentity));
+    };
+    if capabilities.inputs.len() != 1
+        || capabilities.inputs[0] != ProviderInputCapabilityV1::Raster
+        || !capabilities
+            .outputs
+            .contains(&crate::provider_protocol::ProviderOutputCapabilityV1::Text)
+    {
+        return (None, Some(Reason::MismatchedProviderIdentity));
+    }
+    match run.quality_evidence.status {
+        BenchmarkQualityEvidenceStatusV1::EligibleByDeclaredSenocrEvidence => {}
+        BenchmarkQualityEvidenceStatusV1::MismatchedSenocrEvidence => {
+            return (None, Some(Reason::MismatchedRuntimeOrAssetEvidence));
+        }
+        _ => return (None, Some(Reason::IncompleteRuntimeOrAssetEvidence)),
+    }
+    if run.quality_evidence.unavailable_reason.is_some()
+        || run.model_artifact_hash_unavailable_reason.is_some()
+    {
+        return (None, Some(Reason::IncompleteRuntimeOrAssetEvidence));
+    }
+    let (Some(profile), Some(coverage)) = (
+        run.quality_evidence.runtime_profile.as_ref(),
+        run.quality_evidence.model_asset_coverage.as_ref(),
+    ) else {
+        return (None, Some(Reason::IncompleteRuntimeOrAssetEvidence));
+    };
+    let profile_manifest = match load_senocr_runtime_profile_manifest() {
+        Ok(manifest) => manifest,
+        Err(_) => return (None, Some(Reason::IncompleteRuntimeOrAssetEvidence)),
+    };
+    if profile.profile_id != SENOCR_REFERENCE_RUNTIME_PROFILE_ID
+        || profile.profile_manifest_sha256 != SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256
+        || profile.manifest_schema_version != profile_manifest.schema_version
+        || profile.distribution_count != profile_manifest.distribution_count
+        || profile.python_version != profile_manifest.python_version
+        || profile.platform != profile_manifest.platform
+        || profile.root_pins != profile_manifest.root_pins
+        || profile.installed_distribution_closure != profile_manifest.installed_distribution_closure
+    {
+        return (None, Some(Reason::MismatchedRuntimeOrAssetEvidence));
+    }
+    if coverage.model_revision != SENOCR_REFERENCE_MODEL_REVISION
+        || coverage.required_asset_count as usize != SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len()
+        || coverage.observed_asset_count as usize != SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len()
+        || coverage.observed_assets.len() != SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len()
+        || !coverage.missing_asset_names.is_empty()
+    {
+        return (None, Some(Reason::IncompleteRuntimeOrAssetEvidence));
+    }
+    match coverage.status {
+        BenchmarkModelAssetCoverageStatusV1::CompletePrelaunchObservations => {}
+        BenchmarkModelAssetCoverageStatusV1::IncompletePrelaunchObservations => {
+            return (None, Some(Reason::IncompleteRuntimeOrAssetEvidence));
+        }
+        BenchmarkModelAssetCoverageStatusV1::MismatchedPrelaunchManifest => {
+            return (None, Some(Reason::MismatchedRuntimeOrAssetEvidence));
+        }
+    }
+    let Some(asset_plan) = provider.senocr_asset_plan.as_ref() else {
+        return (None, Some(Reason::IncompleteRuntimeOrAssetEvidence));
+    };
+    if asset_plan.mismatch_reason.is_some() {
+        return (None, Some(Reason::MismatchedRuntimeOrAssetEvidence));
+    }
+    if asset_plan.artifact_id_by_asset_name.len() != SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len() {
+        return (None, Some(Reason::IncompleteRuntimeOrAssetEvidence));
+    }
+    for ((asset_name, expected_bytes), observed) in SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES
+        .iter()
+        .zip(&coverage.observed_assets)
+    {
+        let Some(artifact_id) = asset_plan.artifact_id_by_asset_name.get(*asset_name) else {
+            return (None, Some(Reason::IncompleteRuntimeOrAssetEvidence));
+        };
+        let Some(digest) = run
+            .artifact_digests
+            .iter()
+            .find(|digest| digest.artifact_id == *artifact_id)
+        else {
+            return (None, Some(Reason::IncompleteRuntimeOrAssetEvidence));
+        };
+        let expected_role = match *asset_name {
+            "model-00001-of-00001.safetensors" => ProviderArtifactRoleV1::Model,
+            "added_tokens.json"
+            | "chat_template.jinja"
+            | "special_tokens_map.json"
+            | "tokenizer.json"
+            | "tokenizer.model"
+            | "tokenizer_config.json" => ProviderArtifactRoleV1::Tokenizer,
+            _ => ProviderArtifactRoleV1::Resource,
+        };
+        if observed.asset_name != *asset_name
+            || observed.expected_byte_count != *expected_bytes
+            || observed.observed_byte_count != *expected_bytes
+            || validate_sha256_hex(&observed.observed_sha256_hex, "SenOCR timing asset").is_err()
+            || observed
+                .observed_sha256_hex
+                .bytes()
+                .any(|byte| byte.is_ascii_uppercase())
+            || digest.byte_count != observed.observed_byte_count
+            || digest.sha256_hex != observed.observed_sha256_hex
+            || digest.role != expected_role
+        {
+            return (None, Some(Reason::MismatchedRuntimeOrAssetEvidence));
+        }
+    }
+    let model_weight = SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES
+        .iter()
+        .find(|(name, _)| *name == "model-00001-of-00001.safetensors")
+        .zip(
+            asset_plan
+                .artifact_id_by_asset_name
+                .get("model-00001-of-00001.safetensors"),
+        )
+        .and_then(|((_, bytes), artifact_id)| {
+            coverage
+                .observed_assets
+                .iter()
+                .find(|asset| asset.asset_name == "model-00001-of-00001.safetensors")
+                .map(|asset| {
+                    (
+                        *bytes,
+                        artifact_id.as_str(),
+                        asset.observed_sha256_hex.as_str(),
+                    )
+                })
+        });
+    let model_artifact_matches = run.model_artifact_digests.len() == 1
+        && model_weight.is_some_and(|(expected_bytes, artifact_id, observation_sha256)| {
+            let digest = &run.model_artifact_digests[0];
+            digest.artifact_id == artifact_id
+                && digest.role == ProviderArtifactRoleV1::Model
+                && digest.byte_count == expected_bytes
+                && digest.sha256_hex == observation_sha256
+                && run
+                    .artifact_digests
+                    .iter()
+                    .any(|observed| observed == digest)
+        });
+    if !model_artifact_matches {
+        return (None, Some(Reason::MismatchedRuntimeOrAssetEvidence));
+    }
+    let Some(candidate) = result.candidates.first() else {
+        return (None, Some(Reason::MissingRecognitionCandidate));
+    };
+    if result.candidates.len() != 1 {
+        return (None, Some(Reason::InvalidDiagnosticShape));
+    }
+    let Some(candidate_object) = candidate.raw_candidate.as_object() else {
+        return (None, Some(Reason::InvalidDiagnosticShape));
+    };
+    let Some(diagnostic) = candidate_object.get(SENOCR_MODEL_INITIALIZATION_RAW_CANDIDATE_KEY_V1)
+    else {
+        return (None, Some(Reason::MissingDiagnostic));
+    };
+    let Some(diagnostic) = diagnostic.as_object() else {
+        return (None, Some(Reason::InvalidDiagnosticShape));
+    };
+    if !diagnostic.contains_key("elapsed_ns") {
+        return (None, Some(Reason::MissingElapsedNanoseconds));
+    }
+    if !diagnostic.contains_key("scope") {
+        return (None, Some(Reason::MissingDiagnosticScope));
+    }
+    if diagnostic.len() != 5
+        || !diagnostic.contains_key("schema_version")
+        || !diagnostic.contains_key("model_revision")
+        || !diagnostic.contains_key("runtime_profile_sha256")
+    {
+        return (None, Some(Reason::InvalidDiagnosticShape));
+    }
+    if diagnostic
+        .get("schema_version")
+        .and_then(serde_json::Value::as_number)
+        .is_none_or(|number| !number.is_u64() || number.as_u64() != Some(1))
+    {
+        return (None, Some(Reason::InvalidDiagnosticShape));
+    }
+    let Some(scope) = diagnostic.get("scope").and_then(serde_json::Value::as_str) else {
+        return (None, Some(Reason::MissingDiagnosticScope));
+    };
+    if scope != SENOCR_MODEL_INITIALIZATION_SCOPE_V1 {
+        return (None, Some(Reason::UnsupportedScope));
+    }
+    if diagnostic
+        .get("model_revision")
+        .and_then(serde_json::Value::as_str)
+        != Some(SENOCR_REFERENCE_MODEL_REVISION)
+    {
+        return (None, Some(Reason::MismatchedModelRevision));
+    }
+    if diagnostic
+        .get("runtime_profile_sha256")
+        .and_then(serde_json::Value::as_str)
+        != Some(SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256)
+    {
+        return (None, Some(Reason::MismatchedRuntimeProfile));
+    }
+    let Some(elapsed_number) = diagnostic
+        .get("elapsed_ns")
+        .and_then(serde_json::Value::as_number)
+    else {
+        return (None, Some(Reason::InvalidElapsedNanoseconds));
+    };
+    let Some(elapsed_ns) = elapsed_number
+        .is_u64()
+        .then(|| elapsed_number.as_u64())
+        .flatten()
+    else {
+        return (None, Some(Reason::InvalidElapsedNanoseconds));
+    };
+    (
+        Some(BenchmarkProviderDeclaredModelInitializationV1 {
+            schema_version: 1,
+            scope: scope.to_owned(),
+            elapsed_ns,
+            model_revision: SENOCR_REFERENCE_MODEL_REVISION.to_owned(),
+            runtime_profile_sha256: SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256.to_owned(),
+        }),
+        None,
+    )
 }
 
 fn validate_provider_spec(provider: &ApprovedBenchmarkProviderV1) -> io::Result<()> {
@@ -6115,6 +6514,10 @@ mod tests {
                 model_cold_start_unavailable_reason: Some("not reported".to_owned()),
             }),
             timing_unavailable_reason: None,
+            provider_declared_model_initialization: None,
+            provider_declared_model_initialization_unavailable_reason: Some(
+                BenchmarkProviderDeclaredModelInitializationUnavailableReasonV1::MissingDiagnostic,
+            ),
             process_resources: None,
             process_resources_unavailable_reason: Some("fixture omitted counters".to_owned()),
             job_process_tree_cpu_core_equivalent_percent: None,
@@ -6144,6 +6547,277 @@ mod tests {
             status: BenchmarkRunStatusV1::Completed,
             failure_category: None,
         }
+    }
+
+    fn model_initialization_test_diagnostic(elapsed_ns: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "scope": SENOCR_MODEL_INITIALIZATION_SCOPE_V1,
+            "elapsed_ns": elapsed_ns,
+            "model_revision": SENOCR_REFERENCE_MODEL_REVISION,
+            "runtime_profile_sha256": SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256,
+        })
+    }
+
+    fn senocr_model_initialization_test_run(
+        repeat_index: u32,
+        elapsed_ns: serde_json::Value,
+    ) -> BenchmarkRunRecordV1 {
+        let mut run = output_determinism_test_run(repeat_index, "synthetic recognized text");
+        run.result.as_mut().unwrap().candidates[0].raw_candidate = serde_json::json!({
+            "senocr_model_initialization_v1":
+                model_initialization_test_diagnostic(elapsed_ns),
+        });
+        run
+    }
+
+    #[test]
+    fn provider_declared_model_initialization_requires_exact_scope_and_u64() {
+        use BenchmarkProviderDeclaredModelInitializationUnavailableReasonV1 as Reason;
+
+        let provider = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
+        let valid = senocr_model_initialization_test_run(0, serde_json::json!(123_456));
+        let original_candidate = valid.result.as_ref().unwrap().candidates[0]
+            .raw_candidate
+            .clone();
+        let (measurement, unavailable_reason) =
+            provider_declared_model_initialization_from_run(&provider, &valid);
+        let measurement = measurement.unwrap();
+        assert!(unavailable_reason.is_none());
+        assert_eq!(measurement.schema_version, 1);
+        assert_eq!(measurement.scope, SENOCR_MODEL_INITIALIZATION_SCOPE_V1);
+        assert_eq!(measurement.elapsed_ns, 123_456);
+        assert_eq!(measurement.model_revision, SENOCR_REFERENCE_MODEL_REVISION);
+        assert_eq!(
+            measurement.runtime_profile_sha256,
+            SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256
+        );
+        assert_eq!(
+            valid.result.as_ref().unwrap().candidates[0].raw_candidate,
+            original_candidate
+        );
+        for elapsed_ns in [serde_json::json!(0), serde_json::json!(u64::MAX)] {
+            let run = senocr_model_initialization_test_run(0, elapsed_ns.clone());
+            let (measurement, reason) =
+                provider_declared_model_initialization_from_run(&provider, &run);
+            assert_eq!(
+                measurement.unwrap().elapsed_ns,
+                elapsed_ns.as_u64().unwrap()
+            );
+            assert!(reason.is_none());
+        }
+
+        let invalid_elapsed_values = [
+            serde_json::json!(true),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(u64::MAX as f64 + 1.0),
+        ];
+        for elapsed_ns in invalid_elapsed_values {
+            let run = senocr_model_initialization_test_run(0, elapsed_ns);
+            let (measurement, reason) =
+                provider_declared_model_initialization_from_run(&provider, &run);
+            assert!(measurement.is_none());
+            assert_eq!(reason, Some(Reason::InvalidElapsedNanoseconds));
+        }
+
+        let mut missing_elapsed = senocr_model_initialization_test_run(0, serde_json::json!(1));
+        missing_elapsed.result.as_mut().unwrap().candidates[0].raw_candidate
+            ["senocr_model_initialization_v1"]
+            .as_object_mut()
+            .unwrap()
+            .remove("elapsed_ns");
+        let (measurement, reason) =
+            provider_declared_model_initialization_from_run(&provider, &missing_elapsed);
+        assert!(measurement.is_none());
+        assert_eq!(reason, Some(Reason::MissingElapsedNanoseconds));
+
+        let missing_diagnostic = output_determinism_test_run(0, "synthetic recognized text");
+        let (measurement, reason) =
+            provider_declared_model_initialization_from_run(&provider, &missing_diagnostic);
+        assert!(measurement.is_none());
+        assert_eq!(reason, Some(Reason::MissingDiagnostic));
+
+        let mut missing_scope = senocr_model_initialization_test_run(0, serde_json::json!(1));
+        missing_scope.result.as_mut().unwrap().candidates[0].raw_candidate
+            ["senocr_model_initialization_v1"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scope");
+        let (measurement, reason) =
+            provider_declared_model_initialization_from_run(&provider, &missing_scope);
+        assert!(measurement.is_none());
+        assert_eq!(reason, Some(Reason::MissingDiagnosticScope));
+
+        let mut unknown_scope = senocr_model_initialization_test_run(0, serde_json::json!(1));
+        unknown_scope.result.as_mut().unwrap().candidates[0].raw_candidate["senocr_model_initialization_v1"]
+            ["scope"] = serde_json::json!("unknown-scope");
+        let (measurement, reason) =
+            provider_declared_model_initialization_from_run(&provider, &unknown_scope);
+        assert!(measurement.is_none());
+        assert_eq!(reason, Some(Reason::UnsupportedScope));
+
+        let mut wrong_model = senocr_model_initialization_test_run(0, serde_json::json!(1));
+        wrong_model.result.as_mut().unwrap().candidates[0].raw_candidate["senocr_model_initialization_v1"]
+            ["model_revision"] = serde_json::json!("other-model-revision");
+        let (measurement, reason) =
+            provider_declared_model_initialization_from_run(&provider, &wrong_model);
+        assert!(measurement.is_none());
+        assert_eq!(reason, Some(Reason::MismatchedModelRevision));
+
+        let mut wrong_runtime = senocr_model_initialization_test_run(0, serde_json::json!(1));
+        wrong_runtime.result.as_mut().unwrap().candidates[0].raw_candidate["senocr_model_initialization_v1"]
+            ["runtime_profile_sha256"] = serde_json::json!("0".repeat(64));
+        let (measurement, reason) =
+            provider_declared_model_initialization_from_run(&provider, &wrong_runtime);
+        assert!(measurement.is_none());
+        assert_eq!(reason, Some(Reason::MismatchedRuntimeProfile));
+
+        let mut malformed = senocr_model_initialization_test_run(0, serde_json::json!(1));
+        malformed.result.as_mut().unwrap().candidates[0].raw_candidate["senocr_model_initialization_v1"]
+            ["unexpected"] = serde_json::json!(true);
+        let (measurement, reason) =
+            provider_declared_model_initialization_from_run(&provider, &malformed);
+        assert!(measurement.is_none());
+        assert_eq!(reason, Some(Reason::InvalidDiagnosticShape));
+
+        let mut incomplete_assets = senocr_model_initialization_test_run(0, serde_json::json!(1));
+        incomplete_assets.quality_evidence.status =
+            BenchmarkQualityEvidenceStatusV1::IncompleteSenocrEvidence;
+        incomplete_assets.quality_evidence.unavailable_reason =
+            Some("fixture omitted required assets".to_owned());
+        let (measurement, reason) =
+            provider_declared_model_initialization_from_run(&provider, &incomplete_assets);
+        assert!(measurement.is_none());
+        assert_eq!(reason, Some(Reason::IncompleteRuntimeOrAssetEvidence));
+
+        let mut mismatched_identity = senocr_model_initialization_test_run(0, serde_json::json!(1));
+        mismatched_identity
+            .provider_identity
+            .as_mut()
+            .unwrap()
+            .provider_version = "unrecognized-worker-version".to_owned();
+        mismatched_identity
+            .result
+            .as_mut()
+            .unwrap()
+            .provider
+            .provider_version = "unrecognized-worker-version".to_owned();
+        let (measurement, reason) =
+            provider_declared_model_initialization_from_run(&provider, &mismatched_identity);
+        assert!(measurement.is_none());
+        assert_eq!(reason, Some(Reason::MismatchedProviderIdentity));
+
+        let mut mismatched_asset = senocr_model_initialization_test_run(0, serde_json::json!(1));
+        mismatched_asset
+            .quality_evidence
+            .model_asset_coverage
+            .as_mut()
+            .unwrap()
+            .observed_assets[0]
+            .observed_sha256_hex = "0".repeat(64);
+        let (measurement, reason) =
+            provider_declared_model_initialization_from_run(&provider, &mismatched_asset);
+        assert!(measurement.is_none());
+        assert_eq!(reason, Some(Reason::MismatchedRuntimeOrAssetEvidence));
+
+        let mut non_senocr = output_determinism_test_run(0, "diagnostic text");
+        non_senocr.provider_id = "other-provider".to_owned();
+        non_senocr.provider_configuration_id = "other-configuration".to_owned();
+        non_senocr.provider_identity.as_mut().unwrap().provider_id = "other-provider".to_owned();
+        non_senocr.result.as_mut().unwrap().provider.provider_id = "other-provider".to_owned();
+        let (measurement, reason) =
+            provider_declared_model_initialization_from_run(&provider, &non_senocr);
+        assert!(measurement.is_none());
+        assert_eq!(reason, Some(Reason::NotApplicable));
+    }
+
+    #[test]
+    fn provider_declared_model_initialization_summarizes_all_attempts_without_changing_output_hashes()
+     {
+        let provider = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
+        let mut primary = senocr_model_initialization_test_run(0, serde_json::json!(100));
+        let mut secondary = senocr_model_initialization_test_run(1, serde_json::json!(300));
+        for run in [&mut primary, &mut secondary] {
+            let (measurement, reason) =
+                provider_declared_model_initialization_from_run(&provider, run);
+            run.provider_declared_model_initialization = measurement;
+            run.provider_declared_model_initialization_unavailable_reason = reason;
+        }
+        assert_ne!(
+            primary.result.as_ref().unwrap().candidates[0].raw_candidate,
+            secondary.result.as_ref().unwrap().candidates[0].raw_candidate
+        );
+        let determinism = compare_output_determinism_records(&[primary.clone(), secondary.clone()]);
+        assert_eq!(
+            determinism.status,
+            BenchmarkOutputDeterminismStatusV1::Equal
+        );
+        assert_eq!(determinism.distinct_output_count, Some(1));
+
+        let mut summary = ProviderSummaryAccumulator::new(
+            SENOCR_REFERENCE_PROVIDER_ID.to_owned(),
+            SENOCR_REFERENCE_CONFIGURATION_ID.to_owned(),
+            2,
+        )
+        .unwrap();
+        summary.observe(&primary).unwrap();
+        summary.observe(&secondary).unwrap();
+        let summary = summary.finish().unwrap();
+        let model_init_summary = summary.provider_declared_model_initialization.unwrap();
+        assert_eq!(
+            model_init_summary.scope,
+            SENOCR_MODEL_INITIALIZATION_SCOPE_V1
+        );
+        assert_eq!(model_init_summary.elapsed_ns.unit, "nanoseconds");
+        assert_eq!(model_init_summary.elapsed_ns.sample_count, 2);
+        assert_eq!(model_init_summary.elapsed_ns.missing_observation_count, 0);
+        assert_eq!(model_init_summary.elapsed_ns.p50, Some(100));
+        assert_eq!(model_init_summary.elapsed_ns.p95, Some(300));
+        assert_eq!(summary.model_cold_start_ns.sample_count, 0);
+        assert!(summary.model_cold_start_ns.unavailable_reason.is_some());
+    }
+
+    #[test]
+    fn provider_declared_model_initialization_summary_counts_missing_attempts() {
+        use BenchmarkProviderDeclaredModelInitializationUnavailableReasonV1 as Reason;
+
+        let provider = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
+        let mut measured = senocr_model_initialization_test_run(0, serde_json::json!(250));
+        let (observation, reason) =
+            provider_declared_model_initialization_from_run(&provider, &measured);
+        measured.provider_declared_model_initialization = observation;
+        measured.provider_declared_model_initialization_unavailable_reason = reason;
+
+        let mut missing = output_determinism_test_run(1, "synthetic recognized text");
+        let (observation, reason) =
+            provider_declared_model_initialization_from_run(&provider, &missing);
+        assert!(observation.is_none());
+        assert_eq!(reason, Some(Reason::MissingDiagnostic));
+        missing.provider_declared_model_initialization = observation;
+        missing.provider_declared_model_initialization_unavailable_reason = reason;
+
+        let mut summary = ProviderSummaryAccumulator::new(
+            SENOCR_REFERENCE_PROVIDER_ID.to_owned(),
+            SENOCR_REFERENCE_CONFIGURATION_ID.to_owned(),
+            2,
+        )
+        .unwrap();
+        summary.observe(&measured).unwrap();
+        summary.observe(&missing).unwrap();
+        let summary = summary.finish().unwrap();
+        let initialization = summary.provider_declared_model_initialization.unwrap();
+        assert_eq!(initialization.elapsed_ns.sample_count, 1);
+        assert_eq!(initialization.elapsed_ns.missing_observation_count, 1);
+        assert_eq!(initialization.elapsed_ns.p50, Some(250));
+        assert!(initialization.elapsed_ns.unavailable_reason.is_none());
+        assert!(
+            initialization
+                .elapsed_ns
+                .missing_observation_reason
+                .is_some()
+        );
+        assert_eq!(summary.model_cold_start_ns.sample_count, 0);
     }
 
     fn compare_output_determinism_records(
@@ -8014,6 +8688,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("peak_direct_process_working_set_bytes_raw");
+        legacy_summary
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_declared_model_initialization");
         let restored_summary: BenchmarkProviderSummaryV1 =
             serde_json::from_value(legacy_summary).unwrap();
         assert!(
@@ -8025,6 +8703,33 @@ mod tests {
         assert!(
             restored_summary
                 .peak_direct_process_working_set_bytes_raw
+                .is_none()
+        );
+        assert!(
+            restored_summary
+                .provider_declared_model_initialization
+                .is_none()
+        );
+
+        let mut legacy_run =
+            serde_json::to_value(output_determinism_test_run(0, "legacy")).unwrap();
+        legacy_run
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_declared_model_initialization");
+        legacy_run
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_declared_model_initialization_unavailable_reason");
+        let restored_run: BenchmarkRunRecordV1 = serde_json::from_value(legacy_run).unwrap();
+        assert!(
+            restored_run
+                .provider_declared_model_initialization
+                .is_none()
+        );
+        assert!(
+            restored_run
+                .provider_declared_model_initialization_unavailable_reason
                 .is_none()
         );
     }
