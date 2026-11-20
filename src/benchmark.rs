@@ -69,6 +69,11 @@ const MAX_ANNOTATIONS: usize = MAX_BENCHMARK_CASES;
 const MAX_REFERENCE_TEXT_BYTES: usize = 64 * 1024;
 const MAX_NFD_MARK_SCALARS: usize = 4 * MAX_REFERENCE_TEXT_BYTES;
 const MAX_METRIC_DP_CELLS: usize = 1024 * 1024;
+const ORTHOGRAPHIC_BOUNDARY_ALIGNMENT_POLICY_V1: &str = concat!(
+    "nfc_scalar_stream_with_interior_unicode_whitespace_boundary_tokens_v1; ",
+    "ties prefer equal match, substitution, deletion, insertion; ",
+    "boundary-to-scalar substitutions count FN and scalar-to-boundary substitutions count FP"
+);
 const MAX_BOOTSTRAP_REPLICATES: u32 = 5_000;
 const MAX_TOTAL_BOOTSTRAP_CLUSTER_DRAWS: u64 = 10_000_000;
 const SENOCR_REFERENCE_PROVIDER_ID: &str = "senocr-v1-fp32-local";
@@ -655,7 +660,7 @@ pub(crate) struct BenchmarkCountMetricV1 {
     pub reference_units: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BenchmarkCandidateMetricsV1 {
     pub candidate_rank: u16,
@@ -676,6 +681,12 @@ pub(crate) struct BenchmarkCandidateMetricsV1 {
     pub syllable_boundary_offset_diagnostic: Option<BenchmarkCountMetricV1>,
     pub syllable_boundary_offset_diagnostic_unavailable_reason: Option<String>,
     pub syllable_boundary_diagnostic_policy: String,
+    /// Alignment-aware orthographic-whitespace boundaries; the legacy
+    /// cumulative-offset diagnostic above remains separate and unchanged.
+    #[serde(default)]
+    pub orthographic_whitespace_boundary_alignment: Option<BenchmarkAlignedBoundaryMetricV1>,
+    #[serde(default)]
+    pub orthographic_whitespace_boundary_alignment_unavailable_reason: Option<String>,
     pub delayed_attachment_unavailable_reason: String,
 }
 
@@ -736,6 +747,9 @@ pub(crate) struct BenchmarkProviderSummaryV1 {
     /// Missing on legacy summaries; new summaries keep cursive CER separate by split.
     #[serde(default)]
     pub cursive_only_cer_by_split: Option<Vec<BenchmarkCursiveOnlyCerSummaryV1>>,
+    /// Missing on legacy summaries; new summaries aggregate aligned boundaries by split.
+    #[serde(default)]
+    pub orthographic_whitespace_boundary_by_split: Option<Vec<BenchmarkAlignedBoundarySummaryV1>>,
     pub app_batch_call_wall_ns: BenchmarkU64PercentilesV1,
     pub process_create_call_to_handshake_ns: BenchmarkU64PercentilesV1,
     pub process_create_call_to_recognition_ns: BenchmarkU64PercentilesV1,
@@ -766,6 +780,42 @@ pub(crate) struct BenchmarkCursiveOnlyCerSummaryV1 {
     pub scored_case_count: u32,
     pub unavailable_case_count: u32,
     pub nfc_unicode_scalar_micro_cer: Option<BenchmarkCountMetricV1>,
+    pub unavailable_reason: Option<String>,
+    pub partial_coverage_note: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkAlignedBoundaryCountsV1 {
+    pub true_positive_boundary_count: u64,
+    pub false_positive_boundary_count: u64,
+    pub false_negative_boundary_count: u64,
+    pub reference_boundary_total: u64,
+    pub hypothesis_boundary_total: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkAlignedBoundaryMetricV1 {
+    pub counts: BenchmarkAlignedBoundaryCountsV1,
+    pub micro_error_rate: Option<f64>,
+    pub micro_error_rate_unavailable_reason: Option<String>,
+    pub precision: Option<f64>,
+    pub precision_unavailable_reason: Option<String>,
+    pub recall: Option<f64>,
+    pub recall_unavailable_reason: Option<String>,
+    pub f1: Option<f64>,
+    pub f1_unavailable_reason: Option<String>,
+    pub alignment_policy: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkAlignedBoundarySummaryV1 {
+    pub split: Option<BenchmarkSplitV1>,
+    pub aligned_case_count: u32,
+    pub unavailable_case_count: u32,
+    pub metric: Option<BenchmarkAlignedBoundaryMetricV1>,
     pub unavailable_reason: Option<String>,
     pub partial_coverage_note: Option<String>,
 }
@@ -1327,6 +1377,101 @@ fn finish_cursive_only_cer_by_split(
     Ok(summaries)
 }
 
+#[derive(Default)]
+struct AlignedBoundaryAccumulator {
+    counts: BenchmarkAlignedBoundaryCountsV1,
+    aligned_case_count: u32,
+    unavailable_case_count: u32,
+}
+
+impl AlignedBoundaryAccumulator {
+    fn observe(&mut self, metric: Option<&BenchmarkAlignedBoundaryMetricV1>) -> io::Result<()> {
+        if let Some(metric) = metric {
+            self.counts.true_positive_boundary_count = self
+                .counts
+                .true_positive_boundary_count
+                .checked_add(metric.counts.true_positive_boundary_count)
+                .ok_or_else(|| invalid_data("aggregated true-positive boundary count overflow"))?;
+            self.counts.false_positive_boundary_count = self
+                .counts
+                .false_positive_boundary_count
+                .checked_add(metric.counts.false_positive_boundary_count)
+                .ok_or_else(|| invalid_data("aggregated false-positive boundary count overflow"))?;
+            self.counts.false_negative_boundary_count = self
+                .counts
+                .false_negative_boundary_count
+                .checked_add(metric.counts.false_negative_boundary_count)
+                .ok_or_else(|| invalid_data("aggregated false-negative boundary count overflow"))?;
+            self.counts.reference_boundary_total = self
+                .counts
+                .reference_boundary_total
+                .checked_add(metric.counts.reference_boundary_total)
+                .ok_or_else(|| invalid_data("aggregated reference boundary total overflow"))?;
+            self.counts.hypothesis_boundary_total = self
+                .counts
+                .hypothesis_boundary_total
+                .checked_add(metric.counts.hypothesis_boundary_total)
+                .ok_or_else(|| invalid_data("aggregated hypothesis boundary total overflow"))?;
+            self.aligned_case_count = self
+                .aligned_case_count
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("aligned boundary case count overflow"))?;
+        } else {
+            self.unavailable_case_count = self
+                .unavailable_case_count
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("unavailable boundary case count overflow"))?;
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        split: Option<BenchmarkSplitV1>,
+    ) -> io::Result<BenchmarkAlignedBoundarySummaryV1> {
+        let metric = if self.aligned_case_count > 0 {
+            Some(aligned_boundary_metric_from_counts(self.counts)?)
+        } else {
+            None
+        };
+        let unavailable_reason = metric.is_none().then(|| {
+            "no quality-eligible aligned orthographic-whitespace boundary observations were available; inspect per-run reasons"
+                .to_owned()
+        });
+        let partial_coverage_note = (metric.is_some() && self.unavailable_case_count > 0).then(|| {
+            "micro boundary metrics cover only cases with available alignment; inspect unavailable case count"
+                .to_owned()
+        });
+        Ok(BenchmarkAlignedBoundarySummaryV1 {
+            split,
+            aligned_case_count: self.aligned_case_count,
+            unavailable_case_count: self.unavailable_case_count,
+            metric,
+            unavailable_reason,
+            partial_coverage_note,
+        })
+    }
+}
+
+fn accumulate_aligned_boundaries_by_split(
+    accumulators: &mut BTreeMap<Option<BenchmarkSplitV1>, AlignedBoundaryAccumulator>,
+    split: Option<BenchmarkSplitV1>,
+    metric: Option<&BenchmarkAlignedBoundaryMetricV1>,
+) -> io::Result<()> {
+    accumulators.entry(split).or_default().observe(metric)
+}
+
+fn finish_aligned_boundaries_by_split(
+    accumulators: BTreeMap<Option<BenchmarkSplitV1>, AlignedBoundaryAccumulator>,
+) -> io::Result<Vec<BenchmarkAlignedBoundarySummaryV1>> {
+    let mut summaries = Vec::new();
+    summaries.try_reserve_exact(accumulators.len())?;
+    for (split, accumulator) in accumulators {
+        summaries.push(accumulator.finish(split)?);
+    }
+    Ok(summaries)
+}
+
 struct ProviderSummaryAccumulator {
     provider_id: String,
     configuration_id: String,
@@ -1334,6 +1479,7 @@ struct ProviderSummaryAccumulator {
     completed_run_count: u32,
     failed_run_count: u32,
     cursive_cer_by_split: BTreeMap<Option<BenchmarkSplitV1>, CursiveOnlyCerAccumulator>,
+    aligned_boundary_by_split: BTreeMap<Option<BenchmarkSplitV1>, AlignedBoundaryAccumulator>,
     app_batch_call_wall_ns: Vec<u64>,
     process_create_call_to_handshake_ns: Vec<u64>,
     process_create_call_to_recognition_ns: Vec<u64>,
@@ -1354,6 +1500,7 @@ impl ProviderSummaryAccumulator {
             completed_run_count: 0,
             failed_run_count: 0,
             cursive_cer_by_split: BTreeMap::new(),
+            aligned_boundary_by_split: BTreeMap::new(),
             app_batch_call_wall_ns: Vec::new(),
             process_create_call_to_handshake_ns: Vec::new(),
             process_create_call_to_recognition_ns: Vec::new(),
@@ -1401,16 +1548,23 @@ impl ProviderSummaryAccumulator {
                     .ok_or_else(|| invalid_data("provider summary failure count overflow"))?;
             }
         }
-        let nfc_cer = run
+        let rank_zero_metrics = run
             .candidate_metrics
             .iter()
-            .find(|metrics| metrics.candidate_rank == 0)
-            .and_then(|metrics| metrics.nfc_unicode_scalar_cer.as_ref());
+            .find(|metrics| metrics.candidate_rank == 0);
+        let nfc_cer = rank_zero_metrics.and_then(|metrics| metrics.nfc_unicode_scalar_cer.as_ref());
         accumulate_cursive_cer_by_split(
             &mut self.cursive_cer_by_split,
             run.split,
             run.reference_handwriting_style,
             nfc_cer,
+        )?;
+        let aligned_boundary_metric = rank_zero_metrics
+            .and_then(|metrics| metrics.orthographic_whitespace_boundary_alignment.as_ref());
+        accumulate_aligned_boundaries_by_split(
+            &mut self.aligned_boundary_by_split,
+            run.split,
+            aligned_boundary_metric,
         )?;
         self.app_batch_call_wall_ns
             .push(run.elapsed_app_batch_call_wall_ns);
@@ -1446,6 +1600,9 @@ impl ProviderSummaryAccumulator {
         let attempted_run_count = self.attempted_run_count;
         let cursive_only_cer_by_split =
             finish_cursive_only_cer_by_split(std::mem::take(&mut self.cursive_cer_by_split))?;
+        let orthographic_whitespace_boundary_by_split = finish_aligned_boundaries_by_split(
+            std::mem::take(&mut self.aligned_boundary_by_split),
+        )?;
         Ok(BenchmarkProviderSummaryV1 {
             provider_id: self.provider_id,
             configuration_id: self.configuration_id,
@@ -1453,6 +1610,9 @@ impl ProviderSummaryAccumulator {
             completed_run_count: self.completed_run_count,
             failed_run_count: self.failed_run_count,
             cursive_only_cer_by_split: Some(cursive_only_cer_by_split),
+            orthographic_whitespace_boundary_by_split: Some(
+                orthographic_whitespace_boundary_by_split,
+            ),
             app_batch_call_wall_ns: u64_percentiles(
                 &mut self.app_batch_call_wall_ns,
                 attempted_run_count,
@@ -3853,6 +4013,12 @@ fn score_candidate(
     let boundary_unavailable_reason = reference_boundaries
         .is_empty()
         .then(|| "no reference whitespace syllable boundary exists".to_owned());
+    let orthographic_whitespace_boundary_alignment =
+        aligned_orthographic_whitespace_boundaries(&reference, &hypothesis)?;
+    let orthographic_whitespace_boundary_alignment_unavailable_reason =
+        orthographic_whitespace_boundary_alignment
+            .is_none()
+            .then(|| "aligned orthographic-whitespace boundary DP cell cap exceeded".to_owned());
     let lexical_wer_unavailable_reason = if annotation.reference_lexical_tokens.is_some() {
         "predicted lexical token boundaries are unavailable; supplied references alone do not establish a word segmenter"
             .to_owned()
@@ -3883,7 +4049,301 @@ fn score_candidate(
         syllable_boundary_offset_diagnostic: boundary_metric,
         syllable_boundary_offset_diagnostic_unavailable_reason: boundary_unavailable_reason,
         syllable_boundary_diagnostic_policy: "symmetric_difference_cumulative_non_whitespace_nfc_scalar_offsets_v1; not aligned boundary accuracy".to_owned(),
+        orthographic_whitespace_boundary_alignment,
+        orthographic_whitespace_boundary_alignment_unavailable_reason,
         delayed_attachment_unavailable_reason,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WhitespaceBoundaryTokenV1 {
+    Scalar(char),
+    Boundary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundaryAlignmentStepV1 {
+    Origin,
+    Match,
+    Substitute,
+    Delete,
+    Insert,
+}
+
+fn whitespace_boundary_tokens(value: &str) -> io::Result<Vec<WhitespaceBoundaryTokenV1>> {
+    let mut tokens = Vec::new();
+    tokens.try_reserve_exact(value.chars().count())?;
+    let mut pending_interior_boundary = false;
+    for scalar in value.chars() {
+        if scalar.is_whitespace() {
+            if !tokens.is_empty() {
+                pending_interior_boundary = true;
+            }
+        } else {
+            if pending_interior_boundary {
+                tokens.push(WhitespaceBoundaryTokenV1::Boundary);
+                pending_interior_boundary = false;
+            }
+            tokens.push(WhitespaceBoundaryTokenV1::Scalar(scalar));
+        }
+    }
+    Ok(tokens)
+}
+
+fn aligned_orthographic_whitespace_boundaries(
+    reference_nfc: &str,
+    hypothesis_nfc: &str,
+) -> io::Result<Option<BenchmarkAlignedBoundaryMetricV1>> {
+    let reference_tokens = whitespace_boundary_tokens(reference_nfc)?;
+    let hypothesis_tokens = whitespace_boundary_tokens(hypothesis_nfc)?;
+    let Some(counts) = align_whitespace_boundary_tokens(&reference_tokens, &hypothesis_tokens)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(aligned_boundary_metric_from_counts(counts)?))
+}
+
+fn align_whitespace_boundary_tokens(
+    reference: &[WhitespaceBoundaryTokenV1],
+    hypothesis: &[WhitespaceBoundaryTokenV1],
+) -> io::Result<Option<BenchmarkAlignedBoundaryCountsV1>> {
+    let rows = reference
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("boundary-alignment row count overflow"))?;
+    let columns = hypothesis
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| invalid_data("boundary-alignment column count overflow"))?;
+    let cell_count = rows
+        .checked_mul(columns)
+        .ok_or_else(|| invalid_data("boundary-alignment cell count overflow"))?;
+    if cell_count > MAX_METRIC_DP_CELLS {
+        return Ok(None);
+    }
+
+    let mut distances = Vec::new();
+    distances.try_reserve_exact(cell_count)?;
+    distances.resize(cell_count, 0u32);
+    let mut steps = Vec::new();
+    steps.try_reserve_exact(cell_count)?;
+    steps.resize(cell_count, BoundaryAlignmentStepV1::Origin);
+    for row in 1..rows {
+        let index = row * columns;
+        distances[index] = u32::try_from(row)
+            .map_err(|_| invalid_data("boundary-alignment row distance overflow"))?;
+        steps[index] = BoundaryAlignmentStepV1::Delete;
+    }
+    for column in 1..columns {
+        distances[column] = u32::try_from(column)
+            .map_err(|_| invalid_data("boundary-alignment column distance overflow"))?;
+        steps[column] = BoundaryAlignmentStepV1::Insert;
+    }
+
+    // Ties are resolved without consulting boundary scores: equal diagonal
+    // match first, then substitution, deletion, insertion.
+    for row in 1..rows {
+        for column in 1..columns {
+            let diagonal_index = (row - 1) * columns + column - 1;
+            let deletion_index = (row - 1) * columns + column;
+            let insertion_index = row * columns + column - 1;
+            let current_index = row * columns + column;
+            let equal = reference[row - 1] == hypothesis[column - 1];
+            let mut best_cost = if equal {
+                distances[diagonal_index]
+            } else {
+                distances[diagonal_index]
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("boundary-alignment distance overflow"))?
+            };
+            let mut best_step = if equal {
+                BoundaryAlignmentStepV1::Match
+            } else {
+                BoundaryAlignmentStepV1::Substitute
+            };
+
+            let deletion_cost = distances[deletion_index]
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("boundary-alignment distance overflow"))?;
+            if deletion_cost < best_cost {
+                best_cost = deletion_cost;
+                best_step = BoundaryAlignmentStepV1::Delete;
+            }
+
+            let insertion_cost = distances[insertion_index]
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("boundary-alignment distance overflow"))?;
+            if insertion_cost < best_cost {
+                best_cost = insertion_cost;
+                best_step = BoundaryAlignmentStepV1::Insert;
+            }
+
+            distances[current_index] = best_cost;
+            steps[current_index] = best_step;
+        }
+    }
+
+    let mut counts = BenchmarkAlignedBoundaryCountsV1 {
+        reference_boundary_total: u64::try_from(
+            reference
+                .iter()
+                .filter(|token| **token == WhitespaceBoundaryTokenV1::Boundary)
+                .count(),
+        )
+        .map_err(|_| invalid_data("reference boundary count exceeds u64"))?,
+        hypothesis_boundary_total: u64::try_from(
+            hypothesis
+                .iter()
+                .filter(|token| **token == WhitespaceBoundaryTokenV1::Boundary)
+                .count(),
+        )
+        .map_err(|_| invalid_data("hypothesis boundary count exceeds u64"))?,
+        ..BenchmarkAlignedBoundaryCountsV1::default()
+    };
+    let mut row = reference.len();
+    let mut column = hypothesis.len();
+    while row > 0 || column > 0 {
+        let step = if row == 0 {
+            BoundaryAlignmentStepV1::Insert
+        } else if column == 0 {
+            BoundaryAlignmentStepV1::Delete
+        } else {
+            steps[row * columns + column]
+        };
+        match step {
+            BoundaryAlignmentStepV1::Match => {
+                if reference[row - 1] == WhitespaceBoundaryTokenV1::Boundary {
+                    counts.true_positive_boundary_count = counts
+                        .true_positive_boundary_count
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("true-positive boundary count overflow"))?;
+                }
+                row -= 1;
+                column -= 1;
+            }
+            BoundaryAlignmentStepV1::Substitute => {
+                match (reference[row - 1], hypothesis[column - 1]) {
+                    (WhitespaceBoundaryTokenV1::Boundary, WhitespaceBoundaryTokenV1::Scalar(_)) => {
+                        counts.false_negative_boundary_count = counts
+                            .false_negative_boundary_count
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                invalid_data("false-negative boundary count overflow")
+                            })?;
+                    }
+                    (WhitespaceBoundaryTokenV1::Scalar(_), WhitespaceBoundaryTokenV1::Boundary) => {
+                        counts.false_positive_boundary_count = counts
+                            .false_positive_boundary_count
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                invalid_data("false-positive boundary count overflow")
+                            })?;
+                    }
+                    _ => {}
+                }
+                row -= 1;
+                column -= 1;
+            }
+            BoundaryAlignmentStepV1::Delete => {
+                if reference[row - 1] == WhitespaceBoundaryTokenV1::Boundary {
+                    counts.false_negative_boundary_count = counts
+                        .false_negative_boundary_count
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("false-negative boundary count overflow"))?;
+                }
+                row -= 1;
+            }
+            BoundaryAlignmentStepV1::Insert => {
+                if hypothesis[column - 1] == WhitespaceBoundaryTokenV1::Boundary {
+                    counts.false_positive_boundary_count = counts
+                        .false_positive_boundary_count
+                        .checked_add(1)
+                        .ok_or_else(|| invalid_data("false-positive boundary count overflow"))?;
+                }
+                column -= 1;
+            }
+            BoundaryAlignmentStepV1::Origin => {
+                return Err(invalid_data(
+                    "boundary-alignment traceback reached origin early",
+                ));
+            }
+        }
+    }
+    Ok(Some(counts))
+}
+
+fn aligned_boundary_metric_from_counts(
+    counts: BenchmarkAlignedBoundaryCountsV1,
+) -> io::Result<BenchmarkAlignedBoundaryMetricV1> {
+    let hypothesis_boundaries = counts
+        .true_positive_boundary_count
+        .checked_add(counts.false_positive_boundary_count)
+        .ok_or_else(|| invalid_data("aligned hypothesis boundary count overflow"))?;
+    let reference_boundaries = counts
+        .true_positive_boundary_count
+        .checked_add(counts.false_negative_boundary_count)
+        .ok_or_else(|| invalid_data("aligned reference boundary count overflow"))?;
+    if hypothesis_boundaries != counts.hypothesis_boundary_total
+        || reference_boundaries != counts.reference_boundary_total
+    {
+        return Err(invalid_data(
+            "aligned boundary counts do not match stream totals",
+        ));
+    }
+    let boundary_errors = counts
+        .false_positive_boundary_count
+        .checked_add(counts.false_negative_boundary_count)
+        .ok_or_else(|| invalid_data("aligned boundary error count overflow"))?;
+
+    let micro_error_rate = if counts.reference_boundary_total > 0 {
+        Some(boundary_errors as f64 / counts.reference_boundary_total as f64)
+    } else {
+        None
+    };
+    let micro_error_rate_unavailable_reason = (micro_error_rate.is_none()).then(|| {
+        "no reference orthographic-whitespace boundaries; micro error-rate denominator is zero"
+            .to_owned()
+    });
+    let precision = if counts.hypothesis_boundary_total > 0 {
+        Some(counts.true_positive_boundary_count as f64 / counts.hypothesis_boundary_total as f64)
+    } else {
+        None
+    };
+    let precision_unavailable_reason = (precision.is_none())
+        .then(|| "no hypothesis boundaries; precision denominator is zero".to_owned());
+    let recall = if counts.reference_boundary_total > 0 {
+        Some(counts.true_positive_boundary_count as f64 / counts.reference_boundary_total as f64)
+    } else {
+        None
+    };
+    let recall_unavailable_reason = (recall.is_none())
+        .then(|| "no reference boundaries; recall denominator is zero".to_owned());
+    let doubled_true_positive = counts
+        .true_positive_boundary_count
+        .checked_mul(2)
+        .ok_or_else(|| invalid_data("aligned F1 numerator overflow"))?;
+    let f1_denominator = doubled_true_positive
+        .checked_add(counts.false_positive_boundary_count)
+        .and_then(|value| value.checked_add(counts.false_negative_boundary_count))
+        .ok_or_else(|| invalid_data("aligned F1 denominator overflow"))?;
+    let f1 = if f1_denominator > 0 {
+        Some(doubled_true_positive as f64 / f1_denominator as f64)
+    } else {
+        None
+    };
+    let f1_unavailable_reason = (f1.is_none())
+        .then(|| "no reference or hypothesis boundaries; F1 denominator is zero".to_owned());
+    Ok(BenchmarkAlignedBoundaryMetricV1 {
+        counts,
+        micro_error_rate,
+        micro_error_rate_unavailable_reason,
+        precision,
+        precision_unavailable_reason,
+        recall,
+        recall_unavailable_reason,
+        f1,
+        f1_unavailable_reason,
+        alignment_policy: ORTHOGRAPHIC_BOUNDARY_ALIGNMENT_POLICY_V1.to_owned(),
     })
 }
 
@@ -4587,6 +5047,21 @@ mod tests {
             reference_lexical_tokens: None,
             delayed_marks: Vec::new(),
         }
+    }
+
+    fn boundary_metric_for_texts(
+        reference_text: &str,
+        hypothesis_text: &str,
+    ) -> BenchmarkAlignedBoundaryMetricV1 {
+        score_candidate(
+            hypothesis_text,
+            &annotation(reference_text),
+            BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+            0,
+        )
+        .unwrap()
+        .orthographic_whitespace_boundary_alignment
+        .unwrap()
     }
 
     fn senocr_quality_test_provider(asset_count: usize) -> PreparedBenchmarkProvider {
@@ -6260,6 +6735,251 @@ mod tests {
     }
 
     #[test]
+    fn aligned_whitespace_boundaries_ignore_prefix_and_internal_scalar_edits() {
+        for (reference, hypothesis) in [
+            ("ab cd", "xab cd"),
+            ("ab cd", "aXb cd"),
+            ("xab cd", "ab cd"),
+            ("aXb cd", "ab cd"),
+        ] {
+            let metric = boundary_metric_for_texts(reference, hypothesis);
+            assert_eq!(
+                metric.counts,
+                BenchmarkAlignedBoundaryCountsV1 {
+                    true_positive_boundary_count: 1,
+                    false_positive_boundary_count: 0,
+                    false_negative_boundary_count: 0,
+                    reference_boundary_total: 1,
+                    hypothesis_boundary_total: 1,
+                }
+            );
+            assert_eq!(metric.micro_error_rate, Some(0.0));
+        }
+    }
+
+    #[test]
+    fn aligned_whitespace_boundaries_count_missing_extra_and_moved_boundaries() {
+        let missing = boundary_metric_for_texts("ab cd", "abcd");
+        assert_eq!(missing.counts.reference_boundary_total, 1);
+        assert_eq!(missing.counts.hypothesis_boundary_total, 0);
+        assert_eq!(missing.counts.false_negative_boundary_count, 1);
+        assert_eq!(missing.micro_error_rate, Some(1.0));
+        assert!(missing.precision.is_none());
+        assert_eq!(missing.recall, Some(0.0));
+        assert_eq!(missing.f1, Some(0.0));
+
+        let extra = boundary_metric_for_texts("abcd", "ab cd");
+        assert_eq!(extra.counts.reference_boundary_total, 0);
+        assert_eq!(extra.counts.hypothesis_boundary_total, 1);
+        assert_eq!(extra.counts.false_positive_boundary_count, 1);
+        assert!(extra.micro_error_rate.is_none());
+        assert!(
+            extra
+                .micro_error_rate_unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("denominator is zero"))
+        );
+        assert_eq!(extra.precision, Some(0.0));
+        assert!(extra.recall.is_none());
+        assert_eq!(extra.f1, Some(0.0));
+
+        let moved = boundary_metric_for_texts("abc def", "a bcdef");
+        assert_eq!(moved.counts.reference_boundary_total, 1);
+        assert_eq!(moved.counts.hypothesis_boundary_total, 1);
+        assert_eq!(moved.counts.true_positive_boundary_count, 0);
+        assert_eq!(moved.counts.false_positive_boundary_count, 1);
+        assert_eq!(moved.counts.false_negative_boundary_count, 1);
+        assert_eq!(moved.micro_error_rate, Some(2.0));
+        assert_eq!(moved.precision, Some(0.0));
+        assert_eq!(moved.recall, Some(0.0));
+        assert_eq!(moved.f1, Some(0.0));
+    }
+
+    #[test]
+    fn aligned_whitespace_boundary_repeated_scalar_tie_policy_is_deterministic() {
+        let first = boundary_metric_for_texts("aa a", "a aa");
+        let second = boundary_metric_for_texts("aa a", "a aa");
+        assert_eq!(first.counts, second.counts);
+        assert_eq!(first.counts.true_positive_boundary_count, 0);
+        assert_eq!(first.counts.false_positive_boundary_count, 1);
+        assert_eq!(first.counts.false_negative_boundary_count, 1);
+        assert!(
+            first
+                .alignment_policy
+                .contains("ties prefer equal match, substitution, deletion, insertion")
+        );
+    }
+
+    #[test]
+    fn aligned_whitespace_boundaries_normalize_nfc_and_collapse_unicode_whitespace_runs() {
+        let metric = boundary_metric_for_texts(" \t e\u{0301}\u{00a0}\n  x \u{2003}", "é x");
+        assert_eq!(metric.counts.true_positive_boundary_count, 1);
+        assert_eq!(metric.counts.false_positive_boundary_count, 0);
+        assert_eq!(metric.counts.false_negative_boundary_count, 0);
+        assert_eq!(metric.counts.reference_boundary_total, 1);
+        assert_eq!(metric.counts.hypothesis_boundary_total, 1);
+    }
+
+    #[test]
+    fn aligned_whitespace_zero_denominators_are_null_and_keep_spurious_fp() {
+        let no_boundaries = boundary_metric_for_texts("word", "word");
+        assert_eq!(
+            no_boundaries.counts,
+            BenchmarkAlignedBoundaryCountsV1::default()
+        );
+        assert!(no_boundaries.micro_error_rate.is_none());
+        assert!(no_boundaries.micro_error_rate_unavailable_reason.is_some());
+        assert!(no_boundaries.precision.is_none());
+        assert!(no_boundaries.recall.is_none());
+        assert!(no_boundaries.f1.is_none());
+
+        let spurious = boundary_metric_for_texts("word", "word extra");
+        assert_eq!(spurious.counts.reference_boundary_total, 0);
+        assert_eq!(spurious.counts.hypothesis_boundary_total, 1);
+        assert_eq!(spurious.counts.false_positive_boundary_count, 1);
+        assert!(spurious.micro_error_rate.is_none());
+        assert!(spurious.micro_error_rate_unavailable_reason.is_some());
+    }
+
+    #[test]
+    fn aligned_whitespace_micro_totals_include_zero_reference_fp_and_stay_split_disjoint() {
+        let zero_reference_fp = boundary_metric_for_texts("word", "word extra");
+        let evaluation_extra = boundary_metric_for_texts("ab cd", "ab c d");
+        let train_missing = boundary_metric_for_texts("ab cd", "abcd");
+        let mut by_split = BTreeMap::<Option<BenchmarkSplitV1>, AlignedBoundaryAccumulator>::new();
+        accumulate_aligned_boundaries_by_split(
+            &mut by_split,
+            Some(BenchmarkSplitV1::Evaluation),
+            Some(&zero_reference_fp),
+        )
+        .unwrap();
+        accumulate_aligned_boundaries_by_split(
+            &mut by_split,
+            Some(BenchmarkSplitV1::Evaluation),
+            Some(&evaluation_extra),
+        )
+        .unwrap();
+        accumulate_aligned_boundaries_by_split(
+            &mut by_split,
+            Some(BenchmarkSplitV1::Train),
+            Some(&train_missing),
+        )
+        .unwrap();
+
+        let summaries = finish_aligned_boundaries_by_split(by_split).unwrap();
+        assert_eq!(summaries.len(), 2);
+        let evaluation = summaries
+            .iter()
+            .find(|summary| summary.split == Some(BenchmarkSplitV1::Evaluation))
+            .unwrap();
+        assert_eq!(evaluation.aligned_case_count, 2);
+        let evaluation_metric = evaluation.metric.as_ref().unwrap();
+        assert_eq!(evaluation_metric.counts.true_positive_boundary_count, 1);
+        assert_eq!(evaluation_metric.counts.false_positive_boundary_count, 2);
+        assert_eq!(evaluation_metric.counts.false_negative_boundary_count, 0);
+        assert_eq!(evaluation_metric.counts.reference_boundary_total, 1);
+        assert_eq!(evaluation_metric.counts.hypothesis_boundary_total, 3);
+        assert_eq!(evaluation_metric.micro_error_rate, Some(2.0));
+        assert!((evaluation_metric.precision.unwrap() - (1.0 / 3.0)).abs() < 1e-12);
+        assert_eq!(evaluation_metric.recall, Some(1.0));
+        assert_eq!(evaluation_metric.f1, Some(0.5));
+
+        let train = summaries
+            .iter()
+            .find(|summary| summary.split == Some(BenchmarkSplitV1::Train))
+            .unwrap();
+        assert_eq!(train.aligned_case_count, 1);
+        assert_eq!(train.unavailable_case_count, 0);
+        assert_eq!(
+            train
+                .metric
+                .as_ref()
+                .unwrap()
+                .counts
+                .false_negative_boundary_count,
+            1
+        );
+        assert_eq!(
+            train
+                .metric
+                .as_ref()
+                .unwrap()
+                .counts
+                .reference_boundary_total,
+            1
+        );
+    }
+
+    #[test]
+    fn aligned_whitespace_boundary_work_cap_is_visible_and_legacy_fields_default() {
+        let long_reference = "a ".repeat(800);
+        let metrics = score_candidate(
+            &long_reference,
+            &annotation(&long_reference),
+            BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+            0,
+        )
+        .unwrap();
+        assert!(metrics.orthographic_whitespace_boundary_alignment.is_none());
+        assert!(
+            metrics
+                .orthographic_whitespace_boundary_alignment_unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("DP cell cap"))
+        );
+
+        let exact_metrics = score_candidate(
+            "ab cd",
+            &annotation("ab cd"),
+            BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+            0,
+        )
+        .unwrap();
+        let mut legacy_candidate = serde_json::to_value(exact_metrics).unwrap();
+        legacy_candidate
+            .as_object_mut()
+            .unwrap()
+            .remove("orthographic_whitespace_boundary_alignment");
+        legacy_candidate
+            .as_object_mut()
+            .unwrap()
+            .remove("orthographic_whitespace_boundary_alignment_unavailable_reason");
+        let restored_candidate: BenchmarkCandidateMetricsV1 =
+            serde_json::from_value(legacy_candidate).unwrap();
+        assert!(
+            restored_candidate
+                .orthographic_whitespace_boundary_alignment
+                .is_none()
+        );
+
+        let legacy_summary = ProviderSummaryAccumulator::new(
+            "legacy-provider".to_owned(),
+            "legacy-configuration".to_owned(),
+            0,
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        let mut legacy_summary = serde_json::to_value(legacy_summary).unwrap();
+        legacy_summary
+            .as_object_mut()
+            .unwrap()
+            .remove("orthographic_whitespace_boundary_by_split");
+        legacy_summary
+            .as_object_mut()
+            .unwrap()
+            .remove("cursive_only_cer_by_split");
+        let restored_summary: BenchmarkProviderSummaryV1 =
+            serde_json::from_value(legacy_summary).unwrap();
+        assert!(
+            restored_summary
+                .orthographic_whitespace_boundary_by_split
+                .is_none()
+        );
+        assert!(restored_summary.cursive_only_cer_by_split.is_none());
+    }
+
+    #[test]
     fn edit_distance_work_cap_is_visible_as_null() {
         let reference = "a".repeat(3000);
         let hypothesis = "b".repeat(3000);
@@ -6543,23 +7263,32 @@ mod tests {
             None,
         );
         let request_json = serde_json::to_value(&request).unwrap();
+        let request_text = serde_json::to_string(&request).unwrap();
         let original_input_view_id = request.input_view_id.clone();
         let original_binding = canonical_ink_comparison_binding(&request).unwrap();
 
-        for style in [
-            Some(BenchmarkHandwritingStyleV1::Cursive),
-            Some(BenchmarkHandwritingStyleV1::Mixed),
-            None,
+        for (style, reference_text) in [
+            (
+                Some(BenchmarkHandwritingStyleV1::Cursive),
+                "PRIVATE_BOUNDARY_REFERENCE_CURSIVE ab cd",
+            ),
+            (
+                Some(BenchmarkHandwritingStyleV1::Mixed),
+                "PRIVATE_BOUNDARY_REFERENCE_MIXED ab cd",
+            ),
+            (None, "PRIVATE_BOUNDARY_REFERENCE_UNKNOWN ab cd"),
         ] {
-            let mut reference = annotation("human-only reference");
+            let mut reference = annotation(reference_text);
             reference.reference_handwriting_style = style;
-            let _ = score_candidate(
+            let metrics = score_candidate(
                 "provider text",
                 &reference,
                 BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
                 0,
             )
             .unwrap();
+            assert!(metrics.orthographic_whitespace_boundary_alignment.is_some());
+            assert!(!request_text.contains(reference_text));
             assert_eq!(request.input_view_id, original_input_view_id);
             assert_eq!(
                 canonical_ink_comparison_binding(&request).unwrap(),

@@ -5055,6 +5055,12 @@ mod tests {
         assert_eq!(success_a["status"], "completed");
         assert_eq!(success_b["status"], "completed");
         assert_eq!(success_a["reference_handwriting_style"], "cursive");
+        assert!(
+            success_a["candidate_metrics"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             success_a["input_view_id"].as_str(),
             Some(expected_input_view_ids["cfg-success-a"].as_str())
@@ -5242,6 +5248,15 @@ mod tests {
             assert!(cursive_summary[0]["nfc_unicode_scalar_micro_cer"].is_null());
             assert_eq!(cursive_summary[0]["scored_case_count"], 0);
             assert_eq!(cursive_summary[0]["unavailable_case_count"], 1);
+            let boundary_summaries = summary["orthographic_whitespace_boundary_by_split"]
+                .as_array()
+                .unwrap();
+            assert_eq!(boundary_summaries.len(), 1);
+            assert_eq!(boundary_summaries[0]["split"], "evaluation");
+            assert_eq!(boundary_summaries[0]["aligned_case_count"], 0);
+            assert_eq!(boundary_summaries[0]["unavailable_case_count"], 1);
+            assert!(boundary_summaries[0]["metric"].is_null());
+            assert!(boundary_summaries[0]["unavailable_reason"].is_string());
         }
     }
 
