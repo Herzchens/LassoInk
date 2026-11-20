@@ -42,6 +42,8 @@ Gate 0 is **PROVISIONAL PASS** for the owner-locked Direct WM_POINTER + Windows 
 
 ## M5/M6 local benchmark preparation
 
+`peak_direct_process_working_set_bytes_raw` records the direct child worker's `PROCESS_MEMORY_COUNTERS.PeakWorkingSetSize` in bytes, separately from Job Object commit counters; it is null with a reason when unavailable and is not whole-tree RAM/RSS or VRAM.
+
 Each `PROVIDERS.json` entry may optionally declare `requested_input_modalities`. When absent, the request inherits the case's legacy modality vector exactly and keeps the legacy raster-consistency rule: the case must include `Raster` if raster data is present, and must provide raster data if its case vector requests `Raster`. An explicit override for one provider does not relax this rule for another provider that omits the override. An explicit provider may select a nonempty, unique, capped set of modalities backed by case data. Provider capabilities are validated against that request; a mismatch fails visibly and never substitutes or retries in another mode.
 
 M5 run rows carry a versioned `canonical_ink_comparison_binding` for the common canonical input. Its SHA-256 covers journal identity/logical revision, region/line and coordinate context, language hints, ordered stroke views/frames, and ordered source samples. It excludes provider configuration, requested modality, per-request `input_view_id`, and raster payload bytes. Each request still retains its own modality and `input_view_id`, which may differ across providers. `raster_pixel_parity` remains `unverified`; a shared journal binding does not prove that raster pixels match rendered pen input.

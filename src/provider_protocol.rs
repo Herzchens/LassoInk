@@ -1955,15 +1955,23 @@ pub(crate) struct ProviderProcessResourcesV1 {
     pub total_kernel_time_100ns_raw: i64,
     pub total_page_fault_count_raw: u32,
     pub total_process_count_raw: u32,
-    /// Raw `JOBOBJECT_EXTENDED_LIMIT_INFORMATION.PeakJobMemoryUsed` bytes:
-    /// peak memory usage of processes associated with the job as documented
-    /// by Windows. This is not a claim about RSS, VRAM, or a separate memory
-    /// accounting model.
+    /// Raw `JOBOBJECT_EXTENDED_LIMIT_INFORMATION.PeakJobMemoryUsed` bytes,
+    /// retained as the Windows Job Object commit-accounting value. This is not
+    /// the direct worker's resident working set, tree RSS, or VRAM.
     pub peak_job_memory_bytes_raw: Option<u64>,
-    /// Raw `PeakProcessMemoryUsed` bytes: peak memory used by any process ever
-    /// associated with the job, per the Windows structure documentation.
+    /// Raw `PeakProcessMemoryUsed` bytes, the Windows Job Object process
+    /// commit-accounting value for a process ever associated with the job.
     pub peak_process_memory_bytes_raw: Option<u64>,
     pub memory_unavailable_reason: Option<String>,
+    /// Direct recognition worker's raw `PROCESS_MEMORY_COUNTERS.PeakWorkingSetSize`
+    /// bytes. This is a resident working-set observation for the one child
+    /// process, not Job Object commit accounting, process-tree RSS, or VRAM.
+    #[serde(default)]
+    pub peak_direct_process_working_set_bytes_raw: Option<u64>,
+    /// Specific reason when the direct-process working-set observation is
+    /// unavailable; it is separate from Job Object counter failures.
+    #[serde(default)]
+    pub peak_direct_process_working_set_unavailable_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -6032,6 +6040,73 @@ mod tests {
         assert_eq!(footer["complete"].as_bool(), Some(true));
         let summaries = footer["provider_summaries"].as_array().unwrap();
         assert_eq!(summaries.len(), 3);
+        for configuration_id in [
+            "cfg-generated-online",
+            "cfg-generated-raster",
+            "cfg-generated-raster-failure",
+        ] {
+            let run = find_run(configuration_id);
+            let summary = summaries
+                .iter()
+                .find(|summary| summary["configuration_id"] == configuration_id)
+                .unwrap();
+            let resources = &run["process_resources"];
+            let observed_working_set_count = if resources.is_object() {
+                assert_eq!(resources["scope"], "job_process_tree");
+                if let Some(bytes) = resources["peak_direct_process_working_set_bytes_raw"].as_u64()
+                {
+                    assert!(bytes > 0, "zero is not a working-set observation");
+                    assert!(
+                        resources["peak_direct_process_working_set_unavailable_reason"].is_null()
+                    );
+                    1
+                } else {
+                    assert!(
+                        resources["peak_direct_process_working_set_unavailable_reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.contains("GetProcessMemoryInfo"))
+                    );
+                    0
+                }
+            } else {
+                assert!(
+                    run["process_resources_unavailable_reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("Job Object"))
+                );
+                0
+            };
+            let working_set_summary = &summary["peak_direct_process_working_set_bytes_raw"];
+            assert_eq!(working_set_summary["unit"], "bytes_raw");
+            assert_eq!(
+                working_set_summary["sample_count"].as_u64(),
+                Some(observed_working_set_count)
+            );
+            assert_eq!(
+                working_set_summary["missing_observation_count"].as_u64(),
+                Some(1 - observed_working_set_count)
+            );
+            if observed_working_set_count == 0 {
+                assert!(working_set_summary["p50"].is_null());
+                assert!(working_set_summary["unavailable_reason"].is_string());
+            }
+        }
+        let completed_working_set_bytes = run_rows
+            .iter()
+            .filter(|run| run["status"] == "completed")
+            .filter_map(|run| {
+                run["process_resources"]["peak_direct_process_working_set_bytes_raw"].as_u64()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !completed_working_set_bytes.is_empty(),
+            "at least one completed guarded mock child must expose a direct working-set measurement"
+        );
+        let maximum_working_set_bytes = completed_working_set_bytes.iter().copied().max().unwrap();
+        println!(
+            "direct_child_peak_working_set_status=measured positive_samples={} max_bytes={maximum_working_set_bytes}",
+            completed_working_set_bytes.len()
+        );
         let failed_summary = summaries
             .iter()
             .find(|summary| summary["configuration_id"] == "cfg-generated-raster-failure")
@@ -6447,6 +6522,28 @@ mod tests {
         assert_eq!(execution.raw_response_transcript.frames.len(), 2);
         assert!(execution.timing.process_create_call_to_recognition_ns > 0);
         assert!(execution.timing.model_cold_start_ns.is_none());
+        if let Some(process_resources) = execution.process_resources.as_ref() {
+            assert_eq!(
+                process_resources.scope,
+                ProviderResourceScopeV1::JobProcessTree
+            );
+            match process_resources.peak_direct_process_working_set_bytes_raw {
+                Some(bytes) => {
+                    assert!(bytes > 0);
+                    assert!(
+                        process_resources
+                            .peak_direct_process_working_set_unavailable_reason
+                            .is_none()
+                    );
+                }
+                None => assert!(
+                    process_resources
+                        .peak_direct_process_working_set_unavailable_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("GetProcessMemoryInfo"))
+                ),
+            }
+        }
 
         let sidecar_path = sidecar_path_for_request(&request.request_id);
         let sidecar_bytes = fs::read(&sidecar_path).unwrap();
@@ -6817,6 +6914,64 @@ mod tests {
             provider_summaries[0]["completed_run_count"].as_u64(),
             Some(2)
         );
+        let reported_direct_working_set =
+            &provider_summaries[0]["peak_direct_process_working_set_bytes_raw"];
+        let observed_direct_working_set_count = run_records
+            .iter()
+            .filter(|row| {
+                row["process_resources"]["peak_direct_process_working_set_bytes_raw"]
+                    .as_u64()
+                    .is_some()
+            })
+            .count() as u64;
+        for run_record in &run_records {
+            let resources = &run_record["process_resources"];
+            if resources.is_object() {
+                if let Some(bytes) = resources["peak_direct_process_working_set_bytes_raw"].as_u64()
+                {
+                    assert!(bytes > 0);
+                    assert!(
+                        resources["peak_direct_process_working_set_unavailable_reason"].is_null()
+                    );
+                } else {
+                    assert!(
+                        resources["peak_direct_process_working_set_unavailable_reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.contains("GetProcessMemoryInfo"))
+                    );
+                }
+            } else {
+                assert!(
+                    run_record["process_resources_unavailable_reason"]
+                        .as_str()
+                        .is_some_and(|reason| !reason.is_empty())
+                );
+            }
+        }
+        assert_eq!(reported_direct_working_set["unit"], "bytes_raw");
+        assert_eq!(
+            reported_direct_working_set["sample_count"].as_u64(),
+            Some(observed_direct_working_set_count)
+        );
+        assert_eq!(
+            reported_direct_working_set["missing_observation_count"].as_u64(),
+            Some(2 - observed_direct_working_set_count)
+        );
+        if observed_direct_working_set_count == 0 {
+            assert!(reported_direct_working_set["p50"].is_null());
+            assert!(
+                reported_direct_working_set["unavailable_reason"]
+                    .as_str()
+                    .is_some()
+            );
+        }
+        if observed_direct_working_set_count < run_records.len() as u64 {
+            assert!(
+                reported_direct_working_set["missing_observation_reason"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.is_empty())
+            );
+        }
         let cursive_summary = provider_summaries[0]["cursive_only_cer_by_split"]
             .as_array()
             .unwrap();

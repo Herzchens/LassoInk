@@ -36,6 +36,7 @@ use windows_sys::Win32::{
             QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
         },
         Pipes::CreatePipe,
+        ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         Threading::{
             CREATE_NO_WINDOW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
             InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
@@ -68,7 +69,23 @@ pub(super) struct NativeChild {
     active_processes_zero_observed: bool,
     cleanup_faulted: bool,
     process_resources: Option<super::ProviderProcessResourcesV1>,
+    direct_process_working_set_observation: Option<DirectProcessWorkingSetObservation>,
     retained_setup_handles: Vec<OwnedHandle>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectProcessWorkingSetObservation {
+    peak_bytes_raw: Option<u64>,
+    unavailable_reason: Option<String>,
+}
+
+impl DirectProcessWorkingSetObservation {
+    fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            peak_bytes_raw: None,
+            unavailable_reason: Some(reason.into()),
+        }
+    }
 }
 
 // SAFETY: kernel handles are process-wide values, and this owner only calls
@@ -104,6 +121,7 @@ impl NativeChild {
         }
         self.process_exit_observed = true;
         self.process_exit_code = Some(exit_code);
+        self.observe_direct_process_working_set_before_close(process_handle);
         self.close_process()?;
         Ok(Some(exit_code))
     }
@@ -295,6 +313,14 @@ impl NativeChild {
                 None
             }
         });
+        let direct_working_set = self
+            .direct_process_working_set_observation
+            .clone()
+            .unwrap_or_else(|| {
+                DirectProcessWorkingSetObservation::unavailable(
+                    "GetProcessMemoryInfo was not attempted before direct process handle release",
+                )
+            });
         super::ProviderProcessResourcesV1 {
             scope: super::ProviderResourceScopeV1::JobProcessTree,
             total_user_time_100ns_raw: accounting.TotalUserTime,
@@ -304,7 +330,48 @@ impl NativeChild {
             peak_job_memory_bytes_raw: peak_job_memory,
             peak_process_memory_bytes_raw: peak_process_memory,
             memory_unavailable_reason,
+            peak_direct_process_working_set_bytes_raw: direct_working_set.peak_bytes_raw,
+            peak_direct_process_working_set_unavailable_reason: direct_working_set
+                .unavailable_reason,
         }
+    }
+
+    /// Query the direct worker's peak resident set exactly once while its
+    /// CreateProcessW process handle is still owned, immediately before close.
+    /// Windows does not guarantee this query after process exit, so a failed
+    /// query is retained as a specific unavailable reason rather than zero.
+    fn observe_direct_process_working_set_before_close(&mut self, process_handle: HANDLE) {
+        if self.direct_process_working_set_observation.is_some() {
+            return;
+        }
+        let counter_size = match u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS>()) {
+            Ok(size) => size,
+            Err(_) => {
+                self.direct_process_working_set_observation = Some(
+                    DirectProcessWorkingSetObservation::unavailable(
+                        "GetProcessMemoryInfo PROCESS_MEMORY_COUNTERS size does not fit its Win32 cb field",
+                    ),
+                );
+                return;
+            }
+        };
+        // SAFETY: windows-sys 0.52 declares PROCESS_MEMORY_COUNTERS as repr(C)
+        // plain integer/usize fields, so zero is valid output-buffer storage.
+        // The buffer remains alive and correctly aligned through the call, and
+        // cb is set to exactly its owned structure size as required by Psapi.
+        let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { zeroed() };
+        counters.cb = counter_size;
+        // SAFETY: process_handle is this child's uniquely owned CreateProcessW
+        // handle (with query rights); counters is a writable, size-matched ABI
+        // buffer, and the call does not retain either pointer.
+        let query =
+            if unsafe { GetProcessMemoryInfo(process_handle, &mut counters, counter_size) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(&counters)
+            };
+        self.direct_process_working_set_observation =
+            Some(direct_process_working_set_observation(query, counter_size));
     }
 
     fn close_retained_setup_handles(&mut self) -> io::Result<()> {
@@ -349,6 +416,7 @@ impl NativeChild {
                     }
                     self.process_exit_observed = true;
                     self.process_exit_code = Some(exit_code);
+                    self.observe_direct_process_working_set_before_close(process_handle);
                     if self.close_process().is_err() {
                         return false;
                     }
@@ -511,6 +579,7 @@ pub(super) fn spawn_provider(
         active_processes_zero_observed: false,
         cleanup_faulted: false,
         process_resources: None,
+        direct_process_working_set_observation: None,
         retained_setup_handles,
     };
     // The parent-owned guard takes process/job lifetime responsibility before
@@ -550,6 +619,37 @@ pub(super) fn spawn_provider(
         stderr,
         create_process_call_started,
     })
+}
+
+fn direct_process_working_set_observation(
+    query: Result<&PROCESS_MEMORY_COUNTERS, io::Error>,
+    expected_counter_size: u32,
+) -> DirectProcessWorkingSetObservation {
+    let counters = match query {
+        Ok(counters) => counters,
+        Err(error) => {
+            return DirectProcessWorkingSetObservation::unavailable(format!(
+                "GetProcessMemoryInfo failed before process-handle release: {error}"
+            ));
+        }
+    };
+    if counters.cb != expected_counter_size {
+        return DirectProcessWorkingSetObservation::unavailable(
+            "GetProcessMemoryInfo returned a PROCESS_MEMORY_COUNTERS cb size mismatch",
+        );
+    }
+    match u64::try_from(counters.PeakWorkingSetSize) {
+        Ok(0) => DirectProcessWorkingSetObservation::unavailable(
+            "GetProcessMemoryInfo returned zero PeakWorkingSetSize; no usable observation was recorded",
+        ),
+        Ok(peak_bytes_raw) => DirectProcessWorkingSetObservation {
+            peak_bytes_raw: Some(peak_bytes_raw),
+            unavailable_reason: None,
+        },
+        Err(_) => DirectProcessWorkingSetObservation::unavailable(
+            "GetProcessMemoryInfo PROCESS_MEMORY_COUNTERS PeakWorkingSetSize does not fit the report's u64 field",
+        ),
+    }
 }
 
 pub(super) fn cancel_synchronous_io(thread: &JoinHandle<()>) {
@@ -876,7 +976,12 @@ fn zeroed_value<T>() -> T {
 
 #[cfg(test)]
 mod tests {
-    use super::{WAIT_OBJECT_0, WAIT_TIMEOUT, cleanup_complete, process_wait_confirms_exit};
+    use std::mem::size_of;
+
+    use super::{
+        PROCESS_MEMORY_COUNTERS, WAIT_OBJECT_0, WAIT_TIMEOUT, cleanup_complete,
+        direct_process_working_set_observation, process_wait_confirms_exit,
+    };
 
     #[test]
     fn cleanup_requires_parent_exit_zero_count_and_closed_handles() {
@@ -887,5 +992,86 @@ mod tests {
         assert!(cleanup_complete(true, false, false, true));
         assert!(!process_wait_confirms_exit(WAIT_TIMEOUT));
         assert!(process_wait_confirms_exit(WAIT_OBJECT_0));
+    }
+
+    #[test]
+    fn direct_peak_working_set_is_reported_as_bytes_for_one_process() {
+        let counter_size = u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS>()).unwrap();
+        let counters = PROCESS_MEMORY_COUNTERS {
+            cb: counter_size,
+            PageFaultCount: 17,
+            PeakWorkingSetSize: 4 * 1024 * 1024,
+            WorkingSetSize: 1024,
+            QuotaPeakPagedPoolUsage: 0,
+            QuotaPagedPoolUsage: 0,
+            QuotaPeakNonPagedPoolUsage: 0,
+            QuotaNonPagedPoolUsage: 0,
+            PagefileUsage: 9 * 1024 * 1024,
+            PeakPagefileUsage: 12 * 1024 * 1024,
+        };
+        let observation = direct_process_working_set_observation(Ok(&counters), counter_size);
+        assert_eq!(observation.peak_bytes_raw, Some(4 * 1024 * 1024));
+        assert!(observation.unavailable_reason.is_none());
+        assert_ne!(
+            observation.peak_bytes_raw,
+            Some(counters.PeakPagefileUsage as u64)
+        );
+    }
+
+    #[test]
+    fn direct_peak_working_set_query_errors_and_size_mismatch_are_unavailable() {
+        let counter_size = u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS>()).unwrap();
+        let failed = direct_process_working_set_observation(
+            Err(std::io::Error::from_raw_os_error(5)),
+            counter_size,
+        );
+        assert!(failed.peak_bytes_raw.is_none());
+        assert!(
+            failed
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("GetProcessMemoryInfo failed"))
+        );
+
+        let counters = PROCESS_MEMORY_COUNTERS {
+            cb: counter_size.saturating_sub(1),
+            PageFaultCount: 0,
+            PeakWorkingSetSize: 4096,
+            WorkingSetSize: 0,
+            QuotaPeakPagedPoolUsage: 0,
+            QuotaPagedPoolUsage: 0,
+            QuotaPeakNonPagedPoolUsage: 0,
+            QuotaNonPagedPoolUsage: 0,
+            PagefileUsage: 0,
+            PeakPagefileUsage: 0,
+        };
+        let mismatched = direct_process_working_set_observation(Ok(&counters), counter_size);
+        assert!(mismatched.peak_bytes_raw.is_none());
+        assert!(
+            mismatched
+                .unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cb size mismatch"))
+        );
+
+        let zero_counters = PROCESS_MEMORY_COUNTERS {
+            cb: counter_size,
+            PageFaultCount: 0,
+            PeakWorkingSetSize: 0,
+            WorkingSetSize: 0,
+            QuotaPeakPagedPoolUsage: 0,
+            QuotaPagedPoolUsage: 0,
+            QuotaPeakNonPagedPoolUsage: 0,
+            QuotaNonPagedPoolUsage: 0,
+            PagefileUsage: 0,
+            PeakPagefileUsage: 0,
+        };
+        let zero = direct_process_working_set_observation(Ok(&zero_counters), counter_size);
+        assert!(zero.peak_bytes_raw.is_none());
+        assert!(
+            zero.unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("returned zero PeakWorkingSetSize"))
+        );
     }
 }

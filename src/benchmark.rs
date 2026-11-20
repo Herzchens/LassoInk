@@ -866,6 +866,10 @@ pub(crate) struct BenchmarkProviderSummaryV1 {
     pub job_process_tree_cpu_core_equivalent_percent: BenchmarkF64PercentilesV1,
     pub peak_job_memory_bytes_raw: BenchmarkU64PercentilesV1,
     pub peak_process_memory_bytes_raw: BenchmarkU64PercentilesV1,
+    /// Missing on legacy summaries. Current summaries report the one direct
+    /// recognition process's resident working set separately from Job commit.
+    #[serde(default)]
+    pub peak_direct_process_working_set_bytes_raw: Option<BenchmarkU64PercentilesV1>,
     pub model_cold_start_ns: BenchmarkU64PercentilesV1,
     pub gpu_memory_bytes_raw: BenchmarkU64PercentilesV1,
 }
@@ -2220,6 +2224,7 @@ struct ProviderSummaryAccumulator {
     job_process_tree_cpu_percent: Vec<f64>,
     peak_job_memory_bytes: Vec<u64>,
     peak_process_memory_bytes: Vec<u64>,
+    peak_direct_process_working_set_bytes: Vec<u64>,
     model_cold_start_ns: Vec<u64>,
     gpu_memory_bytes: Vec<u64>,
 }
@@ -2241,6 +2246,7 @@ impl ProviderSummaryAccumulator {
             job_process_tree_cpu_percent: Vec::new(),
             peak_job_memory_bytes: Vec::new(),
             peak_process_memory_bytes: Vec::new(),
+            peak_direct_process_working_set_bytes: Vec::new(),
             model_cold_start_ns: Vec::new(),
             gpu_memory_bytes: Vec::new(),
         };
@@ -2251,6 +2257,7 @@ impl ProviderSummaryAccumulator {
             &mut summary.process_create_call_to_tree_drain_ns,
             &mut summary.peak_job_memory_bytes,
             &mut summary.peak_process_memory_bytes,
+            &mut summary.peak_direct_process_working_set_bytes,
             &mut summary.model_cold_start_ns,
             &mut summary.gpu_memory_bytes,
         ] {
@@ -2325,6 +2332,9 @@ impl ProviderSummaryAccumulator {
             if let Some(peak) = resources.peak_process_memory_bytes_raw {
                 self.peak_process_memory_bytes.push(peak);
             }
+            if let Some(peak) = resources.peak_direct_process_working_set_bytes_raw {
+                self.peak_direct_process_working_set_bytes.push(peak);
+            }
         }
         if let Some(gpu_bytes) = run.gpu_memory_bytes {
             self.gpu_memory_bytes.push(gpu_bytes);
@@ -2391,6 +2401,12 @@ impl ProviderSummaryAccumulator {
                 "PeakProcessMemoryUsed_bytes_raw",
                 "Windows did not return a usable PeakProcessMemoryUsed value",
             )?,
+            peak_direct_process_working_set_bytes_raw: Some(u64_percentiles(
+                &mut self.peak_direct_process_working_set_bytes,
+                attempted_run_count,
+                "bytes_raw",
+                "GetProcessMemoryInfo did not return a usable direct-process PeakWorkingSetSize",
+            )?),
             model_cold_start_ns: u64_percentiles(
                 &mut self.model_cold_start_ns,
                 attempted_run_count,
@@ -7994,6 +8010,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("cursive_only_cer_by_split");
+        legacy_summary
+            .as_object_mut()
+            .unwrap()
+            .remove("peak_direct_process_working_set_bytes_raw");
         let restored_summary: BenchmarkProviderSummaryV1 =
             serde_json::from_value(legacy_summary).unwrap();
         assert!(
@@ -8002,6 +8022,11 @@ mod tests {
                 .is_none()
         );
         assert!(restored_summary.cursive_only_cer_by_split.is_none());
+        assert!(
+            restored_summary
+                .peak_direct_process_working_set_bytes_raw
+                .is_none()
+        );
     }
 
     #[test]
@@ -8624,7 +8649,45 @@ mod tests {
             peak_job_memory_bytes_raw: Some(1_000_000),
             peak_process_memory_bytes_raw: Some(900_000),
             memory_unavailable_reason: None,
+            peak_direct_process_working_set_bytes_raw: Some(4 * 1024 * 1024),
+            peak_direct_process_working_set_unavailable_reason: None,
         };
+        let mut legacy_resources = serde_json::to_value(&resources).unwrap();
+        legacy_resources
+            .as_object_mut()
+            .unwrap()
+            .remove("peak_direct_process_working_set_bytes_raw");
+        legacy_resources
+            .as_object_mut()
+            .unwrap()
+            .remove("peak_direct_process_working_set_unavailable_reason");
+        let restored_legacy: ProviderProcessResourcesV1 =
+            serde_json::from_value(legacy_resources).unwrap();
+        assert!(
+            restored_legacy
+                .peak_direct_process_working_set_bytes_raw
+                .is_none()
+        );
+        assert!(
+            restored_legacy
+                .peak_direct_process_working_set_unavailable_reason
+                .is_none()
+        );
+        let serialized_resources = serde_json::to_value(&resources).unwrap();
+        assert_eq!(serialized_resources["scope"], "job_process_tree");
+        assert_eq!(serialized_resources["peak_job_memory_bytes_raw"], 1_000_000);
+        assert_eq!(
+            serialized_resources["peak_process_memory_bytes_raw"],
+            900_000
+        );
+        assert_eq!(
+            serialized_resources["peak_direct_process_working_set_bytes_raw"],
+            4 * 1024 * 1024
+        );
+        assert_ne!(
+            serialized_resources["peak_direct_process_working_set_bytes_raw"],
+            serialized_resources["peak_job_memory_bytes_raw"]
+        );
         let timing = crate::provider_protocol::ProviderExecutionTimingV1 {
             process_create_call_to_handshake_ns: 10,
             process_create_call_to_recognition_ns: 20,
@@ -8639,6 +8702,86 @@ mod tests {
         let (missing, reason) = job_cpu_core_equivalent_percent(None, Some(&timing));
         assert!(missing.is_none());
         assert!(reason.is_some());
+    }
+
+    #[test]
+    fn direct_process_peak_working_set_is_bytes_scoped_and_unavailability_stays_null() {
+        let mut measured = output_determinism_test_run(0, "same output");
+        measured.process_resources = Some(ProviderProcessResourcesV1 {
+            scope: crate::provider_protocol::ProviderResourceScopeV1::JobProcessTree,
+            total_user_time_100ns_raw: 10,
+            total_kernel_time_100ns_raw: 20,
+            total_page_fault_count_raw: 3,
+            total_process_count_raw: 1,
+            peak_job_memory_bytes_raw: Some(9 * 1024 * 1024),
+            peak_process_memory_bytes_raw: Some(8 * 1024 * 1024),
+            memory_unavailable_reason: None,
+            peak_direct_process_working_set_bytes_raw: Some(4 * 1024 * 1024),
+            peak_direct_process_working_set_unavailable_reason: None,
+        });
+        measured.process_resources_unavailable_reason = None;
+        let row = serde_json::to_value(&measured).unwrap();
+        assert_eq!(row["process_resources"]["scope"], "job_process_tree");
+        assert_eq!(
+            row["process_resources"]["peak_direct_process_working_set_bytes_raw"],
+            4 * 1024 * 1024
+        );
+        assert!(
+            row["process_resources"]["peak_direct_process_working_set_unavailable_reason"]
+                .is_null()
+        );
+
+        let mut measured_summary =
+            ProviderSummaryAccumulator::new("senocr".to_owned(), "cfg".to_owned(), 1).unwrap();
+        measured_summary.observe(&measured).unwrap();
+        let measured_summary = measured_summary.finish().unwrap();
+        let percentile = measured_summary
+            .peak_direct_process_working_set_bytes_raw
+            .as_ref()
+            .unwrap();
+        assert_eq!(percentile.unit, "bytes_raw");
+        assert_eq!(percentile.sample_count, 1);
+        assert_eq!(percentile.missing_observation_count, 0);
+        assert_eq!(percentile.p50, Some(4 * 1024 * 1024));
+
+        let mut unavailable = output_determinism_test_run(0, "same output");
+        unavailable.process_resources = Some(ProviderProcessResourcesV1 {
+            scope: crate::provider_protocol::ProviderResourceScopeV1::JobProcessTree,
+            total_user_time_100ns_raw: 10,
+            total_kernel_time_100ns_raw: 20,
+            total_page_fault_count_raw: 3,
+            total_process_count_raw: 1,
+            peak_job_memory_bytes_raw: Some(9 * 1024 * 1024),
+            peak_process_memory_bytes_raw: Some(8 * 1024 * 1024),
+            memory_unavailable_reason: None,
+            peak_direct_process_working_set_bytes_raw: None,
+            peak_direct_process_working_set_unavailable_reason: Some(
+                "GetProcessMemoryInfo failed before process-handle release: access denied"
+                    .to_owned(),
+            ),
+        });
+        let row = serde_json::to_value(&unavailable).unwrap();
+        assert!(row["process_resources"]["peak_direct_process_working_set_bytes_raw"].is_null());
+        assert!(
+            row["process_resources"]["peak_direct_process_working_set_unavailable_reason"]
+                .as_str()
+                .unwrap()
+                .contains("GetProcessMemoryInfo failed")
+        );
+
+        let mut unavailable_summary =
+            ProviderSummaryAccumulator::new("senocr".to_owned(), "cfg".to_owned(), 1).unwrap();
+        unavailable_summary.observe(&unavailable).unwrap();
+        let unavailable_summary = unavailable_summary.finish().unwrap();
+        let percentile = unavailable_summary
+            .peak_direct_process_working_set_bytes_raw
+            .as_ref()
+            .unwrap();
+        assert_eq!(percentile.unit, "bytes_raw");
+        assert_eq!(percentile.sample_count, 0);
+        assert_eq!(percentile.missing_observation_count, 1);
+        assert!(percentile.p50.is_none());
+        assert!(percentile.unavailable_reason.is_some());
     }
 
     #[test]
