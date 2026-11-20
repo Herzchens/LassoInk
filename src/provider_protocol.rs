@@ -4366,15 +4366,17 @@ mod tests {
             std::env::var("LASSOINK_EXPECTED_HEAD_REPOSITORY")
                 .is_ok_and(|actual| actual == "Herzchens/LassoInk")
         );
+        let expected_head_ref = std::env::var("LASSOINK_EXPECTED_HEAD_REF")
+            .expect("the guarded worker job provides its exact PR branch");
         assert!(
-            std::env::var("LASSOINK_EXPECTED_HEAD_REF")
-                .is_ok_and(|actual| actual == "feat/benchmark-fidelity")
+            matches!(
+                expected_head_ref.as_str(),
+                "feat/benchmark-fidelity" | "feat/benchmark-observability"
+            ),
+            "the guarded worker PR branch is not allowlisted"
         );
         assert!(std::env::var("GITHUB_EVENT_NAME").is_ok_and(|actual| actual == "pull_request"));
-        assert!(
-            std::env::var("GITHUB_HEAD_REF")
-                .is_ok_and(|actual| actual == "feat/benchmark-fidelity")
-        );
+        assert!(std::env::var("GITHUB_HEAD_REF").is_ok_and(|actual| actual == expected_head_ref));
         assert!(std::env::var("RUNNER_ARCH").is_ok_and(|actual| actual == "X64"));
     }
 
@@ -4812,6 +4814,7 @@ mod tests {
         let case_manifest = BenchmarkCaseManifestV1 {
             schema_version: 1,
             batch_id: batch_id.clone(),
+            repeat_count: 2,
             cases: vec![case.clone()],
         };
         let corpus_manifest = BenchmarkCorpusManifestV1 {
@@ -4840,26 +4843,26 @@ mod tests {
             (
                 "cfg-success-a",
                 "online-success",
-                "ok",
+                "vary-repeat",
                 vec![ProviderInputCapabilityV1::OnlineStrokes],
                 vec![ProviderInputCapabilityV1::OnlineStrokes],
             ),
             (
                 "cfg-success-b",
                 "raster-success",
-                "ok",
+                "vary-repeat",
                 vec![ProviderInputCapabilityV1::Raster],
                 vec![ProviderInputCapabilityV1::Raster],
             ),
             (
-                "cfg-visible-failure",
-                "raster-failure",
-                "crash",
+                "cfg-primary-failure",
+                "raster-failure-then-success",
+                "fail-primary-then-success",
                 vec![ProviderInputCapabilityV1::Raster],
                 vec![ProviderInputCapabilityV1::Raster],
             ),
         ];
-        let mut expected_frames = BTreeMap::<String, (Vec<u8>, Vec<u8>)>::new();
+        let mut expected_frames = BTreeMap::<(String, u32), (Vec<u8>, Option<Vec<u8>>)>::new();
         let mut expected_input_view_ids = BTreeMap::<String, String>::new();
         let mut providers = Vec::new();
         for (
@@ -4877,60 +4880,101 @@ mod tests {
                     ("mode".to_owned(), (*mode_label).to_owned()),
                 ]),
             };
-            let request = build_recognition_request(RecognitionRequestBuildInput {
-                state: &journal.state,
-                request_id: format!("bench-{batch_id}-0-{provider_index}"),
-                region_id: case.region_id.clone(),
-                line_id: case.line_id.clone(),
-                coordinate_space: case.coordinate_space.clone(),
-                coordinate_units: case.coordinate_units.clone(),
-                language_hints: case.language_hints.clone(),
-                requested_input_modalities: requested_modalities.to_vec(),
-                provider_configuration: configuration.clone(),
-                selected_strokes: &selected_strokes,
-                raster: requested_modalities
-                    .contains(&ProviderInputCapabilityV1::Raster)
-                    .then(|| raster_request_input.clone()),
-            })
-            .unwrap();
-            assert_eq!(request.source_revision, source_revision);
-            let handshake = serde_json::to_string(&WorkerResponseFrameV1::Handshake {
-                protocol_version: PROVIDER_PROTOCOL_VERSION,
-                provider: fixture_provider(),
-                configuration_id: configuration.configuration_id.clone(),
-                configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
-                capabilities: fixture_capabilities_with_inputs(advertised_inputs.to_vec()),
-            })
-            .unwrap();
-            let mut mock_result = fixture_result(&request, source_revision.clone());
-            if !request
-                .requested_input_modalities
-                .contains(&ProviderInputCapabilityV1::OnlineStrokes)
-            {
-                for candidate in &mut mock_result.candidates {
-                    candidate.stroke_ranges.clear();
+            let mut primary_handshake: Option<String> = None;
+            let mut primary_recognition: Option<String> = None;
+            for repeat_index in 0..case_manifest.repeat_count {
+                let request = build_recognition_request(RecognitionRequestBuildInput {
+                    state: &journal.state,
+                    request_id: format!("bench-0-{provider_index}-r{repeat_index}"),
+                    region_id: case.region_id.clone(),
+                    line_id: case.line_id.clone(),
+                    coordinate_space: case.coordinate_space.clone(),
+                    coordinate_units: case.coordinate_units.clone(),
+                    language_hints: case.language_hints.clone(),
+                    requested_input_modalities: requested_modalities.to_vec(),
+                    provider_configuration: configuration.clone(),
+                    selected_strokes: &selected_strokes,
+                    raster: requested_modalities
+                        .contains(&ProviderInputCapabilityV1::Raster)
+                        .then(|| raster_request_input.clone()),
+                })
+                .unwrap();
+                assert_eq!(request.source_revision, source_revision);
+                assert_eq!(
+                    request.request_id,
+                    format!("bench-0-{provider_index}-r{repeat_index}")
+                );
+                let handshake = serde_json::to_string(&WorkerResponseFrameV1::Handshake {
+                    protocol_version: PROVIDER_PROTOCOL_VERSION,
+                    provider: fixture_provider(),
+                    configuration_id: configuration.configuration_id.clone(),
+                    configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
+                    capabilities: fixture_capabilities_with_inputs(advertised_inputs.to_vec()),
+                })
+                .unwrap();
+                let mut mock_result = fixture_result(&request, source_revision.clone());
+                if !request
+                    .requested_input_modalities
+                    .contains(&ProviderInputCapabilityV1::OnlineStrokes)
+                {
+                    for candidate in &mut mock_result.candidates {
+                        candidate.stroke_ranges.clear();
+                    }
+                }
+                let response_template =
+                    serde_json::to_string(&WorkerResponseFrameV1::Recognition {
+                        protocol_version: PROVIDER_PROTOCOL_VERSION,
+                        result: mock_result.clone(),
+                    })
+                    .unwrap();
+                let expected_text = match (*behavior, repeat_index) {
+                    ("vary-repeat", 0) => "fixture text primary",
+                    ("vary-repeat", _) => "fixture text later",
+                    ("fail-primary-then-success", 0) => "fixture text primary-failed",
+                    ("fail-primary-then-success", _) => "fixture text later",
+                    _ => "fixture text",
+                };
+                mock_result.candidates[0].recognized_text = expected_text.to_owned();
+                mock_result.candidates[0].raw_candidate["text"] = serde_json::json!(expected_text);
+                let recognition = serde_json::to_string(&WorkerResponseFrameV1::Recognition {
+                    protocol_version: PROVIDER_PROTOCOL_VERSION,
+                    result: mock_result,
+                })
+                .unwrap();
+                let response_for_repeat =
+                    if *behavior == "fail-primary-then-success" && repeat_index == 0 {
+                        None
+                    } else {
+                        Some(recognition.as_bytes().to_vec())
+                    };
+                expected_frames.insert(
+                    (configuration.configuration_id.clone(), repeat_index),
+                    (handshake.as_bytes().to_vec(), response_for_repeat),
+                );
+                match expected_input_view_ids.get(&configuration.configuration_id) {
+                    Some(known_view) => assert_eq!(known_view, &request.input_view_id),
+                    None => {
+                        expected_input_view_ids.insert(
+                            configuration.configuration_id.clone(),
+                            request.input_view_id.clone(),
+                        );
+                    }
+                }
+                if repeat_index == 0 {
+                    primary_handshake = Some(handshake);
+                    primary_recognition = Some(response_template);
+                } else {
+                    assert_eq!(primary_handshake.as_deref(), Some(handshake.as_str()));
                 }
             }
-            let recognition = serde_json::to_string(&WorkerResponseFrameV1::Recognition {
-                protocol_version: PROVIDER_PROTOCOL_VERSION,
-                result: mock_result,
-            })
-            .unwrap();
-            expected_frames.insert(
-                configuration.configuration_id.clone(),
-                (
-                    handshake.as_bytes().to_vec(),
-                    recognition.as_bytes().to_vec(),
-                ),
-            );
-            expected_input_view_ids.insert(
-                configuration.configuration_id.clone(),
-                request.input_view_id.clone(),
-            );
             providers.push(ApprovedBenchmarkProviderV1 {
                 provider_id: "mock-provider".to_owned(),
                 executable_path: mock.executable.clone(),
-                arguments: vec![(*behavior).to_owned(), handshake, recognition],
+                arguments: vec![
+                    (*behavior).to_owned(),
+                    primary_handshake.expect("repeat zero builds the mock handshake"),
+                    primary_recognition.expect("repeat zero builds the response template"),
+                ],
                 requested_input_modalities: Some(requested_modalities.to_vec()),
                 protocol_configuration: configuration,
                 artifacts: vec![ProviderArtifactPathV1 {
@@ -4977,7 +5021,7 @@ mod tests {
             &output_directory,
         )
         .unwrap();
-        assert_eq!(completion.run_count, 3);
+        assert_eq!(completion.run_count, 6);
         assert_eq!(completion.failure_count, 1);
         assert!(completion.artifact_path.starts_with(&output_directory));
         let artifact_bytes = fs::read(&completion.artifact_path).unwrap();
@@ -5017,7 +5061,7 @@ mod tests {
                     .any(|row| json_value_contains_string(row, path_text.as_ref()))
             );
         }
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 8);
         let header = &rows
             .iter()
             .find(|row| row["record_type"] == "header")
@@ -5042,18 +5086,35 @@ mod tests {
             .filter(|row| row["record_type"] == "run")
             .map(|row| &row["record"])
             .collect::<Vec<_>>();
-        assert_eq!(run_rows.len(), 3);
-        let find_run = |configuration_id: &str| {
+        assert_eq!(run_rows.len(), 6);
+        let find_run = |configuration_id: &str, repeat_index: u32| {
             run_rows
                 .iter()
-                .find(|row| row["provider_configuration_id"] == configuration_id)
+                .find(|row| {
+                    row["provider_configuration_id"] == configuration_id
+                        && row["repeat_index"].as_u64() == Some(u64::from(repeat_index))
+                })
                 .copied()
                 .unwrap()
         };
-        let success_a = find_run("cfg-success-a");
-        let success_b = find_run("cfg-success-b");
+        let success_a = find_run("cfg-success-a", 0);
+        let success_a_later = find_run("cfg-success-a", 1);
+        let success_b = find_run("cfg-success-b", 0);
+        let success_b_later = find_run("cfg-success-b", 1);
         assert_eq!(success_a["status"], "completed");
+        assert_eq!(success_a_later["status"], "completed");
         assert_eq!(success_b["status"], "completed");
+        assert_eq!(success_b_later["status"], "completed");
+        assert_eq!(success_a["repeat_count"], 2);
+        assert_eq!(success_a_later["repeat_count"], 2);
+        assert_eq!(success_a["repeat_index"], 0);
+        assert_eq!(success_a_later["repeat_index"], 1);
+        assert_eq!(success_b["repeat_index"], 0);
+        assert_eq!(success_b_later["repeat_index"], 1);
+        assert_eq!(success_a["result"]["request_id"], "bench-0-0-r0");
+        assert_eq!(success_a_later["result"]["request_id"], "bench-0-0-r1");
+        assert_eq!(success_b["result"]["request_id"], "bench-0-1-r0");
+        assert_eq!(success_b_later["result"]["request_id"], "bench-0-1-r1");
         assert_eq!(success_a["reference_handwriting_style"], "cursive");
         assert!(
             success_a["candidate_metrics"]
@@ -5061,13 +5122,115 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(
+            success_a_later["candidate_metrics"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            success_a_later["metric_evaluation_unavailable_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("primary repeat index 0 only"))
+        );
+        assert!(
+            success_b_later["candidate_metrics"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            success_b_later["metric_evaluation_unavailable_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("primary repeat index 0 only"))
+        );
         assert_eq!(
             success_a["input_view_id"].as_str(),
             Some(expected_input_view_ids["cfg-success-a"].as_str())
         );
+        assert_eq!(success_a["input_view_id"], success_a_later["input_view_id"]);
+        assert_eq!(
+            success_a["source_revision"],
+            success_a_later["source_revision"]
+        );
+        assert_eq!(
+            success_a["requested_input_modalities"],
+            success_a_later["requested_input_modalities"]
+        );
+        assert_eq!(
+            success_a["result"]["consumed_input_modalities"],
+            success_a_later["result"]["consumed_input_modalities"]
+        );
+        assert_eq!(
+            success_a["source_sample_sequences"],
+            success_a_later["source_sample_sequences"]
+        );
+        assert_eq!(
+            success_a["selected_strokes"],
+            success_a_later["selected_strokes"]
+        );
+        assert_eq!(
+            success_a["provider_configuration_fingerprint"],
+            success_a_later["provider_configuration_fingerprint"]
+        );
+        assert_eq!(
+            success_a["repeat_input_identity_sha256"],
+            success_a_later["repeat_input_identity_sha256"]
+        );
+        assert_ne!(
+            success_a["result"]["request_id"],
+            success_a_later["result"]["request_id"]
+        );
+        assert!(
+            success_a["result"]["candidates"][0]["recognized_text"]
+                != success_a_later["result"]["candidates"][0]["recognized_text"],
+            "first mock provider repeat outputs should differ"
+        );
         assert_eq!(
             success_b["input_view_id"].as_str(),
             Some(expected_input_view_ids["cfg-success-b"].as_str())
+        );
+        assert_eq!(success_b["input_view_id"], success_b_later["input_view_id"]);
+        assert_eq!(
+            success_b["source_revision"],
+            success_b_later["source_revision"]
+        );
+        assert_eq!(
+            success_b["requested_input_modalities"],
+            success_b_later["requested_input_modalities"]
+        );
+        assert_eq!(
+            success_b["result"]["consumed_input_modalities"],
+            success_b_later["result"]["consumed_input_modalities"]
+        );
+        assert_eq!(
+            success_b["raster_input_sha256"],
+            success_b_later["raster_input_sha256"]
+        );
+        assert_eq!(
+            success_b["source_sample_sequences"],
+            success_b_later["source_sample_sequences"]
+        );
+        assert_eq!(
+            success_b["selected_strokes"],
+            success_b_later["selected_strokes"]
+        );
+        assert_eq!(
+            success_b["provider_configuration_fingerprint"],
+            success_b_later["provider_configuration_fingerprint"]
+        );
+        assert_eq!(
+            success_b["repeat_input_identity_sha256"],
+            success_b_later["repeat_input_identity_sha256"]
+        );
+        assert_ne!(
+            success_b["result"]["request_id"],
+            success_b_later["result"]["request_id"]
+        );
+        assert!(
+            success_b["result"]["candidates"][0]["recognized_text"]
+                != success_b_later["result"]["candidates"][0]["recognized_text"],
+            "second mock provider repeat outputs should differ"
         );
         assert_eq!(success_a["case_id"], case_id);
         assert_eq!(success_a["provider_id"], "mock-provider");
@@ -5162,27 +5325,55 @@ mod tests {
         );
 
         for configuration_id in ["cfg-success-a", "cfg-success-b"] {
-            let run = find_run(configuration_id);
-            assert!(run["raw_response_capture_complete"].as_bool().unwrap());
-            assert!(run["result"].is_object());
-            let frames = run["raw_response_frames"].as_array().unwrap();
-            let expected = expected_frames.get(configuration_id).unwrap();
-            assert_eq!(frames.len(), 2);
-            for (ordinal, bytes) in [&expected.0, &expected.1].into_iter().enumerate() {
-                let prefix = u32::try_from(bytes.len()).unwrap().to_be_bytes();
-                assert_eq!(frames[ordinal]["ordinal"].as_u64(), Some(ordinal as u64));
-                assert_eq!(frames[ordinal]["payload_hex"], bytes_hex(bytes));
-                assert_eq!(frames[ordinal]["length_prefix_be_hex"], bytes_hex(&prefix));
+            for repeat_index in 0..2u32 {
+                let run = find_run(configuration_id, repeat_index);
+                assert!(run["raw_response_capture_complete"].as_bool().unwrap());
+                assert!(run["result"].is_object());
+                let frames = run["raw_response_frames"].as_array().unwrap();
+                let expected = expected_frames
+                    .get(&(configuration_id.to_owned(), repeat_index))
+                    .unwrap();
+                let expected_recognition = expected.1.as_ref().unwrap();
+                assert_eq!(frames.len(), 2);
+                for (ordinal, bytes) in [&expected.0, expected_recognition].into_iter().enumerate()
+                {
+                    let prefix = u32::try_from(bytes.len()).unwrap().to_be_bytes();
+                    assert_eq!(frames[ordinal]["ordinal"].as_u64(), Some(ordinal as u64));
+                    assert_eq!(frames[ordinal]["payload_hex"], bytes_hex(bytes));
+                    assert_eq!(frames[ordinal]["length_prefix_be_hex"], bytes_hex(&prefix));
+                }
+                let executable_digest = run["artifact_digests"][0]["sha256_hex"].as_str().unwrap();
+                assert_eq!(executable_digest.len(), 64);
+                assert!(artifact_text.contains(executable_digest));
             }
-            let executable_digest = run["artifact_digests"][0]["sha256_hex"].as_str().unwrap();
-            assert_eq!(executable_digest.len(), 64);
-            assert!(artifact_text.contains(executable_digest));
         }
 
-        let failed = find_run("cfg-visible-failure");
+        let failed = find_run("cfg-primary-failure", 0);
+        let later_recovery = find_run("cfg-primary-failure", 1);
         assert_eq!(failed["status"], "failed");
         assert!(failed["result"].is_null());
         assert!(failed["provider_identity"].is_null());
+        assert_eq!(later_recovery["status"], "completed");
+        assert!(later_recovery["result"].is_object());
+        assert!(
+            later_recovery["candidate_metrics"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            later_recovery["metric_evaluation_unavailable_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("primary repeat index 0 only"))
+        );
+        assert_eq!(later_recovery["result"]["request_id"], "bench-0-2-r1");
+        assert_eq!(failed["repeat_index"], 0);
+        assert_eq!(later_recovery["repeat_index"], 1);
+        assert_eq!(
+            failed["repeat_input_identity_sha256"],
+            later_recovery["repeat_input_identity_sha256"]
+        );
+        assert_eq!(failed["input_view_id"], later_recovery["input_view_id"]);
         assert_eq!(
             failed["requested_input_modalities"],
             serde_json::json!(["raster"])
@@ -5207,12 +5398,24 @@ mod tests {
         );
         assert!(!failed["raw_response_capture_complete"].as_bool().unwrap());
         let failed_frames = failed["raw_response_frames"].as_array().unwrap();
-        let expected_failure_handshake = &expected_frames.get("cfg-visible-failure").unwrap().0;
+        let expected_failure_handshake = &expected_frames
+            .get(&("cfg-primary-failure".to_owned(), 0))
+            .unwrap()
+            .0;
         assert_eq!(failed_frames.len(), 1);
         assert_eq!(failed_frames[0]["ordinal"].as_u64(), Some(0));
         assert_eq!(
             failed_frames[0]["payload_hex"],
             bytes_hex(expected_failure_handshake)
+        );
+        let recovery_frames = later_recovery["raw_response_frames"].as_array().unwrap();
+        let expected_recovery = expected_frames
+            .get(&("cfg-primary-failure".to_owned(), 1))
+            .unwrap();
+        assert_eq!(recovery_frames.len(), 2);
+        assert_eq!(
+            recovery_frames[1]["payload_hex"],
+            bytes_hex(expected_recovery.1.as_ref().unwrap())
         );
 
         let footer = &rows
@@ -5221,21 +5424,54 @@ mod tests {
             .unwrap()["record"];
         assert_eq!(footer["planned_case_count"].as_u64(), Some(1));
         assert_eq!(footer["planned_provider_count"].as_u64(), Some(3));
-        assert_eq!(footer["recorded_run_count"].as_u64(), Some(3));
+        assert_eq!(footer["planned_repeat_count"].as_u64(), Some(2));
+        assert_eq!(footer["planned_attempt_count"].as_u64(), Some(6));
+        assert_eq!(footer["recorded_run_count"].as_u64(), Some(6));
         assert_eq!(footer["failed_run_count"].as_u64(), Some(1));
         assert_eq!(footer["complete"].as_bool(), Some(true));
+        let paired_comparisons = footer["paired_comparisons"].as_array().unwrap();
+        assert_eq!(paired_comparisons.len(), 3);
+        assert!(paired_comparisons.iter().all(|comparison| {
+            comparison["nfc_cer_paired_case_count"].as_u64() == Some(0)
+                && comparison["whitespace_syllable_wer_paired_case_count"].as_u64() == Some(0)
+        }));
+        let output_determinism_groups = footer["output_determinism"]["groups"].as_array().unwrap();
+        assert_eq!(output_determinism_groups.len(), 3);
+        let failed_primary_group = output_determinism_groups
+            .iter()
+            .find(|group| group["configuration_id"] == "cfg-primary-failure")
+            .unwrap();
+        assert_eq!(
+            failed_primary_group["successful_repeat_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            failed_primary_group["failed_repeat_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            failed_primary_group["eligible_output_count"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(failed_primary_group["status"], "unavailable");
+        assert!(
+            failed_primary_group["output_hash_counts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         let summaries = footer["provider_summaries"].as_array().unwrap();
         assert_eq!(summaries.len(), 3);
         for (configuration_id, completed, failed_count) in [
-            ("cfg-success-a", 1u64, 0u64),
-            ("cfg-success-b", 1u64, 0u64),
-            ("cfg-visible-failure", 0u64, 1u64),
+            ("cfg-success-a", 2u64, 0u64),
+            ("cfg-success-b", 2u64, 0u64),
+            ("cfg-primary-failure", 1u64, 1u64),
         ] {
             let summary = summaries
                 .iter()
                 .find(|summary| summary["configuration_id"] == configuration_id)
                 .unwrap();
-            assert_eq!(summary["attempted_run_count"].as_u64(), Some(1));
+            assert_eq!(summary["attempted_run_count"].as_u64(), Some(2));
             assert_eq!(summary["completed_run_count"].as_u64(), Some(completed));
             assert_eq!(summary["failed_run_count"].as_u64(), Some(failed_count));
             let cursive_summary = summary["cursive_only_cer_by_split"].as_array().unwrap();
@@ -5455,7 +5691,7 @@ mod tests {
             };
             let expected_request = build_recognition_request(RecognitionRequestBuildInput {
                 state: &journal.state,
-                request_id: format!("bench-{batch_id}-0-{provider_index}"),
+                request_id: format!("bench-0-{provider_index}-r0"),
                 region_id: case.region_id.clone(),
                 line_id: case.line_id.clone(),
                 coordinate_space: case.coordinate_space.clone(),
@@ -5524,6 +5760,7 @@ mod tests {
         let case_manifest = BenchmarkCaseManifestV1 {
             schema_version: 1,
             batch_id: batch_id.clone(),
+            repeat_count: 1,
             cases: vec![case],
         };
         let provider_manifest = BenchmarkProviderManifestV1 {
@@ -6089,6 +6326,12 @@ mod tests {
             }
             output
         };
+        let sidecar_path_for_request = |request_id: &str| {
+            shared_dir.join(format!(
+                "processor-parity-{}.json",
+                hex(&Sha256::digest(request_id.as_bytes()))
+            ))
+        };
         let png = raster_image.png_bytes();
         assert!(!png.is_empty() && png.len() <= 1024 * 1024);
         let png_hex = hex(png);
@@ -6205,7 +6448,7 @@ mod tests {
         assert!(execution.timing.process_create_call_to_recognition_ns > 0);
         assert!(execution.timing.model_cold_start_ns.is_none());
 
-        let sidecar_path = shared_dir.join("processor-parity.json");
+        let sidecar_path = sidecar_path_for_request(&request.request_id);
         let sidecar_bytes = fs::read(&sidecar_path).unwrap();
         assert!(sidecar_bytes.len() <= 16 * 1024);
         let sidecar_text = std::str::from_utf8(&sidecar_bytes).unwrap();
@@ -6239,9 +6482,11 @@ mod tests {
         // copying the operator paths or raster bytes.
         let benchmark_case_path = shared_dir.join("benchmark-case.json");
         let benchmark_provider_path = shared_dir.join("benchmark-provider.json");
+        let benchmark_corpus_path = shared_dir.join("benchmark-corpus.json");
         let benchmark_case = BenchmarkCaseManifestV1 {
             schema_version: 1,
             batch_id: "senocr-benchmark-e2e".to_owned(),
+            repeat_count: 2,
             cases: vec![BenchmarkCaseSpecV1 {
                 case_id: "synthetic-case".to_owned(),
                 journal_path: journal_path.clone(),
@@ -6254,15 +6499,15 @@ mod tests {
                 requested_input_modalities: vec![ProviderInputCapabilityV1::Raster],
                 selected_strokes: vec![BenchmarkStrokeRefV1::from(&target)],
                 provenance: BenchmarkCaseProvenanceV1 {
-                    corpus_id: None,
-                    annotation_id: None,
+                    corpus_id: Some("senocr-repeat-routing-corpus".to_owned()),
+                    annotation_id: Some("senocr-repeat-routing-annotation".to_owned()),
                     writer_key: "synthetic-writer".to_owned(),
                     session_key: target.session_id.clone(),
-                    session_start_unix_ns: None,
+                    session_start_unix_ns: Some(1_700_000_000_000_000_000),
                     configuration_key: "synthetic-senocr-e2e-config".to_owned(),
-                    split: None,
-                    capture_api: None,
-                    capture_api_version: None,
+                    split: Some(BenchmarkSplitV1::Evaluation),
+                    capture_api: Some("synthetic-fixture".to_owned()),
+                    capture_api_version: Some("synthetic-fixture-v1".to_owned()),
                     tablet_model: None,
                     driver_version: None,
                     windows_build: None,
@@ -6283,6 +6528,30 @@ mod tests {
                         bottom_px_exclusive: 512,
                     },
                 }),
+            }],
+        };
+        // This synthetic annotation exercises primary-repeat routing only; it is
+        // not ground truth for the recognizer and supports no quality claim.
+        let synthetic_reference = "synthetic routing reference";
+        let benchmark_corpus = BenchmarkCorpusManifestV1 {
+            schema_version: 1,
+            corpus_id: "senocr-repeat-routing-corpus".to_owned(),
+            split_key: BenchmarkSplitKeyV1::Session,
+            bootstrap_cluster: BenchmarkClusterKeyV1::Session,
+            bootstrap_seed: 7,
+            bootstrap_replicates: 10,
+            tokenization_policy: BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+            cases: vec![BenchmarkAnnotationCaseV1 {
+                case_id: "synthetic-case".to_owned(),
+                annotation_id: "senocr-repeat-routing-annotation".to_owned(),
+                reference_text: synthetic_reference.to_owned(),
+                reference_language_scope:
+                    crate::benchmark::BenchmarkReferenceLanguageScopeV1::MixedOrUnknown,
+                reference_handwriting_style: Some(
+                    crate::benchmark::BenchmarkHandwritingStyleV1::Cursive,
+                ),
+                reference_lexical_tokens: None,
+                delayed_marks: Vec::new(),
             }],
         };
         let benchmark_configuration = ProviderConfigurationV1 {
@@ -6351,23 +6620,125 @@ mod tests {
             serde_json::to_vec(&benchmark_provider).unwrap(),
         )
         .unwrap();
+        fs::write(
+            &benchmark_corpus_path,
+            serde_json::to_vec(&benchmark_corpus).unwrap(),
+        )
+        .unwrap();
         let benchmark_completion = benchmark::run_batch_cli_to_directory(
             &benchmark_case_path,
             &benchmark_provider_path,
-            None,
+            Some(&benchmark_corpus_path),
             &shared_dir,
         )
         .unwrap_or_else(|_error| panic!("the guarded M5 benchmark run returned a failure"));
+        assert_eq!(benchmark_completion.run_count, 2);
+        assert_eq!(benchmark_completion.failure_count, 0);
         let benchmark_text = fs::read_to_string(&benchmark_completion.artifact_path).unwrap();
+        assert!(!benchmark_text.contains(synthetic_reference));
         let benchmark_rows = benchmark_text
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
-        let run_row = benchmark_rows
+        assert_eq!(benchmark_rows.len(), 4);
+        let run_records = benchmark_rows
             .iter()
-            .find(|row| row["record_type"] == "run")
-            .expect("the benchmark artifact contains its run record");
-        let record = &run_row["record"];
+            .filter(|row| row["record_type"] == "run")
+            .map(|row| &row["record"])
+            .collect::<Vec<_>>();
+        assert_eq!(run_records.len(), 2);
+        let record = run_records[0];
+        let later_record = run_records[1];
+        assert_eq!(record["repeat_index"], 0);
+        assert_eq!(later_record["repeat_index"], 1);
+        assert_eq!(record["repeat_count"], 2);
+        assert_eq!(later_record["repeat_count"], 2);
+        assert_eq!(
+            record["repeat_input_identity_sha256"],
+            later_record["repeat_input_identity_sha256"]
+        );
+        assert_eq!(record["input_view_id"], later_record["input_view_id"]);
+        assert_eq!(
+            record["input_view_id"].as_str(),
+            Some(request.input_view_id.as_str())
+        );
+        assert_eq!(record["source_revision"], later_record["source_revision"]);
+        assert_eq!(
+            record["requested_input_modalities"],
+            later_record["requested_input_modalities"]
+        );
+        assert_eq!(
+            record["provider_configuration_id"],
+            later_record["provider_configuration_id"]
+        );
+        assert_eq!(
+            record["provider_configuration_fingerprint"],
+            later_record["provider_configuration_fingerprint"]
+        );
+        assert_eq!(record["selected_strokes"], later_record["selected_strokes"]);
+        assert_eq!(
+            record["source_sample_sequences"],
+            later_record["source_sample_sequences"]
+        );
+        assert_eq!(
+            record["generated_raster_origin"],
+            later_record["generated_raster_origin"]
+        );
+        assert_eq!(
+            record["raster_input_sha256"],
+            later_record["raster_input_sha256"]
+        );
+        assert_ne!(
+            record["result"]["request_id"],
+            later_record["result"]["request_id"]
+        );
+        assert_eq!(
+            record["result"]["consumed_input_modalities"],
+            later_record["result"]["consumed_input_modalities"]
+        );
+        assert_eq!(
+            record["provider_identity"],
+            later_record["provider_identity"]
+        );
+        assert_eq!(record["quality_evidence"], later_record["quality_evidence"]);
+        let output_hash_for_record = |record: &serde_json::Value| {
+            #[derive(Serialize)]
+            struct CandidateProjection<'a> {
+                candidate_rank: u16,
+                recognized_text: &'a str,
+                native_score_raw: &'a Option<serde_json::Number>,
+                stroke_ranges: &'a [ProviderStrokeRangeV1],
+            }
+            #[derive(Serialize)]
+            struct OutputProjection<'a> {
+                schema_version: u32,
+                candidates: Vec<CandidateProjection<'a>>,
+            }
+            let candidates: Vec<ProviderCandidateV1> =
+                serde_json::from_value(record["result"]["candidates"].clone()).unwrap();
+            let projected = candidates
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| CandidateProjection {
+                    candidate_rank: u16::try_from(index).unwrap(),
+                    recognized_text: &candidate.recognized_text,
+                    native_score_raw: &candidate.native_score_raw,
+                    stroke_ranges: &candidate.stroke_ranges,
+                })
+                .collect();
+            let bytes = serde_json::to_vec(&OutputProjection {
+                schema_version: 1,
+                candidates: projected,
+            })
+            .unwrap();
+            hex(&Sha256::digest(bytes))
+        };
+        let mut expected_output_hash_counts = BTreeMap::<String, u64>::new();
+        for run_record in [record, later_record] {
+            *expected_output_hash_counts
+                .entry(output_hash_for_record(run_record))
+                .or_default() += 1;
+        }
         let quality_evidence = &record["quality_evidence"];
         assert_eq!(
             quality_evidence["status"],
@@ -6403,16 +6774,137 @@ mod tests {
                 .len(),
             12
         );
-        assert!(record["candidate_metrics"].as_array().unwrap().is_empty());
+        let primary_metrics = record["candidate_metrics"].as_array().unwrap();
+        assert_eq!(primary_metrics.len(), 1);
+        assert_eq!(primary_metrics[0]["candidate_rank"].as_u64(), Some(0));
+        assert_eq!(
+            primary_metrics[0]["nfc_unicode_scalar_cer"]["reference_units"].as_u64(),
+            Some(synthetic_reference.chars().count() as u64)
+        );
+        assert!(
+            later_record["candidate_metrics"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            later_record["metric_evaluation_unavailable_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("primary repeat index 0 only"))
+        );
         assert_eq!(record["requested_input_modalities"][0], "raster");
         assert_eq!(
             record["provider_identity"]["provider_id"],
             "senocr-v1-fp32-local"
         );
+        let footer = &benchmark_rows
+            .iter()
+            .find(|row| row["record_type"] == "footer")
+            .unwrap()["record"];
+        assert_eq!(footer["planned_repeat_count"].as_u64(), Some(2));
+        assert_eq!(footer["planned_attempt_count"].as_u64(), Some(2));
+        assert_eq!(footer["recorded_run_count"].as_u64(), Some(2));
+        assert_eq!(footer["failed_run_count"].as_u64(), Some(0));
+        assert_eq!(footer["complete"].as_bool(), Some(true));
+        assert!(footer["paired_comparisons"].as_array().unwrap().is_empty());
+        let provider_summaries = footer["provider_summaries"].as_array().unwrap();
+        assert_eq!(provider_summaries.len(), 1);
+        assert_eq!(
+            provider_summaries[0]["attempted_run_count"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            provider_summaries[0]["completed_run_count"].as_u64(),
+            Some(2)
+        );
+        let cursive_summary = provider_summaries[0]["cursive_only_cer_by_split"]
+            .as_array()
+            .unwrap();
+        assert_eq!(cursive_summary.len(), 1);
+        assert_eq!(cursive_summary[0]["split"], "evaluation");
+        assert_eq!(
+            cursive_summary[0]["style_annotation_coverage"]["cursive_case_count"],
+            1
+        );
+        assert_eq!(
+            cursive_summary[0]["explicitly_cursive_reference_case_count"],
+            1
+        );
+        assert_eq!(cursive_summary[0]["scored_case_count"], 1);
+        assert_eq!(cursive_summary[0]["unavailable_case_count"], 0);
+        assert_eq!(
+            cursive_summary[0]["nfc_unicode_scalar_micro_cer"]["reference_units"].as_u64(),
+            Some(synthetic_reference.chars().count() as u64)
+        );
+        let boundary_summary = provider_summaries[0]["orthographic_whitespace_boundary_by_split"]
+            .as_array()
+            .unwrap();
+        assert_eq!(boundary_summary.len(), 1);
+        assert_eq!(boundary_summary[0]["aligned_case_count"], 1);
+        assert_eq!(boundary_summary[0]["unavailable_case_count"], 0);
+        let determinism = &footer["output_determinism"];
+        assert_eq!(determinism["requested_repeat_count"].as_u64(), Some(2));
+        assert_eq!(determinism["primary_repeat_index"].as_u64(), Some(0));
+        assert_eq!(determinism["comparison_group_count"].as_u64(), Some(1));
+        let determinism_groups = determinism["groups"].as_array().unwrap();
+        assert_eq!(determinism_groups.len(), 1);
+        let determinism_group = &determinism_groups[0];
+        let determinism_status = determinism_group["status"].as_str().unwrap();
+        let expected_determinism_status = if expected_output_hash_counts.len() == 1 {
+            "equal"
+        } else {
+            "different"
+        };
+        assert_eq!(determinism_status, expected_determinism_status);
+        assert_eq!(determinism_group["eligible_output_count"].as_u64(), Some(2));
+        assert_eq!(
+            determinism_group["successful_repeat_count"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(determinism_group["failed_repeat_count"].as_u64(), Some(0));
+        assert_eq!(
+            determinism_group["unavailable_repeat_count"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            determinism_group["distinct_output_count"].as_u64(),
+            Some(expected_output_hash_counts.len() as u64)
+        );
+        assert_eq!(
+            determinism_group["all_eligible_outputs_equal"].as_bool(),
+            Some(expected_output_hash_counts.len() == 1)
+        );
+        assert!(determinism_group.get("result").is_none());
+        assert!(determinism_group.get("recognized_text").is_none());
+        assert!(determinism_group.get("raw_response_frames").is_none());
+        let reported_output_hash_counts = determinism_group["output_hash_counts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["output_sha256"].as_str().unwrap().to_owned(),
+                    entry["observation_count"].as_u64().unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(reported_output_hash_counts, expected_output_hash_counts);
+        assert!(
+            determinism_group["output_hash_counts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.as_object().is_some_and(|object| {
+                    object.len() == 2
+                        && object.contains_key("output_sha256")
+                        && object.contains_key("observation_count")
+                }))
+        );
         let private_paths = vec![
             asset_root.to_string_lossy().into_owned(),
             python_executable.to_string_lossy().into_owned(),
             worker_script.to_string_lossy().into_owned(),
+            benchmark_corpus_path.to_string_lossy().into_owned(),
         ];
         let injected_path_json = serde_json::to_string(&serde_json::json!({
             "nested": {"paths": private_paths.clone()}
@@ -6432,11 +6924,39 @@ mod tests {
             );
         }
         assert!(!benchmark_text.contains(&png_hex));
-        // The benchmark worker recreates this one-shot sidecar; the next
-        // guarded negative call correctly rejects a pre-existing sidecar.
-        assert!(sidecar_path.is_file());
-        fs::remove_file(&sidecar_path).unwrap();
-        assert!(!sidecar_path.exists());
+        let mut repeated_sidecar_paths = Vec::new();
+        for repeat_index in 0..2 {
+            let request_id = format!("bench-0-0-r{repeat_index}");
+            let repeated_sidecar = sidecar_path_for_request(&request_id);
+            assert!(repeated_sidecar.is_file());
+            let repeated_sidecar_bytes = fs::read(&repeated_sidecar).unwrap();
+            assert!(repeated_sidecar_bytes.len() <= 16 * 1024);
+            let repeated_sidecar_text = std::str::from_utf8(&repeated_sidecar_bytes).unwrap();
+            assert!(!repeated_sidecar_text.contains(&asset_root.to_string_lossy().into_owned()));
+            assert!(!repeated_sidecar_text.contains(&worker_script.to_string_lossy().into_owned()));
+            assert!(!repeated_sidecar_text.contains(&png_hex));
+            assert!(!repeated_sidecar_text.contains("recognized_text"));
+            let repeated_sidecar_value: serde_json::Value =
+                serde_json::from_slice(&repeated_sidecar_bytes).unwrap();
+            assert_eq!(
+                repeated_sidecar_value["schema"],
+                "senocr-processor-parity-v1"
+            );
+            assert_eq!(
+                repeated_sidecar_value["canonical_rgba_sha256"],
+                hex(&Sha256::digest(rgba))
+            );
+            assert_eq!(
+                repeated_sidecar_value["decoded_processor_inputs"],
+                repeated_sidecar_value["direct_processor_inputs"]
+            );
+            repeated_sidecar_paths.push(repeated_sidecar);
+        }
+        assert_ne!(repeated_sidecar_paths[0], repeated_sidecar_paths[1]);
+        for repeated_sidecar in &repeated_sidecar_paths {
+            fs::remove_file(repeated_sidecar).unwrap();
+            assert!(!repeated_sidecar.exists());
+        }
 
         let expect_worker_failure = |request: RecognitionRequestV1, expected_code: &str| {
             let case_label = request.request_id.clone();

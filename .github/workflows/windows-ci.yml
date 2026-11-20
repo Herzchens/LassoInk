@@ -128,7 +128,8 @@ jobs:
       github.repository == 'Herzchens/LassoInk' &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'feat/benchmark-fidelity'
+      (github.event.pull_request.head.ref == 'feat/benchmark-fidelity' ||
+       github.event.pull_request.head.ref == 'feat/benchmark-observability')
     needs: verify
     runs-on: windows-2025
     timeout-minutes: 60
@@ -159,7 +160,8 @@ jobs:
           if ($env:LASSOINK_RUN_SENOCR_CPU_COMPAT -cne '1') { throw 'Explicit opt-in is required.' }
           if ($env:LASSOINK_RUN_SENOCR_M4_E2E -cne '1') { throw 'Explicit M4 worker E2E opt-in is required.' }
           if ($env:EXPECTED_HEAD_SHA -notmatch '^[0-9a-f]{40}$') { throw 'Exact head SHA is invalid.' }
-          if ($env:EXPECTED_HEAD_REPOSITORY -cne 'Herzchens/LassoInk' -or $env:EXPECTED_HEAD_REF -cne 'feat/benchmark-fidelity') { throw 'Pull request source guard failed.' }
+          $allowedHeadRefs = @('feat/benchmark-fidelity', 'feat/benchmark-observability')
+          if ($env:EXPECTED_HEAD_REPOSITORY -cne 'Herzchens/LassoInk' -or $env:EXPECTED_HEAD_REF -cnotin $allowedHeadRefs -or $env:GITHUB_HEAD_REF -cne $env:EXPECTED_HEAD_REF) { throw 'Pull request source guard failed.' }
 
       - name: Check out exact PR head or pushed commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

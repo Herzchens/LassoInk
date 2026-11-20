@@ -59,9 +59,14 @@ const MAX_GENERATED_RASTER_PROVENANCE_SAMPLES: usize = 4096;
 const MAX_GENERATED_RASTER_PROVENANCE_STROKES: usize = 512;
 const GENERATED_RASTER_COORDINATE_SPACE: &str = "canonical-raster-output-v1";
 const GENERATED_RASTER_COORDINATE_UNITS: &str = "pixel";
+const DEFAULT_BENCHMARK_REPEAT_COUNT: u32 = 1;
+const MAX_BENCHMARK_REPEAT_COUNT: u32 = 5;
+const BENCHMARK_OUTPUT_DETERMINISM_SCHEMA_VERSION: u32 = 1;
+const BENCHMARK_OUTPUT_HASH_SCOPE_V1: &str = "ordered recognized-candidate projection only: candidate rank, recognized_text, native_score_raw, and stroke_ranges; excludes provider-specific raw_candidate and request/result/runtime/timing envelope";
 const MAX_BENCHMARK_RECORD_BYTES: usize = 48 * 1024 * 1024;
 const MAX_BENCHMARK_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_BENCHMARK_RECORDS: u64 = 50_000;
+const MAX_BENCHMARK_RUN_RECORDS: u64 = MAX_BENCHMARK_RECORDS - 2;
 const MAX_PROVIDER_RESULTS_WAIT: Duration = Duration::from_secs(365);
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_ANNOTATION_BYTES: u64 = 2 * 1024 * 1024;
@@ -110,7 +115,13 @@ pub(crate) const SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES: [(&str, u64); 12] = [
 pub(crate) struct BenchmarkCaseManifestV1 {
     pub schema_version: u32,
     pub batch_id: String,
+    #[serde(default = "default_benchmark_repeat_count")]
+    pub repeat_count: u32,
     pub cases: Vec<BenchmarkCaseSpecV1>,
+}
+
+fn default_benchmark_repeat_count() -> u32 {
+    DEFAULT_BENCHMARK_REPEAT_COUNT
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -486,6 +497,8 @@ impl Default for BenchmarkQualityEvidenceV1 {
 struct BenchmarkArtifactHeaderV1 {
     pub schema_version: u32,
     pub batch_id: String,
+    #[serde(default = "default_benchmark_repeat_count")]
+    pub repeat_count: u32,
     pub case_manifest_sha256: String,
     pub corpus_manifest_sha256: Option<String>,
     pub app_version: String,
@@ -581,6 +594,14 @@ struct CanonicalInkComparisonFingerprintV1<'a> {
 #[serde(deny_unknown_fields)]
 pub(crate) struct BenchmarkRunRecordV1 {
     pub case_id: String,
+    /// Zero-based run repetition. Only repetition zero contributes text-quality statistics.
+    #[serde(default)]
+    pub repeat_index: u32,
+    #[serde(default = "default_benchmark_repeat_count")]
+    pub repeat_count: u32,
+    /// Hash of the frozen request view/config/source; excludes request IDs and config values.
+    #[serde(default)]
+    pub repeat_input_identity_sha256: Option<String>,
     pub region_id: String,
     pub line_id: String,
     pub coordinate_space: String,
@@ -697,7 +718,7 @@ pub(crate) enum BenchmarkRunStatusV1 {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BenchmarkFailureCategoryV1 {
     InvalidConfig,
@@ -719,10 +740,14 @@ pub(crate) enum BenchmarkFailureCategoryV1 {
 struct BenchmarkArtifactFooterV1 {
     pub planned_case_count: u32,
     pub planned_provider_count: u32,
+    #[serde(default = "default_benchmark_repeat_count")]
+    pub planned_repeat_count: u32,
+    #[serde(default)]
+    pub planned_attempt_count: u32,
     pub recorded_run_count: u32,
     pub failed_run_count: u32,
-    /// True means every planned case/provider attempt has a run row. Failed
-    /// provider outcomes remain visible and do not make the artifact partial.
+    /// True means every planned case/provider/repeat attempt has a run row.
+    /// Failed provider outcomes remain visible and do not make the artifact partial.
     pub complete: bool,
     pub corpus_id: Option<String>,
     pub split_key: Option<BenchmarkSplitKeyV1>,
@@ -734,6 +759,90 @@ struct BenchmarkArtifactFooterV1 {
     pub pairwise_interpretation: Option<BenchmarkPairwiseInterpretationV1>,
     pub provider_summaries: Vec<BenchmarkProviderSummaryV1>,
     pub paired_comparisons: Vec<BenchmarkPairedComparisonV1>,
+    /// Missing on legacy artifacts; current artifacts record repeat output comparisons.
+    #[serde(default)]
+    pub output_determinism: Option<BenchmarkOutputDeterminismV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BenchmarkOutputDeterminismStatusV1 {
+    Equal,
+    Different,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BenchmarkOutputDeterminismUnavailableReasonV1 {
+    FewerThanTwoRequestedRepeats,
+    MissingRepeatRows,
+    MissingRequestIdentity,
+    RequestIdentityChangedAcrossRepeats,
+    ProviderExecutionIdentityChangedAcrossRepeats,
+    FewerThanTwoFullyEvidencedSuccessfulOutputs,
+    MissingRecognitionResult,
+    IncompleteRawResponseCapture,
+    IncompleteRuntimeOrAssetEvidence,
+    MismatchedProviderResultIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchmarkOutputHashCountV1 {
+    pub output_sha256: String,
+    pub observation_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchmarkFailureCategoryCountV1 {
+    pub category: BenchmarkFailureCategoryV1,
+    pub observation_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchmarkOutputDeterminismReasonCountV1 {
+    pub reason: BenchmarkOutputDeterminismUnavailableReasonV1,
+    pub observation_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchmarkOutputDeterminismGroupV1 {
+    /// Zero-based position in the case manifest; no case text or local path is copied.
+    pub case_ordinal: u32,
+    pub provider_id: String,
+    pub configuration_id: String,
+    pub requested_repeat_count: u32,
+    pub successful_repeat_count: u32,
+    pub failed_repeat_count: u32,
+    pub unavailable_repeat_count: u32,
+    pub eligible_output_count: u32,
+    pub observed_identity_sha256: Option<String>,
+    pub status: BenchmarkOutputDeterminismStatusV1,
+    pub distinct_output_count: Option<u32>,
+    pub all_eligible_outputs_equal: Option<bool>,
+    pub output_hash_counts: Vec<BenchmarkOutputHashCountV1>,
+    pub failure_category_counts: Vec<BenchmarkFailureCategoryCountV1>,
+    pub unavailable_reason_counts: Vec<BenchmarkOutputDeterminismReasonCountV1>,
+    pub unavailable_reason: Option<BenchmarkOutputDeterminismUnavailableReasonV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BenchmarkOutputDeterminismV1 {
+    pub schema_version: u32,
+    pub requested_repeat_count: u32,
+    pub primary_repeat_index: u32,
+    pub hash_algorithm: String,
+    pub output_hash_scope: String,
+    pub comparison_group_count: u32,
+    pub equal_group_count: u32,
+    pub different_group_count: u32,
+    pub unavailable_group_count: u32,
+    pub groups: Vec<BenchmarkOutputDeterminismGroupV1>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -908,14 +1017,27 @@ struct BenchmarkArtifactWriter {
     failure_count: u32,
 }
 
+struct BenchmarkArtifactFinishInput<'a> {
+    planned_case_count: usize,
+    planned_provider_count: usize,
+    planned_repeat_count: u32,
+    planned_attempt_count: usize,
+    paired_comparisons: Vec<BenchmarkPairedComparisonV1>,
+    provider_summaries: Vec<BenchmarkProviderSummaryV1>,
+    output_determinism: Option<BenchmarkOutputDeterminismV1>,
+    corpus_manifest: Option<&'a BenchmarkCorpusManifestV1>,
+}
+
 impl BenchmarkArtifactWriter {
     fn create_at(
         output_directory: &Path,
         batch_id: &str,
+        repeat_count: u32,
         case_manifest_sha256: &str,
         corpus_manifest_sha256: Option<String>,
     ) -> io::Result<Self> {
         validate_local_id(batch_id, "batch ID")?;
+        validate_benchmark_repeat_count(repeat_count)?;
         validate_sha256_hex(case_manifest_sha256, "case manifest digest")?;
         if let Some(sha256) = &corpus_manifest_sha256 {
             validate_sha256_hex(sha256, "corpus manifest digest")?;
@@ -945,6 +1067,7 @@ impl BenchmarkArtifactWriter {
             BenchmarkArtifactHeaderV1 {
                 schema_version: BENCHMARK_SCHEMA_VERSION,
                 batch_id: batch_id.to_owned(),
+                repeat_count,
                 case_manifest_sha256: case_manifest_sha256.to_owned(),
                 corpus_manifest_sha256,
                 app_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -975,18 +1098,31 @@ impl BenchmarkArtifactWriter {
 
     fn finish(
         mut self,
-        planned_case_count: usize,
-        planned_provider_count: usize,
-        paired_comparisons: Vec<BenchmarkPairedComparisonV1>,
-        provider_summaries: Vec<BenchmarkProviderSummaryV1>,
-        corpus_manifest: Option<&BenchmarkCorpusManifestV1>,
+        input: BenchmarkArtifactFinishInput<'_>,
     ) -> io::Result<BenchmarkBatchCompletionV1> {
-        let planned_run_count = planned_case_count
-            .checked_mul(planned_provider_count)
-            .and_then(|count| u32::try_from(count).ok())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "planned run count exceeds u32")
-            })?;
+        let BenchmarkArtifactFinishInput {
+            planned_case_count,
+            planned_provider_count,
+            planned_repeat_count,
+            planned_attempt_count,
+            paired_comparisons,
+            provider_summaries,
+            output_determinism,
+            corpus_manifest,
+        } = input;
+        validate_benchmark_repeat_count(planned_repeat_count)?;
+        let expected_attempt_count = planned_benchmark_attempt_count(
+            planned_case_count,
+            planned_provider_count,
+            planned_repeat_count,
+        )?;
+        if expected_attempt_count != planned_attempt_count {
+            return Err(invalid_data(
+                "planned benchmark attempt count does not match its manifest dimensions",
+            ));
+        }
+        let planned_run_count = u32::try_from(planned_attempt_count)
+            .map_err(|_| invalid_data("planned run count exceeds u32"))?;
         self.write_record(&BenchmarkArtifactRecordV1::Footer(
             BenchmarkArtifactFooterV1 {
                 planned_case_count: u32::try_from(planned_case_count).map_err(|_| {
@@ -995,6 +1131,8 @@ impl BenchmarkArtifactWriter {
                 planned_provider_count: u32::try_from(planned_provider_count).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "provider count does not fit u32")
                 })?,
+                planned_repeat_count,
+                planned_attempt_count: planned_run_count,
                 recorded_run_count: self.run_count,
                 failed_run_count: self.failure_count,
                 complete: self.run_count == planned_run_count,
@@ -1012,6 +1150,7 @@ impl BenchmarkArtifactWriter {
                 }),
                 provider_summaries,
                 paired_comparisons,
+                output_determinism,
             },
         ))?;
         self.file
@@ -1264,6 +1403,600 @@ struct EvaluationObservation {
     session_key: String,
     cer: Option<BenchmarkCountMetricV1>,
     wer: Option<BenchmarkCountMetricV1>,
+}
+
+fn push_primary_evaluation_observation(
+    observations: &mut Vec<EvaluationObservation>,
+    case: &BenchmarkCaseSpecV1,
+    provider: &PreparedBenchmarkProvider,
+    annotation: Option<&BenchmarkAnnotationCaseV1>,
+    run: &BenchmarkRunRecordV1,
+) -> io::Result<()> {
+    if run.repeat_index != 0 {
+        return Ok(());
+    }
+    let (Some(_annotation), Some(split)) = (annotation, case.provenance.split) else {
+        return Ok(());
+    };
+    let first = run.candidate_metrics.first();
+    observations.try_reserve(1)?;
+    observations.push(EvaluationObservation {
+        case_id: case.case_id.clone(),
+        provider_id: provider.provider_id.clone(),
+        configuration_id: provider.approved_configuration_id().to_owned(),
+        split,
+        writer_key: case.provenance.writer_key.clone(),
+        session_key: case.provenance.session_key.clone(),
+        cer: first.and_then(|metrics| metrics.nfc_unicode_scalar_cer.clone()),
+        wer: first.and_then(|metrics| metrics.whitespace_token_syllable_wer.clone()),
+    });
+    Ok(())
+}
+
+struct OutputDeterminismAccumulator {
+    case_ordinal: u32,
+    case_id: String,
+    provider_id: String,
+    configuration_id: String,
+    requested_repeat_count: u32,
+    seen_repeats: Vec<bool>,
+    request_identity_sha256: Option<String>,
+    request_identity_missing: bool,
+    request_identity_changed: bool,
+    execution_identity_sha256: Option<String>,
+    execution_identity_changed: bool,
+    successful_repeat_count: u32,
+    failed_repeat_count: u32,
+    unavailable_repeat_count: u32,
+    eligible_output_count: u32,
+    output_hash_counts: BTreeMap<String, u32>,
+    failure_category_counts: BTreeMap<BenchmarkFailureCategoryV1, u32>,
+    unavailable_reason_counts: BTreeMap<BenchmarkOutputDeterminismUnavailableReasonV1, u32>,
+}
+
+#[derive(Serialize)]
+struct BenchmarkRepeatRequestIdentityV1<'a> {
+    schema_version: u32,
+    source_revision: &'a ProviderSourceRevisionV1,
+    input_view_id: &'a str,
+    canonical_ink_comparison_binding: &'a BenchmarkCanonicalInkComparisonBindingV1,
+    region_id: &'a str,
+    line_id: &'a str,
+    coordinate_space: &'a str,
+    coordinate_units: &'a str,
+    language_hints: &'a [String],
+    requested_input_modalities: &'a [ProviderInputCapabilityV1],
+    selected_strokes: &'a [BenchmarkStrokeRefV1],
+    source_sample_sequences: &'a [u64],
+    raster_input_byte_count: Option<u64>,
+    raster_input_sha256: Option<&'a str>,
+    generated_raster_origin: &'a Option<BenchmarkGeneratedRasterOriginV1>,
+    provider_id: &'a str,
+    provider_configuration_id: &'a str,
+    provider_configuration_fingerprint: &'a str,
+    artifact_digests: &'a [ProviderArtifactDigestV1],
+}
+
+#[derive(Serialize)]
+struct BenchmarkRepeatExecutionIdentityV1<'a> {
+    schema_version: u32,
+    repeat_input_identity_sha256: &'a str,
+    provider_identity: &'a ProviderIdentityV1,
+    provider_configuration_id: &'a str,
+    provider_configuration_fingerprint: &'a str,
+    requested_input_modalities: &'a [ProviderInputCapabilityV1],
+    consumed_input_modalities: &'a [ProviderInputCapabilityV1],
+    artifact_digests: &'a [ProviderArtifactDigestV1],
+    model_artifact_digests: &'a [ProviderArtifactDigestV1],
+    quality_evidence: &'a BenchmarkQualityEvidenceV1,
+}
+
+#[derive(Serialize)]
+struct BenchmarkOutputOnlyFingerprintV1<'a> {
+    schema_version: u32,
+    candidates: &'a [BenchmarkOutputCandidateFingerprintV1<'a>],
+}
+
+#[derive(Serialize)]
+struct BenchmarkOutputCandidateFingerprintV1<'a> {
+    candidate_rank: u16,
+    recognized_text: &'a str,
+    native_score_raw: &'a Option<serde_json::Number>,
+    stroke_ranges: &'a [crate::provider_protocol::ProviderStrokeRangeV1],
+}
+
+impl OutputDeterminismAccumulator {
+    fn new(
+        case_ordinal: usize,
+        case_id: String,
+        provider_id: String,
+        configuration_id: String,
+        requested_repeat_count: u32,
+    ) -> io::Result<Self> {
+        validate_benchmark_repeat_count(requested_repeat_count)?;
+        let repeat_slots = usize::try_from(requested_repeat_count)
+            .map_err(|_| invalid_data("repeat count exceeds usize"))?;
+        let mut seen_repeats = Vec::new();
+        seen_repeats.try_reserve_exact(repeat_slots)?;
+        seen_repeats.resize(repeat_slots, false);
+        Ok(Self {
+            case_ordinal: u32::try_from(case_ordinal)
+                .map_err(|_| invalid_data("case ordinal exceeds u32"))?,
+            case_id,
+            provider_id,
+            configuration_id,
+            requested_repeat_count,
+            seen_repeats,
+            request_identity_sha256: None,
+            request_identity_missing: false,
+            request_identity_changed: false,
+            execution_identity_sha256: None,
+            execution_identity_changed: false,
+            successful_repeat_count: 0,
+            failed_repeat_count: 0,
+            unavailable_repeat_count: 0,
+            eligible_output_count: 0,
+            output_hash_counts: BTreeMap::new(),
+            failure_category_counts: BTreeMap::new(),
+            unavailable_reason_counts: BTreeMap::new(),
+        })
+    }
+
+    fn observe(&mut self, run: &BenchmarkRunRecordV1) -> io::Result<()> {
+        if run.repeat_count != self.requested_repeat_count
+            || run.repeat_index >= self.requested_repeat_count
+            || run.case_id != self.case_id
+        {
+            return Err(invalid_data(
+                "run repetition identity is outside its manifest bound",
+            ));
+        }
+        let index = usize::try_from(run.repeat_index)
+            .map_err(|_| invalid_data("run repetition index exceeds usize"))?;
+        if self.seen_repeats[index] {
+            return Err(invalid_data("duplicate benchmark repeat row"));
+        }
+        self.seen_repeats[index] = true;
+
+        match run.repeat_input_identity_sha256.as_deref() {
+            Some(identity) if !identity.is_empty() => match &self.request_identity_sha256 {
+                Some(previous) if previous != identity => {
+                    self.request_identity_changed = true;
+                    self.add_unavailable_reason(
+                        BenchmarkOutputDeterminismUnavailableReasonV1::
+                            RequestIdentityChangedAcrossRepeats,
+                    )?;
+                }
+                Some(_) => {}
+                None => self.request_identity_sha256 = Some(identity.to_owned()),
+            },
+            Some(_) | None => {
+                self.request_identity_missing = true;
+                self.add_unavailable_reason(
+                    BenchmarkOutputDeterminismUnavailableReasonV1::MissingRequestIdentity,
+                )?;
+            }
+        }
+
+        if run.provider_id != self.provider_id
+            || run.provider_configuration_id != self.configuration_id
+        {
+            self.request_identity_changed = true;
+            self.add_unavailable_reason(
+                BenchmarkOutputDeterminismUnavailableReasonV1::RequestIdentityChangedAcrossRepeats,
+            )?;
+        }
+
+        match run.status {
+            BenchmarkRunStatusV1::Failed => {
+                self.failed_repeat_count = self
+                    .failed_repeat_count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("determinism failure count overflow"))?;
+                let category = run
+                    .failure_category
+                    .unwrap_or(BenchmarkFailureCategoryV1::Other);
+                let count = self.failure_category_counts.entry(category).or_default();
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("determinism failure category count overflow"))?;
+            }
+            BenchmarkRunStatusV1::Completed => {
+                self.successful_repeat_count = self
+                    .successful_repeat_count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("determinism success count overflow"))?;
+                let Some(result) = run.result.as_ref() else {
+                    self.mark_unavailable(
+                        BenchmarkOutputDeterminismUnavailableReasonV1::MissingRecognitionResult,
+                    )?;
+                    return Ok(());
+                };
+                if let Some(reason) = repeat_output_evidence_unavailable_reason(run, result) {
+                    self.mark_unavailable(reason)?;
+                    return Ok(());
+                }
+                let output_identity = repeat_execution_identity_sha256(run, result)?;
+                if !self.request_identity_missing && !self.request_identity_changed {
+                    match &self.execution_identity_sha256 {
+                        Some(previous) if previous != &output_identity => {
+                            self.execution_identity_changed = true;
+                            self.add_unavailable_reason(
+                                BenchmarkOutputDeterminismUnavailableReasonV1::
+                                    ProviderExecutionIdentityChangedAcrossRepeats,
+                            )?;
+                        }
+                        Some(_) => {}
+                        None => self.execution_identity_sha256 = Some(output_identity),
+                    }
+                }
+                let output_sha256 = repeat_output_sha256(result)?;
+                let count = self.output_hash_counts.entry(output_sha256).or_default();
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("output digest occurrence count overflow"))?;
+                self.eligible_output_count = self
+                    .eligible_output_count
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("eligible output count overflow"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_unavailable(
+        &mut self,
+        reason: BenchmarkOutputDeterminismUnavailableReasonV1,
+    ) -> io::Result<()> {
+        self.unavailable_repeat_count = self
+            .unavailable_repeat_count
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("determinism unavailable count overflow"))?;
+        if reason != BenchmarkOutputDeterminismUnavailableReasonV1::MissingRequestIdentity {
+            self.add_unavailable_reason(reason)?;
+        }
+        Ok(())
+    }
+
+    fn add_unavailable_reason(
+        &mut self,
+        reason: BenchmarkOutputDeterminismUnavailableReasonV1,
+    ) -> io::Result<()> {
+        let count = self.unavailable_reason_counts.entry(reason).or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("determinism reason count overflow"))?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> io::Result<BenchmarkOutputDeterminismGroupV1> {
+        let observed_repeat_count =
+            u32::try_from(self.seen_repeats.iter().filter(|seen| **seen).count())
+                .map_err(|_| invalid_data("observed repeat count exceeds u32"))?;
+        let group_reason = if self.requested_repeat_count < 2 {
+            Some(BenchmarkOutputDeterminismUnavailableReasonV1::FewerThanTwoRequestedRepeats)
+        } else if self.request_identity_missing {
+            Some(BenchmarkOutputDeterminismUnavailableReasonV1::MissingRequestIdentity)
+        } else if observed_repeat_count != self.requested_repeat_count {
+            let missing_count = self
+                .requested_repeat_count
+                .checked_sub(observed_repeat_count)
+                .ok_or_else(|| invalid_data("observed repeat rows exceed planned count"))?;
+            if missing_count > 0 {
+                let count = self
+                    .unavailable_reason_counts
+                    .entry(BenchmarkOutputDeterminismUnavailableReasonV1::MissingRepeatRows)
+                    .or_default();
+                *count = count
+                    .checked_add(missing_count)
+                    .ok_or_else(|| invalid_data("missing repeat reason count overflow"))?;
+            }
+            Some(BenchmarkOutputDeterminismUnavailableReasonV1::MissingRepeatRows)
+        } else if self.request_identity_changed {
+            Some(BenchmarkOutputDeterminismUnavailableReasonV1::RequestIdentityChangedAcrossRepeats)
+        } else if self.execution_identity_changed {
+            Some(
+                BenchmarkOutputDeterminismUnavailableReasonV1::
+                    ProviderExecutionIdentityChangedAcrossRepeats,
+            )
+        } else if self.eligible_output_count < 2 {
+            Some(
+                BenchmarkOutputDeterminismUnavailableReasonV1::
+                    FewerThanTwoFullyEvidencedSuccessfulOutputs,
+            )
+        } else {
+            None
+        };
+        if let Some(reason) = group_reason
+            && !self.unavailable_reason_counts.contains_key(&reason)
+        {
+            self.add_unavailable_reason(reason)?;
+        }
+
+        let status = match group_reason {
+            Some(_) => BenchmarkOutputDeterminismStatusV1::Unavailable,
+            None if self.output_hash_counts.len() == 1 => BenchmarkOutputDeterminismStatusV1::Equal,
+            None => BenchmarkOutputDeterminismStatusV1::Different,
+        };
+        let available = status != BenchmarkOutputDeterminismStatusV1::Unavailable;
+        let distinct_output_count = if available {
+            Some(
+                u32::try_from(self.output_hash_counts.len())
+                    .map_err(|_| invalid_data("distinct output count exceeds u32"))?,
+            )
+        } else {
+            None
+        };
+        let all_eligible_outputs_equal =
+            available.then_some(status == BenchmarkOutputDeterminismStatusV1::Equal);
+        let mut output_hash_counts = Vec::new();
+        if available {
+            output_hash_counts.try_reserve_exact(self.output_hash_counts.len())?;
+            for (output_sha256, observation_count) in self.output_hash_counts {
+                output_hash_counts.push(BenchmarkOutputHashCountV1 {
+                    output_sha256,
+                    observation_count,
+                });
+            }
+        }
+        let mut failure_category_counts = Vec::new();
+        failure_category_counts.try_reserve_exact(self.failure_category_counts.len())?;
+        for (category, observation_count) in self.failure_category_counts {
+            failure_category_counts.push(BenchmarkFailureCategoryCountV1 {
+                category,
+                observation_count,
+            });
+        }
+        let mut unavailable_reason_counts = Vec::new();
+        unavailable_reason_counts.try_reserve_exact(self.unavailable_reason_counts.len())?;
+        for (reason, observation_count) in self.unavailable_reason_counts {
+            unavailable_reason_counts.push(BenchmarkOutputDeterminismReasonCountV1 {
+                reason,
+                observation_count,
+            });
+        }
+        let observed_identity_sha256 =
+            if self.request_identity_changed || self.execution_identity_changed {
+                None
+            } else {
+                self.execution_identity_sha256
+            };
+        Ok(BenchmarkOutputDeterminismGroupV1 {
+            case_ordinal: self.case_ordinal,
+            provider_id: self.provider_id,
+            configuration_id: self.configuration_id,
+            requested_repeat_count: self.requested_repeat_count,
+            successful_repeat_count: self.successful_repeat_count,
+            failed_repeat_count: self.failed_repeat_count,
+            unavailable_repeat_count: self.unavailable_repeat_count,
+            eligible_output_count: self.eligible_output_count,
+            observed_identity_sha256,
+            status,
+            distinct_output_count,
+            all_eligible_outputs_equal,
+            output_hash_counts,
+            failure_category_counts,
+            unavailable_reason_counts,
+            unavailable_reason: group_reason,
+        })
+    }
+}
+
+fn hash_bounded_json<T: Serialize>(value: &T, label: &'static str) -> io::Result<String> {
+    let mut buffer = BoundedJsonBuffer::new(MAX_BENCHMARK_RECORD_BYTES);
+    serde_json::to_writer(&mut buffer, value).map_err(|_| invalid_data(label))?;
+    hex_encode(&Sha256::digest(buffer.bytes))
+}
+
+fn benchmark_repeat_request_identity_sha256(base: &BenchmarkRunBase<'_>) -> io::Result<String> {
+    let fingerprint = BenchmarkRepeatRequestIdentityV1 {
+        schema_version: 1,
+        source_revision: &base.source_revision,
+        input_view_id: &base.input_view_id,
+        canonical_ink_comparison_binding: &base.canonical_ink_comparison_binding,
+        region_id: &base.region_id,
+        line_id: &base.line_id,
+        coordinate_space: &base.coordinate_space,
+        coordinate_units: &base.coordinate_units,
+        language_hints: &base.language_hints,
+        requested_input_modalities: &base.requested_input_modalities,
+        selected_strokes: &base.selected_strokes,
+        source_sample_sequences: &base.source_sample_sequences,
+        raster_input_byte_count: base.raster_input_byte_count,
+        raster_input_sha256: base.raster_input_sha256.as_deref(),
+        generated_raster_origin: &base.generated_raster_origin,
+        provider_id: &base.provider.provider_id,
+        provider_configuration_id: &base.provider_configuration_id,
+        provider_configuration_fingerprint: &base.provider_configuration_fingerprint,
+        artifact_digests: &base.provider.artifact_digests,
+    };
+    hash_bounded_json(
+        &fingerprint,
+        "repeat input identity exceeds its fixed serialization cap",
+    )
+}
+
+fn repeat_output_evidence_unavailable_reason(
+    run: &BenchmarkRunRecordV1,
+    result: &RecognitionResultV1,
+) -> Option<BenchmarkOutputDeterminismUnavailableReasonV1> {
+    if !run.raw_response_capture_complete
+        || run.raw_response_frames.len() != 2
+        || run.raw_response_omitted_frame_count != 0
+        || run.raw_response_omitted_payload_bytes != 0
+    {
+        return Some(BenchmarkOutputDeterminismUnavailableReasonV1::IncompleteRawResponseCapture);
+    }
+    let Some(input_identity) = run.repeat_input_identity_sha256.as_deref() else {
+        return Some(BenchmarkOutputDeterminismUnavailableReasonV1::MissingRequestIdentity);
+    };
+    if input_identity.is_empty()
+        || run.provider_identity.as_ref() != Some(&result.provider)
+        || run.provider_id != result.provider.provider_id
+        || run.provider_configuration_id != result.provider_configuration_id
+        || run.provider_configuration_fingerprint != result.provider_configuration_fingerprint
+        || run.source_revision != result.source_revision
+        || run.input_view_id != result.input_view_id
+        || run.region_id != result.region_id
+        || run.line_id != result.line_id
+        || run.requested_input_modalities != result.consumed_input_modalities
+    {
+        return Some(
+            BenchmarkOutputDeterminismUnavailableReasonV1::MismatchedProviderResultIdentity,
+        );
+    }
+    let Some(provider_identity) = run.provider_identity.as_ref() else {
+        return Some(
+            BenchmarkOutputDeterminismUnavailableReasonV1::MismatchedProviderResultIdentity,
+        );
+    };
+    let expected_resource_version = format!(
+        "{SENOCR_REFERENCE_RUNTIME_PROFILE_ID}-sha256-{SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256}"
+    );
+    if run.provider_id != SENOCR_REFERENCE_PROVIDER_ID
+        || provider_identity.provider_id != SENOCR_REFERENCE_PROVIDER_ID
+        || provider_identity.provider_version != SENOCR_REFERENCE_PROVIDER_VERSION
+        || provider_identity.model_version.as_deref() != Some(SENOCR_REFERENCE_MODEL_REVISION)
+        || provider_identity.resource_version.as_deref() != Some(expected_resource_version.as_str())
+    {
+        return Some(
+            BenchmarkOutputDeterminismUnavailableReasonV1::MismatchedProviderResultIdentity,
+        );
+    }
+    if !quality_metrics_allowed(&run.quality_evidence)
+        || run.provider_capabilities.is_none()
+        || run.model_artifact_hash_unavailable_reason.is_some()
+    {
+        return Some(
+            BenchmarkOutputDeterminismUnavailableReasonV1::IncompleteRuntimeOrAssetEvidence,
+        );
+    }
+    let Some(profile) = run.quality_evidence.runtime_profile.as_ref() else {
+        return Some(
+            BenchmarkOutputDeterminismUnavailableReasonV1::IncompleteRuntimeOrAssetEvidence,
+        );
+    };
+    let Some(coverage) = run.quality_evidence.model_asset_coverage.as_ref() else {
+        return Some(
+            BenchmarkOutputDeterminismUnavailableReasonV1::IncompleteRuntimeOrAssetEvidence,
+        );
+    };
+    if profile.profile_id != SENOCR_REFERENCE_RUNTIME_PROFILE_ID
+        || profile.profile_manifest_sha256 != SENOCR_REFERENCE_RUNTIME_PROFILE_SHA256
+        || profile.distribution_count != SENOCR_REFERENCE_RUNTIME_DISTRIBUTION_COUNT
+        || profile.installed_distribution_closure.len()
+            != SENOCR_REFERENCE_RUNTIME_DISTRIBUTION_COUNT as usize
+        || profile.python_version != SENOCR_REFERENCE_PYTHON_VERSION
+        || profile.platform != SENOCR_REFERENCE_PLATFORM
+        || coverage.model_revision != SENOCR_REFERENCE_MODEL_REVISION
+        || coverage.required_asset_count as usize != SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len()
+        || coverage.observed_asset_count as usize != SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len()
+        || coverage.observed_assets.len() != SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len()
+        || !coverage.missing_asset_names.is_empty()
+        || coverage.status != BenchmarkModelAssetCoverageStatusV1::CompletePrelaunchObservations
+    {
+        return Some(
+            BenchmarkOutputDeterminismUnavailableReasonV1::IncompleteRuntimeOrAssetEvidence,
+        );
+    }
+    None
+}
+
+fn repeat_execution_identity_sha256(
+    run: &BenchmarkRunRecordV1,
+    result: &RecognitionResultV1,
+) -> io::Result<String> {
+    let provider_identity = run
+        .provider_identity
+        .as_ref()
+        .ok_or_else(|| invalid_data("eligible output is missing provider identity"))?;
+    let fingerprint = BenchmarkRepeatExecutionIdentityV1 {
+        schema_version: 1,
+        repeat_input_identity_sha256: run
+            .repeat_input_identity_sha256
+            .as_deref()
+            .ok_or_else(|| invalid_data("eligible output is missing request identity"))?,
+        provider_identity,
+        provider_configuration_id: &run.provider_configuration_id,
+        provider_configuration_fingerprint: &run.provider_configuration_fingerprint,
+        requested_input_modalities: &run.requested_input_modalities,
+        consumed_input_modalities: &result.consumed_input_modalities,
+        artifact_digests: &run.artifact_digests,
+        model_artifact_digests: &run.model_artifact_digests,
+        quality_evidence: &run.quality_evidence,
+    };
+    hash_bounded_json(
+        &fingerprint,
+        "repeat execution identity exceeds its fixed serialization cap",
+    )
+}
+
+fn repeat_output_sha256(result: &RecognitionResultV1) -> io::Result<String> {
+    let mut candidates = Vec::new();
+    candidates.try_reserve_exact(result.candidates.len())?;
+    for (index, candidate) in result.candidates.iter().enumerate() {
+        candidates.push(BenchmarkOutputCandidateFingerprintV1 {
+            candidate_rank: u16::try_from(index)
+                .map_err(|_| invalid_data("provider candidate rank exceeds u16"))?,
+            recognized_text: &candidate.recognized_text,
+            native_score_raw: &candidate.native_score_raw,
+            stroke_ranges: &candidate.stroke_ranges,
+        });
+    }
+    let fingerprint = BenchmarkOutputOnlyFingerprintV1 {
+        schema_version: 1,
+        candidates: &candidates,
+    };
+    hash_bounded_json(
+        &fingerprint,
+        "provider output fingerprint exceeds its fixed serialization cap",
+    )
+}
+
+fn finish_output_determinism(
+    requested_repeat_count: u32,
+    accumulators: Vec<OutputDeterminismAccumulator>,
+) -> io::Result<BenchmarkOutputDeterminismV1> {
+    let mut groups = Vec::new();
+    groups.try_reserve_exact(accumulators.len())?;
+    for accumulator in accumulators {
+        groups.push(accumulator.finish()?);
+    }
+    let equal_group_count = u32::try_from(
+        groups
+            .iter()
+            .filter(|group| group.status == BenchmarkOutputDeterminismStatusV1::Equal)
+            .count(),
+    )
+    .map_err(|_| invalid_data("equal determinism group count exceeds u32"))?;
+    let different_group_count = u32::try_from(
+        groups
+            .iter()
+            .filter(|group| group.status == BenchmarkOutputDeterminismStatusV1::Different)
+            .count(),
+    )
+    .map_err(|_| invalid_data("different determinism group count exceeds u32"))?;
+    let unavailable_group_count = u32::try_from(
+        groups
+            .iter()
+            .filter(|group| group.status == BenchmarkOutputDeterminismStatusV1::Unavailable)
+            .count(),
+    )
+    .map_err(|_| invalid_data("unavailable determinism group count exceeds u32"))?;
+    let comparison_group_count = u32::try_from(groups.len())
+        .map_err(|_| invalid_data("determinism group count exceeds u32"))?;
+    Ok(BenchmarkOutputDeterminismV1 {
+        schema_version: BENCHMARK_OUTPUT_DETERMINISM_SCHEMA_VERSION,
+        requested_repeat_count,
+        primary_repeat_index: 0,
+        hash_algorithm: "sha256".to_owned(),
+        output_hash_scope: BENCHMARK_OUTPUT_HASH_SCOPE_V1.to_owned(),
+        comparison_group_count,
+        equal_group_count,
+        different_group_count,
+        unavailable_group_count,
+        groups,
+    })
 }
 
 #[derive(Default)]
@@ -1548,24 +2281,27 @@ impl ProviderSummaryAccumulator {
                     .ok_or_else(|| invalid_data("provider summary failure count overflow"))?;
             }
         }
-        let rank_zero_metrics = run
-            .candidate_metrics
-            .iter()
-            .find(|metrics| metrics.candidate_rank == 0);
-        let nfc_cer = rank_zero_metrics.and_then(|metrics| metrics.nfc_unicode_scalar_cer.as_ref());
-        accumulate_cursive_cer_by_split(
-            &mut self.cursive_cer_by_split,
-            run.split,
-            run.reference_handwriting_style,
-            nfc_cer,
-        )?;
-        let aligned_boundary_metric = rank_zero_metrics
-            .and_then(|metrics| metrics.orthographic_whitespace_boundary_alignment.as_ref());
-        accumulate_aligned_boundaries_by_split(
-            &mut self.aligned_boundary_by_split,
-            run.split,
-            aligned_boundary_metric,
-        )?;
+        if run.repeat_index == 0 {
+            let rank_zero_metrics = run
+                .candidate_metrics
+                .iter()
+                .find(|metrics| metrics.candidate_rank == 0);
+            let nfc_cer =
+                rank_zero_metrics.and_then(|metrics| metrics.nfc_unicode_scalar_cer.as_ref());
+            accumulate_cursive_cer_by_split(
+                &mut self.cursive_cer_by_split,
+                run.split,
+                run.reference_handwriting_style,
+                nfc_cer,
+            )?;
+            let aligned_boundary_metric = rank_zero_metrics
+                .and_then(|metrics| metrics.orthographic_whitespace_boundary_alignment.as_ref());
+            accumulate_aligned_boundaries_by_split(
+                &mut self.aligned_boundary_by_split,
+                run.split,
+                aligned_boundary_metric,
+            )?;
+        }
         self.app_batch_call_wall_ns
             .push(run.elapsed_app_batch_call_wall_ns);
         if let Some(timing) = &run.timing {
@@ -1807,11 +2543,18 @@ fn run_batch_cli_inner(
     {
         return Err(invalid_data("provider manifest version/count is invalid").into());
     }
-    if case_manifest.cases.len()
-        > MAX_BENCHMARK_RECORDS as usize / provider_manifest.providers.len()
-    {
-        return Err(invalid_data("case × provider run count exceeds artifact record cap").into());
-    }
+    let planned_attempt_count = planned_benchmark_attempt_count(
+        case_manifest.cases.len(),
+        provider_manifest.providers.len(),
+        case_manifest.repeat_count,
+    )?;
+    let runs_per_provider =
+        planned_benchmark_attempt_count(case_manifest.cases.len(), 1, case_manifest.repeat_count)?;
+    let determinism_group_count = planned_benchmark_attempt_count(
+        case_manifest.cases.len(),
+        provider_manifest.providers.len(),
+        1,
+    )?;
     let mut provider_input_modalities_by_case = Vec::new();
     provider_input_modalities_by_case.try_reserve_exact(case_manifest.cases.len())?;
     for case in &case_manifest.cases {
@@ -1894,7 +2637,7 @@ fn run_batch_cli_inner(
         let summary = ProviderSummaryAccumulator::new(
             provider.provider_id.clone(),
             provider.configuration_id.clone(),
-            case_manifest.cases.len(),
+            runs_per_provider,
         )?;
         provider_summary_accumulators.insert(
             (
@@ -1905,9 +2648,24 @@ fn run_batch_cli_inner(
         );
     }
 
+    let mut determinism_accumulators = Vec::new();
+    determinism_accumulators.try_reserve_exact(determinism_group_count)?;
+    for (case_ordinal, case) in case_manifest.cases.iter().enumerate() {
+        for provider in &providers {
+            determinism_accumulators.push(OutputDeterminismAccumulator::new(
+                case_ordinal,
+                case.case_id.clone(),
+                provider.provider_id.clone(),
+                provider.configuration_id.clone(),
+                case_manifest.repeat_count,
+            )?);
+        }
+    }
+
     let mut writer = BenchmarkArtifactWriter::create_at(
         output_directory,
         &case_manifest.batch_id,
+        case_manifest.repeat_count,
         &case_manifest_sha256,
         corpus_manifest_sha256,
     )?;
@@ -1979,144 +2737,168 @@ fn run_batch_cli_inner(
                 .and_then(|items| items.get(case.case_id.as_str()).copied());
 
             for (provider_index, provider) in providers.iter().enumerate() {
-                let request_id = format!(
-                    "bench-{}-{case_index}-{provider_index}",
-                    case_manifest.batch_id
-                );
-                let requested_input_modalities = modalities_for_case[provider_index].clone();
-                let requested_raster =
-                    if requested_input_modalities.contains(&ProviderInputCapabilityV1::Raster) {
+                let determinism_index = case_index
+                    .checked_mul(providers.len())
+                    .and_then(|base| base.checked_add(provider_index))
+                    .ok_or_else(|| invalid_data("determinism group index overflow"))?;
+                let mut frozen_request_identity_sha256: Option<String> = None;
+                for repeat_index in 0..case_manifest.repeat_count {
+                    let request_id = format!("bench-{case_index}-{provider_index}-r{repeat_index}");
+                    let requested_input_modalities = modalities_for_case[provider_index].clone();
+                    let requested_raster = if requested_input_modalities
+                        .contains(&ProviderInputCapabilityV1::Raster)
+                    {
                         raster.as_ref().map(|value| value.request_input.clone())
                     } else {
                         None
                     };
-                let request = build_recognition_request(RecognitionRequestBuildInput {
-                    state: &journal.state,
-                    request_id,
-                    region_id: case.region_id.clone(),
-                    line_id: case.line_id.clone(),
-                    coordinate_space: case.coordinate_space.clone(),
-                    coordinate_units: case.coordinate_units.clone(),
-                    language_hints: case.language_hints.clone(),
-                    requested_input_modalities,
-                    provider_configuration: provider.configuration.clone(),
-                    selected_strokes: &selected_strokes,
-                    raster: requested_raster,
-                })
-                .map_err(|error| {
-                    invalid_data(format!("case {} request invalid: {error}", case.case_id))
-                })?;
-                if request.source_revision != source_revision {
-                    return Err(
-                        invalid_data("built request changed the exact source revision").into(),
-                    );
-                }
-                let canonical_ink_comparison_binding = canonical_ink_comparison_binding(&request)?;
-                if let Some(annotation) = annotation {
-                    validate_delayed_mark_links(annotation, &request)?;
-                }
-                match canonical_case_bindings.get(&case.case_id) {
-                    Some((known_revision, known_binding))
-                        if known_revision != &request.source_revision
-                            || known_binding != &canonical_ink_comparison_binding =>
-                    {
-                        return Err(invalid_data(format!(
+                    let request = build_recognition_request(RecognitionRequestBuildInput {
+                        state: &journal.state,
+                        request_id,
+                        region_id: case.region_id.clone(),
+                        line_id: case.line_id.clone(),
+                        coordinate_space: case.coordinate_space.clone(),
+                        coordinate_units: case.coordinate_units.clone(),
+                        language_hints: case.language_hints.clone(),
+                        requested_input_modalities,
+                        provider_configuration: provider.configuration.clone(),
+                        selected_strokes: &selected_strokes,
+                        raster: requested_raster,
+                    })
+                    .map_err(|error| {
+                        invalid_data(format!("case {} request invalid: {error}", case.case_id))
+                    })?;
+                    if request.source_revision != source_revision {
+                        return Err(invalid_data(
+                            "built request changed the exact source revision",
+                        )
+                        .into());
+                    }
+                    let canonical_ink_comparison_binding =
+                        canonical_ink_comparison_binding(&request)?;
+                    if let Some(annotation) = annotation {
+                        validate_delayed_mark_links(annotation, &request)?;
+                    }
+                    match canonical_case_bindings.get(&case.case_id) {
+                        Some((known_revision, known_binding))
+                            if known_revision != &request.source_revision
+                                || known_binding != &canonical_ink_comparison_binding =>
+                        {
+                            return Err(invalid_data(format!(
                             "provider requests for case {} do not share one canonical-ink binding",
                             case.case_id
                         ))
                         .into());
+                        }
+                        Some(_) => {}
+                        None => {
+                            canonical_case_bindings.insert(
+                                case.case_id.clone(),
+                                (
+                                    request.source_revision.clone(),
+                                    canonical_ink_comparison_binding.clone(),
+                                ),
+                            );
+                        }
                     }
-                    Some(_) => {}
-                    None => {
-                        canonical_case_bindings.insert(
-                            case.case_id.clone(),
-                            (
-                                request.source_revision.clone(),
-                                canonical_ink_comparison_binding.clone(),
-                            ),
-                        );
+                    let mut source_sample_sequences = Vec::new();
+                    source_sample_sequences.try_reserve_exact(request.samples.len())?;
+                    source_sample_sequences
+                        .extend(request.samples.iter().map(|sample| sample.journal_sequence));
+                    let selected_strokes = benchmark_selected_strokes_from_request(&request)?;
+                    let generated_raster_origin = generated_raster_origin_for_request(
+                        &request,
+                        raster.as_ref(),
+                        &canonical_ink_comparison_binding,
+                        &selected_strokes,
+                    )?;
+                    let (raster_input_byte_count, raster_input_sha256) =
+                        raster_provenance_for_request(
+                            &request.requested_input_modalities,
+                            raster.as_ref(),
+                        )?;
+                    let mut base = BenchmarkRunBase {
+                        case,
+                        repeat_index,
+                        repeat_count: case_manifest.repeat_count,
+                        repeat_input_identity_sha256: String::new(),
+                        region_id: case.region_id.clone(),
+                        line_id: case.line_id.clone(),
+                        coordinate_space: case.coordinate_space.clone(),
+                        coordinate_units: case.coordinate_units.clone(),
+                        language_hints: case.language_hints.clone(),
+                        raster_input_byte_count,
+                        raster_input_sha256,
+                        source_revision: request.source_revision.clone(),
+                        input_view_id: request.input_view_id.clone(),
+                        canonical_ink_comparison_binding,
+                        generated_raster_origin,
+                        requested_input_modalities: request.requested_input_modalities.clone(),
+                        selected_strokes,
+                        source_sample_sequences,
+                        provider,
+                        provider_configuration_id: request
+                            .provider_configuration
+                            .configuration_id
+                            .clone(),
+                        provider_configuration_fingerprint: request
+                            .provider_configuration_fingerprint
+                            .clone(),
+                    };
+                    let repeat_input_identity_sha256 =
+                        benchmark_repeat_request_identity_sha256(&base)?;
+                    match frozen_request_identity_sha256.as_deref() {
+                        Some(frozen) if frozen != repeat_input_identity_sha256 => {
+                            return Err(invalid_data(
+                            "repeated requests changed their frozen source/view/config identity before provider launch",
+                        )
+                        .into());
+                        }
+                        Some(_) => {}
+                        None => {
+                            frozen_request_identity_sha256 =
+                                Some(repeat_input_identity_sha256.clone());
+                        }
                     }
-                }
-                let mut source_sample_sequences = Vec::new();
-                source_sample_sequences.try_reserve_exact(request.samples.len())?;
-                source_sample_sequences
-                    .extend(request.samples.iter().map(|sample| sample.journal_sequence));
-                let selected_strokes = benchmark_selected_strokes_from_request(&request)?;
-                let generated_raster_origin = generated_raster_origin_for_request(
-                    &request,
-                    raster.as_ref(),
-                    &canonical_ink_comparison_binding,
-                    &selected_strokes,
-                )?;
-                let (raster_input_byte_count, raster_input_sha256) = raster_provenance_for_request(
-                    &request.requested_input_modalities,
-                    raster.as_ref(),
-                )?;
-                let base = BenchmarkRunBase {
-                    case,
-                    region_id: case.region_id.clone(),
-                    line_id: case.line_id.clone(),
-                    coordinate_space: case.coordinate_space.clone(),
-                    coordinate_units: case.coordinate_units.clone(),
-                    language_hints: case.language_hints.clone(),
-                    raster_input_byte_count,
-                    raster_input_sha256,
-                    source_revision: request.source_revision.clone(),
-                    input_view_id: request.input_view_id.clone(),
-                    canonical_ink_comparison_binding,
-                    generated_raster_origin,
-                    requested_input_modalities: request.requested_input_modalities.clone(),
-                    selected_strokes,
-                    source_sample_sequences,
-                    provider,
-                    provider_configuration_id: request
-                        .provider_configuration
-                        .configuration_id
-                        .clone(),
-                    provider_configuration_fingerprint: request
-                        .provider_configuration_fingerprint
-                        .clone(),
-                };
-                let run_started = Instant::now();
-                let outcome = execute_provider(provider, request);
-                let elapsed_app_batch_call_wall_ns = elapsed_app_ns(run_started);
-                let record = match outcome {
-                    Ok(execution) => successful_run_record(
-                        base,
-                        execution,
-                        elapsed_app_batch_call_wall_ns,
+                    base.repeat_input_identity_sha256 = repeat_input_identity_sha256;
+                    let run_started = Instant::now();
+                    let outcome = execute_provider(provider, request);
+                    let elapsed_app_batch_call_wall_ns = elapsed_app_ns(run_started);
+                    let record = match outcome {
+                        Ok(execution) => successful_run_record(
+                            base,
+                            execution,
+                            elapsed_app_batch_call_wall_ns,
+                            annotation,
+                            corpus_manifest
+                                .as_ref()
+                                .map(|corpus| corpus.tokenization_policy),
+                        )?,
+                        Err(error) => failed_run_record(
+                            base,
+                            error,
+                            elapsed_app_batch_call_wall_ns,
+                            annotation,
+                        )?,
+                    };
+                    determinism_accumulators[determinism_index].observe(&record)?;
+                    push_primary_evaluation_observation(
+                        &mut evaluation_observations,
+                        case,
+                        provider,
                         annotation,
-                        corpus_manifest
-                            .as_ref()
-                            .map(|corpus| corpus.tokenization_policy),
-                    )?,
-                    Err(error) => {
-                        failed_run_record(base, error, elapsed_app_batch_call_wall_ns, annotation)?
-                    }
-                };
-                if let (Some(_annotation), Some(split)) = (annotation, case.provenance.split) {
-                    let first = record.candidate_metrics.first();
-                    evaluation_observations.push(EvaluationObservation {
-                        case_id: case.case_id.clone(),
-                        provider_id: provider.provider_id.clone(),
-                        configuration_id: provider.approved_configuration_id().to_owned(),
-                        split,
-                        writer_key: case.provenance.writer_key.clone(),
-                        session_key: case.provenance.session_key.clone(),
-                        cer: first.and_then(|metrics| metrics.nfc_unicode_scalar_cer.clone()),
-                        wer: first
-                            .and_then(|metrics| metrics.whitespace_token_syllable_wer.clone()),
-                    });
+                        &record,
+                    )?;
+                    let summary_key = (
+                        provider.provider_id.clone(),
+                        provider.configuration_id.clone(),
+                    );
+                    provider_summary_accumulators
+                        .get_mut(&summary_key)
+                        .ok_or_else(|| invalid_data("provider summary accumulator is missing"))?
+                        .observe(&record)?;
+                    writer.write_run(record)?;
                 }
-                let summary_key = (
-                    provider.provider_id.clone(),
-                    provider.configuration_id.clone(),
-                );
-                provider_summary_accumulators
-                    .get_mut(&summary_key)
-                    .ok_or_else(|| invalid_data("provider summary accumulator is missing"))?
-                    .observe(&record)?;
-                writer.write_run(record)?;
             }
         }
 
@@ -2129,13 +2911,20 @@ fn run_batch_cli_inner(
         for summary in provider_summary_accumulators.into_values() {
             provider_summaries.push(summary.finish()?);
         }
-        Ok(writer.finish(
-            case_manifest.cases.len(),
-            providers.len(),
+        let output_determinism = Some(finish_output_determinism(
+            case_manifest.repeat_count,
+            determinism_accumulators,
+        )?);
+        Ok(writer.finish(BenchmarkArtifactFinishInput {
+            planned_case_count: case_manifest.cases.len(),
+            planned_provider_count: providers.len(),
+            planned_repeat_count: case_manifest.repeat_count,
+            planned_attempt_count,
             paired_comparisons,
             provider_summaries,
-            corpus_manifest.as_ref(),
-        )?)
+            output_determinism,
+            corpus_manifest: corpus_manifest.as_ref(),
+        })?)
     })();
     let completion = match processing {
         Ok(completion) => completion,
@@ -2158,6 +2947,9 @@ impl PreparedBenchmarkProvider {
 
 struct BenchmarkRunBase<'a> {
     case: &'a BenchmarkCaseSpecV1,
+    repeat_index: u32,
+    repeat_count: u32,
+    repeat_input_identity_sha256: String,
     region_id: String,
     line_id: String,
     coordinate_space: String,
@@ -2254,13 +3046,24 @@ fn successful_run_record(
     tokenization_policy: Option<BenchmarkTokenizationPolicyV1>,
 ) -> Result<BenchmarkRunRecordV1, io::Error> {
     let quality_evidence = benchmark_quality_evidence(base.provider, Some(&execution.provider))?;
-    let (candidate_metrics, metric_evaluation_unavailable_reason) =
+    let (candidate_metrics, metric_evaluation_unavailable_reason) = if base.repeat_index == 0 {
         candidate_metrics_for_quality_evidence(
             &execution.result,
             annotation,
             tokenization_policy,
             &quality_evidence,
-        );
+        )
+    } else if annotation.is_some() && tokenization_policy.is_some() {
+        (
+            Vec::new(),
+            Some(
+                "text-quality metrics use predefined primary repeat index 0 only; raw provider output is preserved"
+                    .to_owned(),
+            ),
+        )
+    } else {
+        (Vec::new(), None)
+    };
     let transcript = execution.raw_response_transcript;
     let raw_response_frames = encode_response_frames(transcript.frames)?;
     let (model_artifact_digests, model_artifact_hash_unavailable_reason) =
@@ -2271,6 +3074,9 @@ fn successful_run_record(
     );
     let run = BenchmarkRunRecordV1 {
         case_id: base.case.case_id.clone(),
+        repeat_index: base.repeat_index,
+        repeat_count: base.repeat_count,
+        repeat_input_identity_sha256: Some(base.repeat_input_identity_sha256),
         region_id: base.region_id,
         line_id: base.line_id,
         coordinate_space: base.coordinate_space,
@@ -2397,6 +3203,9 @@ fn failed_run_record(
         model_artifact_hash_status(&base.provider.artifact_digests)?;
     Ok(BenchmarkRunRecordV1 {
         case_id: base.case.case_id.clone(),
+        repeat_index: base.repeat_index,
+        repeat_count: base.repeat_count,
+        repeat_input_identity_sha256: Some(base.repeat_input_identity_sha256),
         region_id: base.region_id,
         line_id: base.line_id,
         coordinate_space: base.coordinate_space,
@@ -2609,6 +3418,37 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+fn validate_benchmark_repeat_count(repeat_count: u32) -> io::Result<()> {
+    if !(1..=MAX_BENCHMARK_REPEAT_COUNT).contains(&repeat_count) {
+        return Err(invalid_data(format!(
+            "benchmark repeat_count must be between 1 and {MAX_BENCHMARK_REPEAT_COUNT}"
+        )));
+    }
+    Ok(())
+}
+
+fn planned_benchmark_attempt_count(
+    case_count: usize,
+    provider_count: usize,
+    repeat_count: u32,
+) -> io::Result<usize> {
+    validate_benchmark_repeat_count(repeat_count)?;
+    let case_count =
+        u64::try_from(case_count).map_err(|_| invalid_data("case count exceeds u64"))?;
+    let provider_count =
+        u64::try_from(provider_count).map_err(|_| invalid_data("provider count exceeds u64"))?;
+    let attempts = case_count
+        .checked_mul(provider_count)
+        .and_then(|count| count.checked_mul(u64::from(repeat_count)))
+        .ok_or_else(|| invalid_data("expanded benchmark work count overflow"))?;
+    if attempts > MAX_BENCHMARK_RUN_RECORDS {
+        return Err(invalid_data(
+            "case × provider × repeat work leaves no room for artifact header/footer rows",
+        ));
+    }
+    usize::try_from(attempts).map_err(|_| invalid_data("expanded benchmark work exceeds usize"))
+}
+
 fn validate_case_manifest(manifest: &BenchmarkCaseManifestV1) -> io::Result<()> {
     if manifest.schema_version != BENCHMARK_SCHEMA_VERSION
         || manifest.cases.is_empty()
@@ -2616,6 +3456,7 @@ fn validate_case_manifest(manifest: &BenchmarkCaseManifestV1) -> io::Result<()> 
     {
         return Err(invalid_data("case manifest version/count is invalid"));
     }
+    validate_benchmark_repeat_count(manifest.repeat_count)?;
     validate_local_id(&manifest.batch_id, "batch ID")?;
     let mut case_ids = BTreeSet::new();
     for case in &manifest.cases {
@@ -5099,14 +5940,24 @@ mod tests {
             .enumerate()
         {
             let artifact_id = format!("required-asset-{index:02}");
+            let role = match *asset_name {
+                "model-00001-of-00001.safetensors" => ProviderArtifactRoleV1::Model,
+                "added_tokens.json"
+                | "chat_template.jinja"
+                | "special_tokens_map.json"
+                | "tokenizer.json"
+                | "tokenizer.model"
+                | "tokenizer_config.json" => ProviderArtifactRoleV1::Tokenizer,
+                _ => ProviderArtifactRoleV1::Resource,
+            };
             artifacts.push(ProviderArtifactPathV1 {
                 artifact_id: artifact_id.clone(),
-                role: ProviderArtifactRoleV1::Resource,
+                role,
                 path: asset_root.join(*asset_name),
             });
             artifact_digests.push(ProviderArtifactDigestV1 {
                 artifact_id,
-                role: ProviderArtifactRoleV1::Resource,
+                role,
                 byte_count: *byte_count,
                 sha256_hex: hex_encode(&Sha256::digest(asset_name.as_bytes())).unwrap(),
                 observation: "test-only prelaunch digest".to_owned(),
@@ -5173,6 +6024,180 @@ mod tests {
                 stroke_ranges: Vec::new(),
                 raw_candidate: serde_json::json!({"text": text}),
             }],
+        }
+    }
+
+    fn output_determinism_test_run(repeat_index: u32, text: &str) -> BenchmarkRunRecordV1 {
+        let provider = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
+        let provider_identity = senocr_quality_test_identity();
+        let quality_evidence =
+            benchmark_quality_evidence(&provider, Some(&provider_identity)).unwrap();
+        let (model_artifact_digests, model_artifact_hash_unavailable_reason) =
+            model_artifact_hash_status(&provider.artifact_digests).unwrap();
+        let result = senocr_quality_test_result(text);
+        BenchmarkRunRecordV1 {
+            case_id: "determinism-case".to_owned(),
+            repeat_index,
+            repeat_count: 2,
+            repeat_input_identity_sha256: Some("a".repeat(64)),
+            region_id: result.region_id.clone(),
+            line_id: result.line_id.clone(),
+            coordinate_space: "generated-raster-output-v1".to_owned(),
+            coordinate_units: "pixel".to_owned(),
+            language_hints: vec!["vi-VN".to_owned()],
+            raster_input_byte_count: Some(12),
+            raster_input_sha256: Some("b".repeat(64)),
+            corpus_id: Some("test-corpus".to_owned()),
+            annotation_id: Some("test-annotation".to_owned()),
+            reference_language_scope: Some(BenchmarkReferenceLanguageScopeV1::VietnameseOnly),
+            reference_handwriting_style: Some(BenchmarkHandwritingStyleV1::Cursive),
+            writer_key: "writer-test".to_owned(),
+            session_key: "session-test".to_owned(),
+            declared_session_start_unix_ns: Some(100),
+            configuration_key: "config-test".to_owned(),
+            split: Some(BenchmarkSplitV1::Evaluation),
+            declared_capture_api: Some("direct".to_owned()),
+            declared_capture_api_version: Some("fixture-v1".to_owned()),
+            declared_tablet_model: None,
+            declared_driver_version: None,
+            declared_windows_build: None,
+            declared_windows_ink_state: None,
+            declared_active_area: None,
+            declared_display_mapping: None,
+            declared_pressure_curve: None,
+            source_revision: result.source_revision.clone(),
+            input_view_id: result.input_view_id.clone(),
+            canonical_ink_comparison_binding: Some(BenchmarkCanonicalInkComparisonBindingV1 {
+                schema_version: CANONICAL_INK_COMPARISON_BINDING_SCHEMA_VERSION,
+                sha256_hex: "c".repeat(64),
+                raster_pixel_parity: BenchmarkRasterPixelParityV1::Unverified,
+            }),
+            generated_raster_origin: None,
+            requested_input_modalities: vec![ProviderInputCapabilityV1::Raster],
+            selected_strokes: Vec::new(),
+            source_sample_sequences: Vec::new(),
+            provider_id: provider.provider_id.clone(),
+            provider_identity: Some(provider_identity),
+            provider_capabilities: Some(ProviderCapabilitiesV1 {
+                inputs: vec![ProviderInputCapabilityV1::Raster],
+                outputs: vec![crate::provider_protocol::ProviderOutputCapabilityV1::Text],
+                languages: vec!["vi-VN".to_owned()],
+            }),
+            provider_configuration_id: provider.configuration_id.clone(),
+            provider_configuration_fingerprint: result.provider_configuration_fingerprint.clone(),
+            artifact_digests: provider.artifact_digests.clone(),
+            model_artifact_digests,
+            model_artifact_hash_unavailable_reason,
+            quality_evidence,
+            elapsed_app_batch_call_wall_ns: u64::from(repeat_index) + 100,
+            timing: Some(crate::provider_protocol::ProviderExecutionTimingV1 {
+                process_create_call_to_handshake_ns: u64::from(repeat_index) + 10,
+                process_create_call_to_recognition_ns: u64::from(repeat_index) + 20,
+                process_create_call_to_parent_exit_ns: u64::from(repeat_index) + 30,
+                process_create_call_to_tree_drain_ns: u64::from(repeat_index) + 40,
+                model_cold_start_ns: None,
+                model_cold_start_unavailable_reason: Some("not reported".to_owned()),
+            }),
+            timing_unavailable_reason: None,
+            process_resources: None,
+            process_resources_unavailable_reason: Some("fixture omitted counters".to_owned()),
+            job_process_tree_cpu_core_equivalent_percent: None,
+            job_cpu_ratio_unavailable_reason: Some("fixture omitted CPU".to_owned()),
+            gpu_memory_bytes: None,
+            gpu_memory_unavailable_reason: Some("not reported".to_owned()),
+            result: Some(result),
+            candidate_metrics: Vec::new(),
+            metric_evaluation_unavailable_reason: None,
+            raw_response_frames: vec![
+                BenchmarkRawResponseFrameHexV1 {
+                    ordinal: 0,
+                    length_prefix_be_hex: "00000002".to_owned(),
+                    payload_hex: "7b7d".to_owned(),
+                },
+                BenchmarkRawResponseFrameHexV1 {
+                    ordinal: 1,
+                    length_prefix_be_hex: "00000002".to_owned(),
+                    payload_hex: "7b7d".to_owned(),
+                },
+            ],
+            raw_response_capture_complete: true,
+            raw_response_omitted_frame_count: 0,
+            raw_response_omitted_payload_bytes: 0,
+            stderr_byte_count: 0,
+            stderr_truncated: false,
+            status: BenchmarkRunStatusV1::Completed,
+            failure_category: None,
+        }
+    }
+
+    fn compare_output_determinism_records(
+        runs: &[BenchmarkRunRecordV1],
+    ) -> BenchmarkOutputDeterminismGroupV1 {
+        let first = runs
+            .first()
+            .expect("determinism fixture has at least one run");
+        let mut accumulator = OutputDeterminismAccumulator::new(
+            0,
+            first.case_id.clone(),
+            first.provider_id.clone(),
+            first.provider_configuration_id.clone(),
+            first.repeat_count,
+        )
+        .unwrap();
+        for run in runs {
+            accumulator.observe(run).unwrap();
+        }
+        accumulator.finish().unwrap()
+    }
+
+    struct RepeatRequestTestInputs {
+        repeat_index: u32,
+        source_revision: ProviderSourceRevisionV1,
+        input_view_id: String,
+        requested_input_modalities: Vec<ProviderInputCapabilityV1>,
+        configuration_fingerprint: String,
+        raster_sha256: String,
+    }
+
+    fn repeat_request_test_base<'a>(
+        case: &'a BenchmarkCaseSpecV1,
+        provider: &'a PreparedBenchmarkProvider,
+        inputs: RepeatRequestTestInputs,
+    ) -> BenchmarkRunBase<'a> {
+        let RepeatRequestTestInputs {
+            repeat_index,
+            source_revision,
+            input_view_id,
+            requested_input_modalities,
+            configuration_fingerprint,
+            raster_sha256,
+        } = inputs;
+        BenchmarkRunBase {
+            case,
+            repeat_index,
+            repeat_count: 2,
+            repeat_input_identity_sha256: String::new(),
+            region_id: case.region_id.clone(),
+            line_id: case.line_id.clone(),
+            coordinate_space: case.coordinate_space.clone(),
+            coordinate_units: case.coordinate_units.clone(),
+            language_hints: case.language_hints.clone(),
+            raster_input_byte_count: Some(4),
+            raster_input_sha256: Some(raster_sha256),
+            source_revision,
+            input_view_id,
+            canonical_ink_comparison_binding: BenchmarkCanonicalInkComparisonBindingV1 {
+                schema_version: CANONICAL_INK_COMPARISON_BINDING_SCHEMA_VERSION,
+                sha256_hex: "c".repeat(64),
+                raster_pixel_parity: BenchmarkRasterPixelParityV1::Unverified,
+            },
+            generated_raster_origin: None,
+            requested_input_modalities,
+            selected_strokes: case.selected_strokes.clone(),
+            source_sample_sequences: vec![1, 2],
+            provider,
+            provider_configuration_id: provider.configuration_id.clone(),
+            provider_configuration_fingerprint: configuration_fingerprint,
         }
     }
 
@@ -7493,6 +8518,7 @@ mod tests {
         let batch = BenchmarkCaseManifestV1 {
             schema_version: BENCHMARK_SCHEMA_VERSION,
             batch_id: "batch-1".to_owned(),
+            repeat_count: DEFAULT_BENCHMARK_REPEAT_COUNT,
             cases: vec![
                 case_with_split(
                     "case-a",
@@ -7537,6 +8563,7 @@ mod tests {
         let mut batch = BenchmarkCaseManifestV1 {
             schema_version: BENCHMARK_SCHEMA_VERSION,
             batch_id: "batch-time".to_owned(),
+            repeat_count: DEFAULT_BENCHMARK_REPEAT_COUNT,
             cases: vec![
                 case_with_split(
                     "adapt",
@@ -7619,12 +8646,31 @@ mod tests {
         let directory = temp_dir("no-clobber");
         fs::create_dir_all(&directory).unwrap();
         let manifest_sha = hex_encode(&Sha256::digest(b"case manifest")).unwrap();
-        let writer =
-            BenchmarkArtifactWriter::create_at(&directory, "batch-1", &manifest_sha, None).unwrap();
+        let writer = BenchmarkArtifactWriter::create_at(
+            &directory,
+            "batch-1",
+            DEFAULT_BENCHMARK_REPEAT_COUNT,
+            &manifest_sha,
+            None,
+        )
+        .unwrap();
         let final_path = writer.final_path.clone();
         let partial_path = writer.partial_path.clone();
         fs::write(&final_path, b"pre-existing-result").unwrap();
-        assert!(writer.finish(0, 0, Vec::new(), Vec::new(), None).is_err());
+        assert!(
+            writer
+                .finish(BenchmarkArtifactFinishInput {
+                    planned_case_count: 0,
+                    planned_provider_count: 0,
+                    planned_repeat_count: DEFAULT_BENCHMARK_REPEAT_COUNT,
+                    planned_attempt_count: 0,
+                    paired_comparisons: Vec::new(),
+                    provider_summaries: Vec::new(),
+                    output_determinism: None,
+                    corpus_manifest: None,
+                })
+                .is_err()
+        );
         assert_eq!(fs::read(&final_path).unwrap(), b"pre-existing-result");
         assert!(partial_path.is_file());
         fs::remove_dir_all(directory).unwrap();
@@ -7637,11 +8683,27 @@ mod tests {
         let manifest_sha = hex_encode(&Sha256::digest(b"case manifest")).unwrap();
         let corpus_digest = hex_encode(&Sha256::digest(b"corpus manifest")).unwrap();
         let corpus_sha = Some(corpus_digest.clone());
-        let writer =
-            BenchmarkArtifactWriter::create_at(&directory, "batch-2", &manifest_sha, corpus_sha)
-                .unwrap();
+        let writer = BenchmarkArtifactWriter::create_at(
+            &directory,
+            "batch-2",
+            DEFAULT_BENCHMARK_REPEAT_COUNT,
+            &manifest_sha,
+            corpus_sha,
+        )
+        .unwrap();
         let partial_path = writer.partial_path.clone();
-        let completion = writer.finish(0, 0, Vec::new(), Vec::new(), None).unwrap();
+        let completion = writer
+            .finish(BenchmarkArtifactFinishInput {
+                planned_case_count: 0,
+                planned_provider_count: 0,
+                planned_repeat_count: DEFAULT_BENCHMARK_REPEAT_COUNT,
+                planned_attempt_count: 0,
+                paired_comparisons: Vec::new(),
+                provider_summaries: Vec::new(),
+                output_determinism: None,
+                corpus_manifest: None,
+            })
+            .unwrap();
         assert!(completion.artifact_path.is_file());
         assert!(!partial_path.exists());
         let contents = fs::read_to_string(&completion.artifact_path).unwrap();
@@ -7653,5 +8715,733 @@ mod tests {
         assert!(!contents.contains("case manifest"));
         assert!(!contents.contains("corpus manifest"));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn repeat_manifest_defaults_to_one_and_expanded_work_is_capped() {
+        let legacy_manifest: BenchmarkCaseManifestV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": BENCHMARK_SCHEMA_VERSION,
+            "batch_id": "legacy-repeat-default",
+            "cases": []
+        }))
+        .unwrap();
+        assert_eq!(legacy_manifest.repeat_count, 1);
+        assert!(validate_benchmark_repeat_count(0).is_err());
+        assert!(validate_benchmark_repeat_count(MAX_BENCHMARK_REPEAT_COUNT + 1).is_err());
+        assert_eq!(planned_benchmark_attempt_count(2048, 8, 3).unwrap(), 49_152);
+        assert!(planned_benchmark_attempt_count(2048, 8, 4).is_err());
+        assert_eq!(
+            planned_benchmark_attempt_count(49_998, 1, 1).unwrap(),
+            49_998
+        );
+        assert!(planned_benchmark_attempt_count(49_999, 1, 1).is_err());
+    }
+
+    #[test]
+    fn repeat_input_identity_binds_source_view_modes_config_raster_and_assets() {
+        let case = case_with_split(
+            "repeat-input-case",
+            "writer-repeat",
+            "session-repeat",
+            "config-repeat",
+            BenchmarkSplitV1::Train,
+            "annotation-repeat",
+        );
+        let provider = senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
+        let source_revision = case.expected_source_revision.clone();
+        let config_fingerprint = "a".repeat(64);
+        let alternate_config_fingerprint = "d".repeat(64);
+        let raster_sha256 = "b".repeat(64);
+        let alternate_raster_sha256 = "e".repeat(64);
+        let make_base = |repeat_index: u32,
+                         source_revision: ProviderSourceRevisionV1,
+                         view: &str,
+                         modalities: Vec<ProviderInputCapabilityV1>,
+                         config_fp: &str,
+                         raster_sha: &str| {
+            repeat_request_test_base(
+                &case,
+                &provider,
+                RepeatRequestTestInputs {
+                    repeat_index,
+                    source_revision,
+                    input_view_id: view.to_owned(),
+                    requested_input_modalities: modalities,
+                    configuration_fingerprint: config_fp.to_owned(),
+                    raster_sha256: raster_sha.to_owned(),
+                },
+            )
+        };
+        let baseline = benchmark_repeat_request_identity_sha256(&make_base(
+            0,
+            source_revision.clone(),
+            "frozen-input-view",
+            vec![ProviderInputCapabilityV1::Raster],
+            &config_fingerprint,
+            &raster_sha256,
+        ))
+        .unwrap();
+        let later_repeat = benchmark_repeat_request_identity_sha256(&make_base(
+            1,
+            source_revision.clone(),
+            "frozen-input-view",
+            vec![ProviderInputCapabilityV1::Raster],
+            &config_fingerprint,
+            &raster_sha256,
+        ))
+        .unwrap();
+        assert_eq!(baseline, later_repeat);
+
+        let mut changed_source = source_revision.clone();
+        changed_source.logical_revision += 1;
+        assert_ne!(
+            baseline,
+            benchmark_repeat_request_identity_sha256(&make_base(
+                1,
+                changed_source,
+                "frozen-input-view",
+                vec![ProviderInputCapabilityV1::Raster],
+                &config_fingerprint,
+                &raster_sha256,
+            ))
+            .unwrap()
+        );
+        assert_ne!(
+            baseline,
+            benchmark_repeat_request_identity_sha256(&make_base(
+                1,
+                source_revision.clone(),
+                "changed-input-view",
+                vec![ProviderInputCapabilityV1::Raster],
+                &config_fingerprint,
+                &raster_sha256,
+            ))
+            .unwrap()
+        );
+        assert_ne!(
+            baseline,
+            benchmark_repeat_request_identity_sha256(&make_base(
+                1,
+                source_revision.clone(),
+                "frozen-input-view",
+                vec![ProviderInputCapabilityV1::OnlineStrokes],
+                &config_fingerprint,
+                &raster_sha256,
+            ))
+            .unwrap()
+        );
+        assert_ne!(
+            baseline,
+            benchmark_repeat_request_identity_sha256(&make_base(
+                1,
+                source_revision.clone(),
+                "frozen-input-view",
+                vec![ProviderInputCapabilityV1::Raster],
+                &alternate_config_fingerprint,
+                &raster_sha256,
+            ))
+            .unwrap()
+        );
+        assert_ne!(
+            baseline,
+            benchmark_repeat_request_identity_sha256(&make_base(
+                1,
+                source_revision.clone(),
+                "frozen-input-view",
+                vec![ProviderInputCapabilityV1::Raster],
+                &config_fingerprint,
+                &alternate_raster_sha256,
+            ))
+            .unwrap()
+        );
+
+        let mut provider_with_changed_asset =
+            senocr_quality_test_provider(SENOCR_REFERENCE_ASSET_NAMES_AND_BYTES.len());
+        provider_with_changed_asset.artifact_digests[0].sha256_hex = "f".repeat(64);
+        assert_ne!(
+            baseline,
+            benchmark_repeat_request_identity_sha256(&repeat_request_test_base(
+                &case,
+                &provider_with_changed_asset,
+                RepeatRequestTestInputs {
+                    repeat_index: 1,
+                    source_revision,
+                    input_view_id: "frozen-input-view".to_owned(),
+                    requested_input_modalities: vec![ProviderInputCapabilityV1::Raster],
+                    configuration_fingerprint: config_fingerprint.clone(),
+                    raster_sha256: raster_sha256.clone(),
+                },
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn repeat_output_comparison_ignores_volatile_envelope_and_withholds_text() {
+        let first = output_determinism_test_run(0, "private recognized output");
+        let mut second = output_determinism_test_run(1, "private recognized output");
+        let result = second.result.as_mut().unwrap();
+        result.request_id = "different-transport-request".to_owned();
+        result.candidates[0].raw_candidate = serde_json::json!({
+            "runtime_diagnostic": "volatile per process",
+            "request_id": "candidate-private-request"
+        });
+        second.elapsed_app_batch_call_wall_ns = 99_999;
+        second
+            .timing
+            .as_mut()
+            .unwrap()
+            .process_create_call_to_recognition_ns = 888_888;
+
+        let group = compare_output_determinism_records(&[first, second]);
+        assert_eq!(group.status, BenchmarkOutputDeterminismStatusV1::Equal);
+        assert_eq!(group.distinct_output_count, Some(1));
+        assert_eq!(group.all_eligible_outputs_equal, Some(true));
+        assert_eq!(group.output_hash_counts.len(), 1);
+        assert_eq!(group.output_hash_counts[0].observation_count, 2);
+        let summary = serde_json::to_string(&group).unwrap();
+        assert!(!summary.contains("private recognized output"));
+        assert!(!summary.contains("test-annotation"));
+        assert!(!summary.contains("test-corpus"));
+        assert!(!summary.contains("request_id"));
+        assert!(!summary.contains("timing"));
+        assert!(!summary.contains(r"C:\runner\models"));
+    }
+
+    #[test]
+    fn repeat_output_difference_is_reported_without_text() {
+        let first = output_determinism_test_run(0, "candidate alpha");
+        let second = output_determinism_test_run(1, "candidate beta");
+        let group = compare_output_determinism_records(&[first, second]);
+        assert_eq!(group.status, BenchmarkOutputDeterminismStatusV1::Different);
+        assert_eq!(group.distinct_output_count, Some(2));
+        assert_eq!(group.all_eligible_outputs_equal, Some(false));
+        assert_eq!(group.output_hash_counts.len(), 2);
+        let summary = serde_json::to_string(&group).unwrap();
+        assert!(!summary.contains("candidate alpha"));
+        assert!(!summary.contains("candidate beta"));
+    }
+
+    #[test]
+    fn repeated_outputs_with_changed_view_or_provider_identity_are_unavailable() {
+        let first = output_determinism_test_run(0, "same output");
+        let mut changed_view = output_determinism_test_run(1, "same output");
+        changed_view.input_view_id = "different-view".to_owned();
+        changed_view.repeat_input_identity_sha256 = Some("d".repeat(64));
+        changed_view.result.as_mut().unwrap().input_view_id = "different-view".to_owned();
+        let view_group = compare_output_determinism_records(&[first.clone(), changed_view]);
+        assert_eq!(
+            view_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert_eq!(
+            view_group.unavailable_reason,
+            Some(
+                BenchmarkOutputDeterminismUnavailableReasonV1::RequestIdentityChangedAcrossRepeats
+            )
+        );
+        assert!(view_group.output_hash_counts.is_empty());
+
+        let mut changed_source = output_determinism_test_run(1, "same output");
+        changed_source.source_revision.last_sequence += 1;
+        changed_source.result.as_mut().unwrap().source_revision =
+            changed_source.source_revision.clone();
+        changed_source.repeat_input_identity_sha256 = Some("f".repeat(64));
+        let source_group = compare_output_determinism_records(&[first.clone(), changed_source]);
+        assert_eq!(
+            source_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert_eq!(
+            source_group.unavailable_reason,
+            Some(
+                BenchmarkOutputDeterminismUnavailableReasonV1::RequestIdentityChangedAcrossRepeats
+            )
+        );
+
+        let mut changed_modes = output_determinism_test_run(1, "same output");
+        changed_modes.requested_input_modalities = vec![ProviderInputCapabilityV1::OnlineStrokes];
+        changed_modes
+            .result
+            .as_mut()
+            .unwrap()
+            .consumed_input_modalities = vec![ProviderInputCapabilityV1::OnlineStrokes];
+        changed_modes.repeat_input_identity_sha256 = Some("e".repeat(64));
+        let mode_group = compare_output_determinism_records(&[first.clone(), changed_modes]);
+        assert_eq!(
+            mode_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert_eq!(
+            mode_group.unavailable_reason,
+            Some(
+                BenchmarkOutputDeterminismUnavailableReasonV1::RequestIdentityChangedAcrossRepeats
+            )
+        );
+
+        let mut changed_configuration = output_determinism_test_run(1, "same output");
+        changed_configuration.provider_configuration_id = "other-configuration".to_owned();
+        changed_configuration.provider_configuration_fingerprint = "f".repeat(64);
+        let changed_result = changed_configuration.result.as_mut().unwrap();
+        changed_result.provider_configuration_id = "other-configuration".to_owned();
+        changed_result.provider_configuration_fingerprint = "f".repeat(64);
+        changed_configuration.repeat_input_identity_sha256 = Some("g".repeat(64));
+        let configuration_group =
+            compare_output_determinism_records(&[first.clone(), changed_configuration]);
+        assert_eq!(
+            configuration_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert_eq!(
+            configuration_group.unavailable_reason,
+            Some(
+                BenchmarkOutputDeterminismUnavailableReasonV1::RequestIdentityChangedAcrossRepeats
+            )
+        );
+
+        let mut changed_runtime = output_determinism_test_run(1, "same output");
+        changed_runtime
+            .quality_evidence
+            .runtime_profile
+            .as_mut()
+            .unwrap()
+            .observation_scope = "different observed runtime scope".to_owned();
+        let runtime_group = compare_output_determinism_records(&[first.clone(), changed_runtime]);
+        assert_eq!(
+            runtime_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert_eq!(
+            runtime_group.unavailable_reason,
+            Some(BenchmarkOutputDeterminismUnavailableReasonV1::ProviderExecutionIdentityChangedAcrossRepeats)
+        );
+        assert!(runtime_group.output_hash_counts.is_empty());
+
+        let mut changed_assets = output_determinism_test_run(1, "same output");
+        changed_assets.model_artifact_digests[0].sha256_hex = "e".repeat(64);
+        let asset_group = compare_output_determinism_records(&[first, changed_assets]);
+        assert_eq!(
+            asset_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert_eq!(
+            asset_group.unavailable_reason,
+            Some(BenchmarkOutputDeterminismUnavailableReasonV1::ProviderExecutionIdentityChangedAcrossRepeats)
+        );
+        assert!(asset_group.output_hash_counts.is_empty());
+    }
+
+    #[test]
+    fn missing_failed_or_incomplete_repeats_never_claim_determinism() {
+        let mut one_repeat = output_determinism_test_run(0, "one output");
+        one_repeat.repeat_count = 1;
+        let one_repeat_group = compare_output_determinism_records(&[one_repeat.clone()]);
+        assert_eq!(
+            one_repeat_group.unavailable_reason,
+            Some(BenchmarkOutputDeterminismUnavailableReasonV1::FewerThanTwoRequestedRepeats)
+        );
+
+        let missing_repeat_group =
+            compare_output_determinism_records(&[output_determinism_test_run(0, "one output")]);
+        assert_eq!(
+            missing_repeat_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+
+        let mut failed = output_determinism_test_run(1, "ignored output");
+        failed.status = BenchmarkRunStatusV1::Failed;
+        failed.failure_category = Some(BenchmarkFailureCategoryV1::Timeout);
+        failed.result = None;
+        let failed_group = compare_output_determinism_records(&[
+            output_determinism_test_run(0, "one output"),
+            failed,
+        ]);
+        assert_eq!(
+            failed_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert_eq!(failed_group.failed_repeat_count, 1);
+        assert_eq!(failed_group.eligible_output_count, 1);
+        assert_eq!(failed_group.failure_category_counts.len(), 1);
+        assert_eq!(
+            failed_group.failure_category_counts[0].category,
+            BenchmarkFailureCategoryV1::Timeout
+        );
+
+        let mut incomplete = output_determinism_test_run(0, "not comparable");
+        incomplete.quality_evidence.status =
+            BenchmarkQualityEvidenceStatusV1::IncompleteSenocrEvidence;
+        let mut incomplete_again = incomplete.clone();
+        incomplete_again.repeat_index = 1;
+        let incomplete_group = compare_output_determinism_records(&[incomplete, incomplete_again]);
+        assert_eq!(
+            incomplete_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert_eq!(incomplete_group.unavailable_repeat_count, 2);
+        assert_eq!(
+            incomplete_group.unavailable_reason,
+            Some(BenchmarkOutputDeterminismUnavailableReasonV1::FewerThanTwoFullyEvidencedSuccessfulOutputs)
+        );
+
+        let mut partial_capture = output_determinism_test_run(0, "not comparable");
+        partial_capture.raw_response_capture_complete = false;
+        let partial_group = compare_output_determinism_records(&[
+            partial_capture,
+            output_determinism_test_run(1, "not comparable"),
+        ]);
+        assert_eq!(
+            partial_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert!(partial_group.unavailable_reason_counts.iter().any(|entry| {
+            entry.reason
+                == BenchmarkOutputDeterminismUnavailableReasonV1::IncompleteRawResponseCapture
+        }));
+
+        let mut missing_profile = output_determinism_test_run(0, "not comparable");
+        missing_profile.quality_evidence.runtime_profile = None;
+        missing_profile.quality_evidence.status =
+            BenchmarkQualityEvidenceStatusV1::IncompleteSenocrEvidence;
+        let missing_profile_group = compare_output_determinism_records(&[
+            missing_profile,
+            output_determinism_test_run(1, "not comparable"),
+        ]);
+        assert_eq!(
+            missing_profile_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert!(
+            missing_profile_group
+                .unavailable_reason_counts
+                .iter()
+                .any(|entry| {
+                    entry.reason
+                == BenchmarkOutputDeterminismUnavailableReasonV1::IncompleteRuntimeOrAssetEvidence
+                })
+        );
+
+        let mut missing_assets = output_determinism_test_run(0, "not comparable");
+        missing_assets.model_artifact_digests.clear();
+        missing_assets.model_artifact_hash_unavailable_reason =
+            Some("test fixture omitted model hashes".to_owned());
+        missing_assets.quality_evidence.model_asset_coverage = None;
+        missing_assets.quality_evidence.status =
+            BenchmarkQualityEvidenceStatusV1::IncompleteSenocrEvidence;
+        let missing_assets_group = compare_output_determinism_records(&[
+            missing_assets,
+            output_determinism_test_run(1, "not comparable"),
+        ]);
+        assert_eq!(
+            missing_assets_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+
+        let mut missing_provider_identity = output_determinism_test_run(0, "not comparable");
+        missing_provider_identity.provider_identity = None;
+        let missing_identity_group = compare_output_determinism_records(&[
+            missing_provider_identity,
+            output_determinism_test_run(1, "not comparable"),
+        ]);
+        assert_eq!(
+            missing_identity_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+    }
+
+    #[test]
+    fn missing_request_identity_is_counted_once_for_completed_and_failed_runs() {
+        let mut completed_without_identity = output_determinism_test_run(0, "same output");
+        completed_without_identity.repeat_input_identity_sha256 = None;
+        let completed_group = compare_output_determinism_records(&[
+            completed_without_identity,
+            output_determinism_test_run(1, "same output"),
+        ]);
+        assert_eq!(
+            completed_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert_eq!(
+            completed_group.unavailable_reason,
+            Some(BenchmarkOutputDeterminismUnavailableReasonV1::MissingRequestIdentity)
+        );
+        assert_eq!(completed_group.unavailable_repeat_count, 1);
+        assert_eq!(
+            completed_group
+                .unavailable_reason_counts
+                .iter()
+                .find(|entry| {
+                    entry.reason
+                        == BenchmarkOutputDeterminismUnavailableReasonV1::MissingRequestIdentity
+                })
+                .unwrap()
+                .observation_count,
+            1
+        );
+
+        let mut failed_without_identity = output_determinism_test_run(0, "ignored output");
+        failed_without_identity.repeat_input_identity_sha256 = None;
+        failed_without_identity.status = BenchmarkRunStatusV1::Failed;
+        failed_without_identity.failure_category = Some(BenchmarkFailureCategoryV1::Timeout);
+        failed_without_identity.result = None;
+        let failed_group = compare_output_determinism_records(&[
+            failed_without_identity,
+            output_determinism_test_run(1, "same output"),
+        ]);
+        assert_eq!(
+            failed_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert_eq!(
+            failed_group.unavailable_reason,
+            Some(BenchmarkOutputDeterminismUnavailableReasonV1::MissingRequestIdentity)
+        );
+        assert_eq!(failed_group.failed_repeat_count, 1);
+        assert_eq!(
+            failed_group
+                .unavailable_reason_counts
+                .iter()
+                .find(|entry| {
+                    entry.reason
+                        == BenchmarkOutputDeterminismUnavailableReasonV1::MissingRequestIdentity
+                })
+                .unwrap()
+                .observation_count,
+            1
+        );
+    }
+
+    #[test]
+    fn unequal_present_request_identities_keep_the_changed_identity_reason() {
+        let mut first = output_determinism_test_run(0, "same output");
+        let mut second = output_determinism_test_run(1, "same output");
+        first.repeat_input_identity_sha256 = Some("a".repeat(64));
+        second.repeat_input_identity_sha256 = Some("b".repeat(64));
+        let group = compare_output_determinism_records(&[first, second]);
+        assert_eq!(
+            group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert_eq!(
+            group.unavailable_reason,
+            Some(
+                BenchmarkOutputDeterminismUnavailableReasonV1::RequestIdentityChangedAcrossRepeats
+            )
+        );
+        assert_eq!(
+            group
+                .unavailable_reason_counts
+                .iter()
+                .find(|entry| {
+                    entry.reason
+                        == BenchmarkOutputDeterminismUnavailableReasonV1::
+                            RequestIdentityChangedAcrossRepeats
+                })
+                .unwrap()
+                .observation_count,
+            1
+        );
+        assert_eq!(group.unavailable_reason_counts.len(), 1);
+        assert!(group.output_hash_counts.is_empty());
+    }
+
+    #[test]
+    fn empty_request_identity_uses_missing_identity_reason_once() {
+        let mut completed_without_identity = output_determinism_test_run(0, "same output");
+        completed_without_identity.repeat_input_identity_sha256 = Some(String::new());
+        let completed_group = compare_output_determinism_records(&[
+            completed_without_identity,
+            output_determinism_test_run(1, "same output"),
+        ]);
+        assert_eq!(
+            completed_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert_eq!(
+            completed_group.unavailable_reason,
+            Some(BenchmarkOutputDeterminismUnavailableReasonV1::MissingRequestIdentity)
+        );
+        assert_eq!(
+            completed_group
+                .unavailable_reason_counts
+                .iter()
+                .find(|entry| {
+                    entry.reason
+                        == BenchmarkOutputDeterminismUnavailableReasonV1::MissingRequestIdentity
+                })
+                .unwrap()
+                .observation_count,
+            1
+        );
+
+        let mut failed_without_identity = output_determinism_test_run(0, "ignored output");
+        failed_without_identity.repeat_input_identity_sha256 = Some(String::new());
+        failed_without_identity.status = BenchmarkRunStatusV1::Failed;
+        failed_without_identity.failure_category = Some(BenchmarkFailureCategoryV1::Timeout);
+        failed_without_identity.result = None;
+        let failed_group = compare_output_determinism_records(&[
+            failed_without_identity,
+            output_determinism_test_run(1, "same output"),
+        ]);
+        assert_eq!(
+            failed_group.status,
+            BenchmarkOutputDeterminismStatusV1::Unavailable
+        );
+        assert_eq!(
+            failed_group.unavailable_reason,
+            Some(BenchmarkOutputDeterminismUnavailableReasonV1::MissingRequestIdentity)
+        );
+        assert_eq!(
+            failed_group
+                .unavailable_reason_counts
+                .iter()
+                .find(|entry| {
+                    entry.reason
+                        == BenchmarkOutputDeterminismUnavailableReasonV1::MissingRequestIdentity
+                })
+                .unwrap()
+                .observation_count,
+            1
+        );
+    }
+
+    #[test]
+    fn only_primary_repeat_feeds_quality_summaries_and_paired_cases() {
+        let annotation = annotation("a b");
+        let mut primary = output_determinism_test_run(0, "a b");
+        primary.candidate_metrics = score_candidates(
+            primary.result.as_ref().unwrap(),
+            &annotation,
+            BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+        )
+        .unwrap();
+        let mut secondary = output_determinism_test_run(1, "different result");
+        secondary.candidate_metrics = score_candidates(
+            secondary.result.as_ref().unwrap(),
+            &annotation,
+            BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+        )
+        .unwrap();
+        let mut summary_accumulator = ProviderSummaryAccumulator::new(
+            "senocr-test".to_owned(),
+            "senocr-config".to_owned(),
+            2,
+        )
+        .unwrap();
+        summary_accumulator.observe(&primary).unwrap();
+        summary_accumulator.observe(&secondary).unwrap();
+        let summary = summary_accumulator.finish().unwrap();
+        assert_eq!(summary.attempted_run_count, 2);
+        let cursive = summary
+            .cursive_only_cer_by_split
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|item| item.split == Some(BenchmarkSplitV1::Evaluation))
+            .unwrap();
+        assert_eq!(cursive.style_annotation_coverage.cursive_case_count, 1);
+        assert_eq!(cursive.scored_case_count, 1);
+        assert_eq!(
+            cursive
+                .nfc_unicode_scalar_micro_cer
+                .as_ref()
+                .unwrap()
+                .errors,
+            0
+        );
+        assert_eq!(
+            cursive
+                .nfc_unicode_scalar_micro_cer
+                .as_ref()
+                .unwrap()
+                .reference_units,
+            3
+        );
+        let boundary = summary
+            .orthographic_whitespace_boundary_by_split
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|item| item.split == Some(BenchmarkSplitV1::Evaluation))
+            .unwrap();
+        assert_eq!(boundary.aligned_case_count, 1);
+
+        let case = case_with_split(
+            "paired-primary-case",
+            "writer-pair",
+            "session-pair",
+            "config-pair",
+            BenchmarkSplitV1::Evaluation,
+            "annotation-pair",
+        );
+        let paired_annotation = annotation_for("paired-primary-case", "annotation-pair", "a b");
+        let mut left_provider = senocr_quality_test_provider(0);
+        left_provider.provider_id = "left-provider".to_owned();
+        left_provider.configuration_id = "left-config".to_owned();
+        let mut right_provider = senocr_quality_test_provider(0);
+        right_provider.provider_id = "right-provider".to_owned();
+        right_provider.configuration_id = "right-config".to_owned();
+        let mut left_primary = output_determinism_test_run(0, "a b");
+        left_primary.candidate_metrics = score_candidates(
+            left_primary.result.as_ref().unwrap(),
+            &paired_annotation,
+            BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+        )
+        .unwrap();
+        let mut left_secondary = output_determinism_test_run(1, "x y z");
+        left_secondary.candidate_metrics = score_candidates(
+            left_secondary.result.as_ref().unwrap(),
+            &paired_annotation,
+            BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+        )
+        .unwrap();
+        let mut right_primary = output_determinism_test_run(0, "a b");
+        right_primary.candidate_metrics = score_candidates(
+            right_primary.result.as_ref().unwrap(),
+            &paired_annotation,
+            BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+        )
+        .unwrap();
+        let mut observations = Vec::new();
+        push_primary_evaluation_observation(
+            &mut observations,
+            &case,
+            &left_provider,
+            Some(&paired_annotation),
+            &left_primary,
+        )
+        .unwrap();
+        push_primary_evaluation_observation(
+            &mut observations,
+            &case,
+            &left_provider,
+            Some(&paired_annotation),
+            &left_secondary,
+        )
+        .unwrap();
+        push_primary_evaluation_observation(
+            &mut observations,
+            &case,
+            &right_provider,
+            Some(&paired_annotation),
+            &right_primary,
+        )
+        .unwrap();
+        assert_eq!(observations.len(), 2);
+        let corpus = BenchmarkCorpusManifestV1 {
+            schema_version: BENCHMARK_SCHEMA_VERSION,
+            corpus_id: "paired-primary-corpus".to_owned(),
+            split_key: BenchmarkSplitKeyV1::Session,
+            bootstrap_cluster: BenchmarkClusterKeyV1::Session,
+            bootstrap_seed: 5,
+            bootstrap_replicates: 20,
+            tokenization_policy: BenchmarkTokenizationPolicyV1::UnicodeWhitespaceSyllableV1,
+            cases: vec![paired_annotation],
+        };
+        let comparisons =
+            build_paired_comparisons_with_work_budget(&observations, &corpus, 10_000).unwrap();
+        assert_eq!(comparisons.len(), 1);
+        assert_eq!(comparisons[0].nfc_cer_paired_case_count, 1);
+        assert_eq!(comparisons[0].nfc_cer_cluster_count, 1);
     }
 }

@@ -530,7 +530,12 @@ def _decode_png_rgb(
         raise protocol.WorkerFailure("raster_decode_failed") from None
 
 
-def _senocr_e2e_shared_files() -> tuple[Path, Path] | None:
+SENOCR_E2E_ALLOWED_HEAD_REFS = frozenset(
+    {"feat/benchmark-fidelity", "feat/benchmark-observability"}
+)
+
+
+def _senocr_e2e_shared_files(request_id: str | None = None) -> tuple[Path, Path] | None:
     if os.environ.get("LASSOINK_RUN_SENOCR_M4_E2E") != "1":
         return None
     expected_sha = os.environ.get("LASSOINK_EXPECTED_HEAD_SHA", "")
@@ -542,14 +547,18 @@ def _senocr_e2e_shared_files() -> tuple[Path, Path] | None:
         "RUNNER_ARCH": "X64",
         "GITHUB_REPOSITORY": "Herzchens/LassoInk",
         "GITHUB_EVENT_NAME": "pull_request",
-        "GITHUB_HEAD_REF": "feat/benchmark-fidelity",
         "LASSOINK_EXPECTED_HEAD_REPOSITORY": "Herzchens/LassoInk",
-        "LASSOINK_EXPECTED_HEAD_REF": "feat/benchmark-fidelity",
         "LASSOINK_RUN_SENOCR_CPU_COMPAT": "1",
     }
     if sys.platform != "win32" or platform.machine().lower() not in {"amd64", "x86_64"}:
         raise protocol.WorkerFailure("runtime_version_mismatch")
     if any(os.environ.get(key) != value for key, value in required.items()):
+        raise protocol.WorkerFailure("runtime_version_mismatch")
+    head_ref = os.environ.get("GITHUB_HEAD_REF", "")
+    if (
+        head_ref not in SENOCR_E2E_ALLOWED_HEAD_REFS
+        or os.environ.get("LASSOINK_EXPECTED_HEAD_REF") != head_ref
+    ):
         raise protocol.WorkerFailure("runtime_version_mismatch")
     if (
         len(expected_sha) != 40
@@ -579,8 +588,16 @@ def _senocr_e2e_shared_files() -> tuple[Path, Path] | None:
         or shared_dir.is_symlink()
     ):
         raise protocol.WorkerFailure("runtime_version_mismatch")
+    if (
+        type(request_id) is not str
+        or not request_id
+        or len(request_id) > 128
+        or not request_id.isascii()
+    ):
+        raise protocol.WorkerFailure("runtime_version_mismatch")
     rgba_path = shared_dir / "canonical-rgba.bin"
-    sidecar_path = shared_dir / "processor-parity.json"
+    request_id_digest = hashlib.sha256(request_id.encode("ascii")).hexdigest()
+    sidecar_path = shared_dir / f"processor-parity-{request_id_digest}.json"
     try:
         invalid_test_files = (
             rgba_path.is_symlink()
@@ -631,9 +648,9 @@ def _processor_tensor_summary(inputs, torch) -> dict[str, dict[str, object]]:
 
 
 def _verify_and_record_e2e_processor_parity(
-    processor, decoded_image, decoded_inputs, torch
+    processor, decoded_image, decoded_inputs, torch, request_id: str
 ) -> None:
-    paths = _senocr_e2e_shared_files()
+    paths = _senocr_e2e_shared_files(request_id)
     if paths is None:
         return
     rgba_path, sidecar_path = paths
@@ -776,7 +793,7 @@ def _load_local_model(asset_root: Path):
         raise protocol.WorkerFailure("model_load_failed") from None
 
 
-def _generate_raw_text(runtime, image) -> str:
+def _generate_raw_text(runtime, image, request_id: str) -> str:
     torch, processor, model = runtime
     messages = [
         {
@@ -797,7 +814,7 @@ def _generate_raw_text(runtime, image) -> str:
             return_tensors="pt",
         ).to("cpu")
         _verify_and_record_e2e_processor_parity(
-            processor, image, inputs, torch
+            processor, image, inputs, torch, request_id
         )
         input_token_count = int(inputs["input_ids"].shape[-1])
         with torch.inference_mode():
@@ -889,7 +906,7 @@ def process_senocr_request(request: dict[str, protocol.JsonValue]) -> str:
     """Guard test-only context before resource, asset, decode, or model work."""
     return _run_after_senocr_e2e_context_guard(
         request,
-        context_guard=_senocr_e2e_shared_files,
+        context_guard=lambda: _senocr_e2e_shared_files(request["request_id"]),
         request_processor=_process_senocr_request_after_context_guard,
     )
 
@@ -915,7 +932,9 @@ def _process_senocr_request_after_context_guard(
                     runtime_guard=_validate_runtime_versions,
                     image_decoder=_decode_png_rgb,
                     model_loader=lambda root: _load_local_model(root),
-                    generator=_generate_raw_text,
+                    generator=lambda runtime, image: _generate_raw_text(
+                        runtime, image, request["request_id"]
+                    ),
                 )
     except protocol.WorkerFailure:
         raise

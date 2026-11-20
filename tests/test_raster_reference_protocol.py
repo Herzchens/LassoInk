@@ -19,6 +19,10 @@ from tools import raster_reference_protocol as protocol
 from tools import senocr_fp32_worker as senocr
 from tools import senocr_runtime_profile as runtime_profile
 
+SENOCR_E2E_ALLOWED_HEAD_REFS = frozenset(
+    {"feat/benchmark-fidelity", "feat/benchmark-observability"}
+)
+
 
 def require_senocr_hosted_e2e_guard(test_case: unittest.TestCase) -> None:
     expected_sha = os.environ.get("LASSOINK_EXPECTED_HEAD_SHA", "")
@@ -30,9 +34,7 @@ def require_senocr_hosted_e2e_guard(test_case: unittest.TestCase) -> None:
         "RUNNER_ARCH": "X64",
         "GITHUB_REPOSITORY": "Herzchens/LassoInk",
         "GITHUB_EVENT_NAME": "pull_request",
-        "GITHUB_HEAD_REF": "feat/benchmark-fidelity",
         "LASSOINK_EXPECTED_HEAD_REPOSITORY": "Herzchens/LassoInk",
-        "LASSOINK_EXPECTED_HEAD_REF": "feat/benchmark-fidelity",
         "LASSOINK_RUN_SENOCR_CPU_COMPAT": "1",
         "LASSOINK_RUN_SENOCR_M4_E2E": "1",
     }
@@ -41,6 +43,12 @@ def require_senocr_hosted_e2e_guard(test_case: unittest.TestCase) -> None:
     for key, value in required.items():
         if os.environ.get(key) != value:
             test_case.fail(f"SenOCR integration test guard failed: {key}")
+    head_ref = os.environ.get("GITHUB_HEAD_REF", "")
+    if (
+        head_ref not in SENOCR_E2E_ALLOWED_HEAD_REFS
+        or os.environ.get("LASSOINK_EXPECTED_HEAD_REF") != head_ref
+    ):
+        test_case.fail("SenOCR integration test branch guard failed")
     if (
         len(expected_sha) != 40
         or any(character not in "0123456789abcdef" for character in expected_sha)

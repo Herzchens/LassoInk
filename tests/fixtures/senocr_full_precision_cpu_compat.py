@@ -21,7 +21,9 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 REPOSITORY = "Herzchens/LassoInk"
-REQUIRED_BRANCH = "feat/benchmark-fidelity"
+ALLOWED_BRANCHES = frozenset(
+    {"feat/benchmark-fidelity", "feat/benchmark-observability"}
+)
 MODEL_REPOSITORY = "VietAlphaLabs/SenOCR-Vi"
 MODEL_REVISION = "1e70dff4ef0429b0d88a2b873fb5d03300af1a41"
 MODEL_INDEX_FILE = "model.safetensors.index.json"
@@ -152,9 +154,11 @@ def guard_execution_context() -> None:
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
     require(event_name == "pull_request", "pull_request_event_required")
     require(os.environ.get("EXPECTED_EVENT", "") == event_name, "event_context_mismatch")
+    expected_head_ref = os.environ.get("EXPECTED_HEAD_REF", "")
     require(
         os.environ.get("EXPECTED_HEAD_REPOSITORY", "") == REPOSITORY
-        and os.environ.get("EXPECTED_HEAD_REF", "") == REQUIRED_BRANCH,
+        and expected_head_ref in ALLOWED_BRANCHES
+        and os.environ.get("GITHUB_HEAD_REF", "") == expected_head_ref,
         "pull_request_source_guard_failed",
     )
 

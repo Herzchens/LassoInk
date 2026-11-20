@@ -50,6 +50,23 @@ fn write_frame(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     writer.flush()
 }
 
+fn json_string_field(input: &[u8], field: &str) -> Option<String> {
+    let marker = format!("\"{field}\":\"");
+    let start = input
+        .windows(marker.len())
+        .position(|window| window == marker.as_bytes())?
+        + marker.len();
+    let remaining = &input[start..];
+    let end = remaining.iter().position(|byte| *byte == b'"')?;
+    String::from_utf8(remaining[..end].to_vec()).ok()
+}
+
+fn response_bound_to_request(template: &str, request_frame: &[u8]) -> Option<String> {
+    let template_request_id = json_string_field(template.as_bytes(), "request_id")?;
+    let request_id = json_string_field(request_frame, "request_id")?;
+    Some(template.replace(&template_request_id, &request_id))
+}
+
 fn spawn_pipe_holder() -> io::Result<()> {
     let executable = env::current_exe()?;
     Command::new(executable)
@@ -106,9 +123,12 @@ fn main() {
     if write_frame(&mut output, handshake.as_bytes()).is_err() {
         process::exit(32);
     }
-    if read_frame(&mut input).ok().flatten().is_none() {
+    let Some(recognition_request) = read_frame(&mut input).ok().flatten() else {
         process::exit(33);
-    }
+    };
+    let is_primary_repeat = recognition_request
+        .windows(b"-r0".len())
+        .any(|window| window == b"-r0");
     match behavior.as_str() {
         "crash" => process::exit(23),
         "crash-holder" => {
@@ -137,6 +157,38 @@ fn main() {
             }
             if behavior == "stale" && spawn_pipe_holder().is_err() {
                 process::exit(44);
+            }
+            process::exit(0);
+        }
+        "vary-repeat" => {
+            let Some(response_for_request) =
+                response_bound_to_request(&response, &recognition_request)
+            else {
+                process::exit(50);
+            };
+            let recognized = if is_primary_repeat {
+                "fixture text primary"
+            } else {
+                "fixture text later"
+            };
+            let varied_response = response_for_request.replace("fixture text", recognized);
+            if write_frame(&mut output, varied_response.as_bytes()).is_err() {
+                process::exit(34);
+            }
+            process::exit(0);
+        }
+        "fail-primary-then-success" => {
+            if is_primary_repeat {
+                process::exit(23);
+            }
+            let Some(response_for_request) =
+                response_bound_to_request(&response, &recognition_request)
+            else {
+                process::exit(50);
+            };
+            let later_response = response_for_request.replace("fixture text", "fixture text later");
+            if write_frame(&mut output, later_response.as_bytes()).is_err() {
+                process::exit(34);
             }
             process::exit(0);
         }
