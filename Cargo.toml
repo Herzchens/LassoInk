@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
 license = "Apache-2.0"
-description = "Winit diagnostic for the LassoInk Gate 0 Windows pen capture comparison"
+description = "Windows Direct WM_POINTER pen capture diagnostic for the owner-tested Ink ON setup, with Winit and explicit Wintab diagnostics"
 publish = false
 
 [dependencies]

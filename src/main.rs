@@ -56,9 +56,8 @@ use winit::{
 };
 use wintab::{WT_DEFBASE, WintabCapture, WintabControlObserver};
 
-const STATUS: &str = "LassoInk M3 minimal canvas: Direct WM_POINTER is provisional; no mouse fallback or capture winner is selected";
-const NOT_IMPLEMENTED: &str =
-    "Convert provider unavailable; Gate 0 hardware status is DEFERRED / NOT PASSED.";
+const STATUS: &str = "LassoInk M3: canonical capture lock is Direct WM_POINTER/GetPointerPenInfoHistory + Windows Ink ON; diagnostics elsewhere do not requalify it";
+const NOT_IMPLEMENTED: &str = "Convert is not implemented/configured in this build. Gate 0 is PROVISIONAL PASS; criterion-8 capture CPU cost and physical pen-to-display latency remain partial and nonblocking.";
 const STORAGE_POLICY: &str = "Bounded local session output under the selected session directory; 4,096 retained events, 131,072 native samples, 65,536 direct samples per history, 4,096 Wintab packets per message, and bounded parser/metrics partitions.";
 const TITLE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_LOOP_WAKE_MARKER_THRESHOLD_NS: u128 = 50_000_000;
@@ -305,7 +304,8 @@ impl ProbeApp {
         self.canvas_scene.set_selection_rect(None);
         self.canvas_status = match tool {
             CanvasTool::Pen => {
-                "Direct WM_POINTER pen input only; mouse drawing disabled".to_owned()
+                "Direct WM_POINTER pen input only (Windows Ink ON); public mouse events are not ink"
+                    .to_owned()
             }
             CanvasTool::Eraser => {
                 "Eraser: pen contact erases on native up; mouse click then Delete also works"
@@ -493,7 +493,7 @@ impl ProbeApp {
             PhysicalKey::Code(KeyCode::ArrowDown) => self.queue_selected_move_from_view(0.0, 10.0),
             PhysicalKey::Code(KeyCode::F4) | PhysicalKey::Code(KeyCode::Enter) => {
                 self.canvas_status =
-                    "Convert unavailable: no recognition provider is configured".to_owned();
+                    "Convert is not implemented/configured in this build".to_owned();
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
                 }
@@ -1881,7 +1881,7 @@ impl ApplicationHandler for ProbeApp {
                         &self.canvas_scene,
                         self.canvas_viewport,
                         &format!(
-                            "{} | source {} (provisional; no fallback) | zoom {:.0}% pan {:.0},{:.0} | Ctrl+Z/Y undo/redo | arrows move selected",
+                            "{} | source {} (no fallback) | zoom {:.0}% pan {:.0},{:.0} | Ctrl+Z/Y undo/redo | arrows move selected",
                             self.canvas_status,
                             match self.capture_mode {
                                 CaptureMode::DirectWmPointer => "Direct WM_POINTER",
@@ -2092,10 +2092,10 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
         "canvas_capture_source_status".to_owned(),
         match capture_mode {
             CaptureMode::DirectWmPointer => {
-                "direct WM_POINTER provisionally selected; not a canonical source decision"
+                "Direct WM_POINTER/GetPointerPenInfoHistory selected for this session; owner-tested supported setup requires Windows Ink ON; this session is not hardware qualification"
             }
             CaptureMode::Wintab => {
-                "Wintab explicitly selected; canvas adapter unavailable and no fallback is used"
+                "Wintab explicitly selected for diagnostics; canvas adapter unavailable and no fallback is used"
             }
         }
         .to_owned(),
@@ -2183,7 +2183,7 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
     );
     metadata.insert(
         "hardware_gate_status".to_owned(),
-        "DEFERRED / NOT PASSED; this software run does not establish CT430 fidelity".to_owned(),
+        "Owner-reported Gate 0 PROVISIONAL PASS for Direct WM_POINTER with Windows Ink ON; criterion-8 callback/query CPU cost and physical pen-to-display latency remain partial and nonblocking; this session is not hardware qualification".to_owned(),
     );
     let process_cpu_start = process_cpu_snapshot(app_clock_origin);
 
@@ -2460,9 +2460,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
     }
     if arguments.len() == 1 && arguments[0] == "--help" {
-        println!("LassoInk M3 minimal canvas with explicitly provisional capture diagnostics");
+        println!(
+            "LassoInk M3 minimal canvas; Direct WM_POINTER with Windows Ink ON is the owner-tested capture lock"
+        );
         println!("Usage: lassoink-capture-probe [options]");
         println!("  --capture-mode direct|wintab");
+        println!(
+            "  Supported tested capture setup: Direct WM_POINTER/GetPointerPenInfoHistory with Windows Ink ON"
+        );
+        println!(
+            "  Ink OFF may suppress Direct PT_PEN; public mouse/Winit events remain diagnostic and never become ink"
+        );
+        println!("  Wintab is an explicit diagnostic mode, not a fallback for Direct capture");
         println!("  --session-dir PATH | --session-path PATH");
         println!("  --project-path PATH | --open-project PATH");
         println!("  --trial-id ID --windows-ink on|off|unknown");
@@ -2498,7 +2507,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!("{NOT_IMPLEMENTED}");
         println!("{STORAGE_POLICY}");
         println!("Default session directory: local_capture (ignored local data)");
-        println!("Gate 0 hardware status: DEFERRED / NOT PASSED pending owner CT430 evidence.");
+        println!(
+            "Gate 0 hardware status: PROVISIONAL PASS for the owner-tested Direct WM_POINTER + Windows Ink ON setup; criterion-8 CPU/physical latency debt is partial and nonblocking."
+        );
+        println!("This software session is not hardware qualification or a Gate 1 selection.");
         return Ok(());
     }
     if arguments.len() == 2 && arguments[0] == "--report" {
@@ -2701,7 +2713,7 @@ fn startup_canvas_status(recovery_note: Option<&str>, incomplete_strokes: usize)
         (None, count) if count > 0 => format!(
             "{count} interrupted/in-progress stroke(s) remain as raw history and are not rendered complete; lift before restarting"
         ),
-        (None, _) => "F1 pen | F2 eraser | F3 select | F4 Convert (unavailable)".to_owned(),
+        (None, _) => "F1 pen | F2 eraser | F3 select | F4 Convert (not configured)".to_owned(),
     }
 }
 
