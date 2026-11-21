@@ -13,21 +13,25 @@ mod project_runtime;
 #[allow(dead_code)]
 mod provider_protocol;
 mod session;
+mod windows_clipboard;
 mod win32_pointer;
 mod wintab;
 
 use canvas::{
     CanvasInputTracker, CanvasOrigin, CanvasRect, CanvasScene, CanvasTool,
     CanvasToolCaptureContext, CanvasToolGestureTracker, CanvasToolIntent, CanvasViewport,
-    DirectCaptureEvent, paint_gdi,
+    CORRECTION_PANE_PADDING_PX, CORRECTION_PANE_ROW_HEIGHT_PX, CORRECTION_PANE_WIDTH_PX,
+    DirectCaptureEvent, GdiTextAdvanceCache, paint_gdi_with_side_pane,
 };
 use convert::{
     ConvertPreparationError, ConvertPreparationTask, LocalConvertProviderV1, PreparedConversionV1,
     projection_from_execution, same_generated_raster_output,
 };
+use correction::{CorrectionSession, CorrectionTextEditor};
 use journal::{
     EditCommand, JournalEvent, JournalHeader, JournalMetadata, JournalRecord, JournalReplayState,
-    JournalWriter, MetadataScope, StrokeInterruptionReason, StrokeViewFrame,
+    JournalWriter, MetadataScope, RegionCorrectionActionV1, StoredRecognitionProjection,
+    StrokeInterruptionReason, StrokeViewFrame,
     migrate_schema_one_to_four, migrate_schema_three_to_four, migrate_schema_two_to_four,
     read_journal,
 };
@@ -35,7 +39,8 @@ use process_cpu::{
     PROCESS_CPU_SCOPE, measure as measure_process_cpu, snapshot as process_cpu_snapshot,
 };
 use project_runtime::{
-    ProjectQueueError, ProjectWriterAck, ProjectWriterHandle, ProjectionQueueError,
+    CorrectionQueueError, ProjectQueueError, ProjectWriterAck, ProjectWriterHandle,
+    ProjectionQueueError,
 };
 use provider_protocol::{
     ProviderErrorKind, ProviderExecution, ProviderSubmitError, ProviderWorkerHandle,
@@ -44,7 +49,7 @@ use provider_protocol::{
 use session::{SessionWriter, default_session_path, read_report};
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     io,
     ops::Range,
@@ -54,13 +59,15 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use win32_pointer::{
-    CaptureMode, CaptureSource, LifecycleEventKind, LifecycleEventRecord, ProbeRecord, ProbeState,
-    ProbeSummary, PublicEventCapability, PublicWinitEventData, PublicWinitEventRecord,
-    StorageLimit, WintabPacketTimeMode, WintabStatus,
+    CaptureMode, CaptureSource, LifecycleEventKind, LifecycleEventRecord, MouseMessageOrigin,
+    PointerMessageKind, ProbeRecord, ProbeState, ProbeSummary, PublicEventCapability,
+    PublicWinitEventData, PublicWinitEventRecord, StorageLimit, WintabPacketTimeMode, WintabStatus,
 };
-use winit::event::ElementState;
-use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, Ime};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent},
@@ -75,6 +82,10 @@ const CONVERT_POLICY: &str = "F4 Convert requires an explicit local --provider-c
 const STORAGE_POLICY: &str = "Bounded local session output under the selected session directory; 4,096 retained events, 131,072 native samples, 65,536 direct samples per history, 4,096 Wintab packets per message, and bounded parser/metrics partitions.";
 const TITLE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_LOOP_WAKE_MARKER_THRESHOLD_NS: u128 = 50_000_000;
+const MAX_UI_POINTER_OWNERS: usize = 32;
+const MAX_DIRECT_CANVAS_POINTER_OWNERS: usize = 256;
+const CORRECTION_PANE_MAX_EDITOR_ROWS: usize = 4;
+const MAX_DEFERRED_PANE_ACTIONS: usize = 32;
 
 #[cfg(test)]
 pub(crate) fn require_native_ui_test_opt_in() {
@@ -119,6 +130,22 @@ struct ProbeApp {
     local_convert_provider: Option<LocalConvertProviderV1>,
     provider_worker: Option<ProviderWorkerHandle>,
     pending_convert: Option<PendingConvert>,
+    correction_session: Option<CorrectionSession>,
+    pending_correction: Option<PendingCorrectionWrite>,
+    next_correction_id: u64,
+    correction_focus: CorrectionPaneFocus,
+    correction_panel_status: String,
+    provider_config_path_editor: CorrectionTextEditor,
+    provider_id_editor: CorrectionTextEditor,
+    export_path_editor: CorrectionTextEditor,
+    direct_ui_pointer_owners: DirectUiPointerOwnerTracker,
+    deferred_pane_actions: Vec<CorrectionPaneAction>,
+    correction_pane_scroll: CorrectionPaneScrollOffsets,
+    pane_text_measurements: GdiTextAdvanceCache,
+    correction_editor_browse_mode: bool,
+    correction_mouse_selection_anchor: Option<usize>,
+    correction_mouse_selecting: bool,
+    alt_graph_active: bool,
     next_convert_generation: u64,
     project_generation: u64,
     convert_view_generation: u64,
@@ -173,6 +200,9 @@ struct PendingConvert {
 
 enum PendingConvertPhase {
     Transitioning,
+    QueueSnapshotForPreparation {
+        batch_id: u64,
+    },
     SnapshotForPreparation {
         batch_id: u64,
     },
@@ -197,6 +227,1072 @@ enum PendingConvertPhase {
     Persisting {
         batch_id: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CorrectionPaneFocus {
+    None,
+    CorrectionEditor,
+    ProviderConfigPath,
+    ProviderId,
+    ExportPath,
+}
+
+impl CorrectionPaneFocus {
+    fn is_text_field(self) -> bool {
+        self != Self::None
+    }
+}
+
+struct PendingCorrectionWrite {
+    batch_id: u64,
+    correction: Box<journal::RegionCorrectionV1>,
+    enqueued: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectUiPointerRoute {
+    Canvas,
+    Unowned,
+    CapacityExceeded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CorrectionPaneAction {
+    Convert,
+    Save,
+    Reset,
+    Cancel,
+    Copy,
+    LoadProviderConfig,
+}
+
+#[derive(Default)]
+struct DirectUiPointerOwnerTracker {
+    ui_owned: HashMap<(isize, u32), Option<CorrectionPaneAction>>,
+    canvas_owned: HashSet<(isize, u32)>,
+    // One separately bounded overflow slot preserves the next UI contact;
+    // further simultaneous pane contacts fail capture instead of changing owner.
+    overflow_ui_owned: Option<((isize, u32), Option<CorrectionPaneAction>)>,
+}
+
+impl DirectUiPointerOwnerTracker {
+    fn route_down(
+        &mut self,
+        key: (isize, u32),
+        starts_in_ui: bool,
+        action: Option<CorrectionPaneAction>,
+    ) -> DirectUiPointerRoute {
+        if self.ui_owned.contains_key(&key)
+            || self
+                .overflow_ui_owned
+                .is_some_and(|(overflow_key, _)| overflow_key == key)
+        {
+            return DirectUiPointerRoute::Unowned;
+        }
+        if self.canvas_owned.contains(&key) {
+            return DirectUiPointerRoute::Canvas;
+        }
+        if !starts_in_ui {
+            if self.canvas_owned.len() >= MAX_DIRECT_CANVAS_POINTER_OWNERS {
+                return DirectUiPointerRoute::CapacityExceeded;
+            }
+            self.canvas_owned.insert(key);
+            return DirectUiPointerRoute::Canvas;
+        }
+        if self.ui_owned.len() < MAX_UI_POINTER_OWNERS {
+            self.ui_owned.insert(key, action);
+            DirectUiPointerRoute::Unowned
+        } else if self.overflow_ui_owned.is_none() {
+            self.overflow_ui_owned = Some((key, action));
+            DirectUiPointerRoute::Unowned
+        } else {
+            DirectUiPointerRoute::CapacityExceeded
+        }
+    }
+
+    fn route_continuation(
+        &mut self,
+        key: (isize, u32),
+        kind: PointerMessageKind,
+        action_at_release: Option<CorrectionPaneAction>,
+    ) -> (DirectUiPointerRoute, Option<CorrectionPaneAction>) {
+        let saved_action = self
+            .ui_owned
+            .get(&key)
+            .copied()
+            .or_else(|| {
+                self.overflow_ui_owned
+                    .filter(|(overflow_key, _)| *overflow_key == key)
+                    .map(|(_, action)| action)
+            });
+        let ui_owned = self.ui_owned.contains_key(&key)
+            || self
+                .overflow_ui_owned
+                .is_some_and(|(overflow_key, _)| overflow_key == key);
+        let completed_action = if kind == PointerMessageKind::Up {
+            saved_action
+                .filter(|saved| saved.is_some() && *saved == action_at_release)
+                .flatten()
+        } else {
+            None
+        };
+        if kind == PointerMessageKind::Up {
+            self.ui_owned.remove(&key);
+            self.canvas_owned.remove(&key);
+            if self
+                .overflow_ui_owned
+                .is_some_and(|(overflow_key, _)| overflow_key == key)
+            {
+                self.overflow_ui_owned = None;
+            }
+        }
+        let route = if ui_owned {
+            DirectUiPointerRoute::Unowned
+        } else {
+            DirectUiPointerRoute::Canvas
+        };
+        (route, completed_action)
+    }
+
+    fn release_pointer_id(&mut self, pointer_id: u32) -> DirectUiPointerRoute {
+        let was_canvas_owned = self
+            .canvas_owned
+            .iter()
+            .any(|(_, tracked_pointer_id)| *tracked_pointer_id == pointer_id);
+        let was_ui_owned = self
+            .ui_owned
+            .keys()
+            .any(|(_, tracked_pointer_id)| *tracked_pointer_id == pointer_id)
+            || self
+                .overflow_ui_owned
+                .is_some_and(|((_, tracked_pointer_id), _)| tracked_pointer_id == pointer_id);
+        self.ui_owned
+            .retain(|(_, tracked_pointer_id), _| *tracked_pointer_id != pointer_id);
+        self.canvas_owned
+            .retain(|(_, tracked_pointer_id)| *tracked_pointer_id != pointer_id);
+        if self
+            .overflow_ui_owned
+            .is_some_and(|((_, tracked_pointer_id), _)| tracked_pointer_id == pointer_id)
+        {
+            self.overflow_ui_owned = None;
+        }
+        self.canvas_owned
+            .retain(|(_, tracked_pointer_id)| *tracked_pointer_id != pointer_id);
+        if was_canvas_owned {
+            DirectUiPointerRoute::Canvas
+        } else if was_ui_owned {
+            DirectUiPointerRoute::Unowned
+        } else {
+            DirectUiPointerRoute::Canvas
+        }
+    }
+
+    fn clear(&mut self) {
+        self.ui_owned.clear();
+        self.canvas_owned.clear();
+        self.overflow_ui_owned = None;
+    }
+
+    fn has_pending_action(&self, action: CorrectionPaneAction) -> bool {
+        self.ui_owned.values().any(|pending| *pending == Some(action))
+            || self
+                .overflow_ui_owned
+                .is_some_and(|(_, pending)| pending == Some(action))
+    }
+
+    fn has_pending_direct_action(&self) -> bool {
+        self.ui_owned.values().any(|pending| pending.is_some())
+            || self
+                .overflow_ui_owned
+                .is_some_and(|(_, pending)| pending.is_some())
+    }
+
+    fn has_active_canvas_pointer(&self) -> bool {
+        !self.canvas_owned.is_empty()
+    }
+
+    fn observe_lifecycle(&mut self, kind: LifecycleEventKind, pointer_id: Option<u32>) {
+        if kind == LifecycleEventKind::WindowFocusLost {
+            self.clear();
+        } else if matches!(
+            kind,
+            LifecycleEventKind::DirectPointerLeave
+                | LifecycleEventKind::DirectPointerEnter
+                | LifecycleEventKind::DirectPointerCaptureChanged
+                | LifecycleEventKind::DirectPointerDeviceChanged
+                | LifecycleEventKind::DirectPointerDeviceInRange
+                | LifecycleEventKind::DirectPointerDeviceOutOfRange
+        ) {
+            if let Some(pointer_id) = pointer_id {
+                self.release_pointer_id(pointer_id);
+            } else {
+                self.clear();
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct CorrectionPaneLayout {
+    lines: Vec<String>,
+    editor_rows: Option<Range<usize>>,
+    editor_grapheme_ranges: Vec<Range<usize>>,
+    editor_row_hit_offsets: Vec<Vec<i32>>,
+    action_row: Option<usize>,
+    action_hit_targets: Vec<(Range<i32>, CorrectionPaneAction)>,
+    scroll_regions: Vec<CorrectionPaneScrollRegion>,
+    inline_editor_rows: Vec<InlineEditorRowLayout>,
+    provider_path_row: Option<usize>,
+    provider_id_row: Option<usize>,
+    load_config_row: Option<usize>,
+    export_path_row: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlineEditorField {
+    ProviderConfigPath,
+    ProviderId,
+    ExportPath,
+}
+
+#[derive(Clone, Debug)]
+struct InlineEditorRowLayout {
+    field: InlineEditorField,
+    row_index: usize,
+    visible_graphemes: Range<usize>,
+    boundary_x: Vec<i32>,
+}
+
+#[derive(Clone, Debug)]
+struct MeasuredPaneTextRow {
+    text: String,
+    grapheme_range: Range<usize>,
+    boundary_x: Vec<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CorrectionPaneTextSection {
+    Status,
+    ProviderDetails,
+    ProviderOutput,
+    SavedText,
+    EffectiveText,
+    Draft,
+    ImePreview,
+}
+
+#[derive(Clone, Debug)]
+struct CorrectionPaneScrollRegion {
+    section: CorrectionPaneTextSection,
+    row_range: Range<usize>,
+    total_rows: usize,
+    visible_rows: usize,
+}
+
+#[derive(Default)]
+struct CorrectionPaneScrollOffsets {
+    status: usize,
+    provider_details: usize,
+    provider_output: usize,
+    saved_text: usize,
+    effective_text: usize,
+    draft: usize,
+    ime_preview: usize,
+}
+
+impl CorrectionPaneScrollOffsets {
+    fn get(&self, section: CorrectionPaneTextSection) -> usize {
+        match section {
+            CorrectionPaneTextSection::Status => self.status,
+            CorrectionPaneTextSection::ProviderDetails => self.provider_details,
+            CorrectionPaneTextSection::ProviderOutput => self.provider_output,
+            CorrectionPaneTextSection::SavedText => self.saved_text,
+            CorrectionPaneTextSection::EffectiveText => self.effective_text,
+            CorrectionPaneTextSection::Draft => self.draft,
+            CorrectionPaneTextSection::ImePreview => self.ime_preview,
+        }
+    }
+
+    fn set(&mut self, section: CorrectionPaneTextSection, offset: usize) {
+        match section {
+            CorrectionPaneTextSection::Status => self.status = offset,
+            CorrectionPaneTextSection::ProviderDetails => self.provider_details = offset,
+            CorrectionPaneTextSection::ProviderOutput => self.provider_output = offset,
+            CorrectionPaneTextSection::SavedText => self.saved_text = offset,
+            CorrectionPaneTextSection::EffectiveText => self.effective_text = offset,
+            CorrectionPaneTextSection::Draft => self.draft = offset,
+            CorrectionPaneTextSection::ImePreview => self.ime_preview = offset,
+        }
+    }
+}
+
+fn append_pane_line(layout: &mut CorrectionPaneLayout, line: String) -> usize {
+    let row = layout.lines.len();
+    layout.lines.push(line);
+    row
+}
+
+fn safe_pane_display_grapheme(grapheme: &str) -> String {
+    if matches!(grapheme, "\n" | "\r\n" | "\r") {
+        String::new()
+    } else if grapheme.chars().any(char::is_control) {
+        "�".to_owned()
+    } else {
+        grapheme.to_owned()
+    }
+}
+
+fn grapheme_pixel_boundaries(text: &str, utf16_extents: &[i32]) -> Vec<i32> {
+    let mut boundaries = Vec::with_capacity(text.graphemes(true).count().saturating_add(1));
+    boundaries.push(0);
+    let mut utf16_units = 0usize;
+    for grapheme in text.graphemes(true) {
+        utf16_units = utf16_units.saturating_add(grapheme.encode_utf16().count());
+        let fallback = boundaries.last().copied().unwrap_or_default();
+        let extent = utf16_extents
+            .get(utf16_units.saturating_sub(1))
+            .copied()
+            .unwrap_or(fallback);
+        boundaries.push(extent);
+    }
+    boundaries
+}
+
+fn measured_pane_text_rows(
+    text: &str,
+    maximum_width_px: i32,
+    measurements: &mut GdiTextAdvanceCache,
+) -> io::Result<Vec<MeasuredPaneTextRow>> {
+    let graphemes = text
+        .graphemes(true)
+        .map(safe_pane_display_grapheme)
+        .collect::<Vec<_>>();
+    let maximum_width_px = maximum_width_px.max(1);
+    let mut rows = Vec::new();
+    let mut logical_start = 0usize;
+
+    loop {
+        let logical_end = graphemes[logical_start..]
+            .iter()
+            .position(String::is_empty)
+            .map_or(graphemes.len(), |relative| logical_start + relative);
+        let logical_text = graphemes[logical_start..logical_end].concat();
+        let logical_extents = measurements.advances(&logical_text)?;
+        let logical_boundaries = grapheme_pixel_boundaries(&logical_text, &logical_extents);
+        let logical_len = logical_end.saturating_sub(logical_start);
+
+        if logical_len == 0 {
+            rows.push(MeasuredPaneTextRow {
+                text: String::new(),
+                grapheme_range: logical_start..logical_start,
+                boundary_x: vec![0],
+            });
+        } else {
+            let mut row_start = 0usize;
+            while row_start < logical_len {
+                let mut row_end = row_start;
+                while row_end < logical_len {
+                    let next = row_end + 1;
+                    let width = logical_boundaries[next]
+                        .saturating_sub(logical_boundaries[row_start]);
+                    if width > maximum_width_px && row_end > row_start {
+                        break;
+                    }
+                    row_end = next;
+                    if width > maximum_width_px {
+                        break;
+                    }
+                }
+                if row_end == row_start {
+                    row_end = row_start + 1;
+                }
+
+                let mut row_text = logical_text_for_range(
+                    &graphemes,
+                    logical_start + row_start..logical_start + row_end,
+                );
+                let mut row_extents = measurements.advances(&row_text)?;
+                let mut boundary_x = grapheme_pixel_boundaries(&row_text, &row_extents);
+                while row_end > row_start + 1
+                    && boundary_x.last().copied().unwrap_or_default() > maximum_width_px
+                {
+                    row_end -= 1;
+                    row_text = logical_text_for_range(
+                        &graphemes,
+                        logical_start + row_start..logical_start + row_end,
+                    );
+                    row_extents = measurements.advances(&row_text)?;
+                    boundary_x = grapheme_pixel_boundaries(&row_text, &row_extents);
+                }
+                rows.push(MeasuredPaneTextRow {
+                    text: row_text,
+                    grapheme_range: logical_start + row_start..logical_start + row_end,
+                    boundary_x,
+                });
+                row_start = row_end;
+            }
+        }
+
+        if logical_end == graphemes.len() {
+            break;
+        }
+        logical_start = logical_end + 1;
+        if logical_start > graphemes.len() {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
+fn logical_text_for_range(graphemes: &[String], range: Range<usize>) -> String {
+    graphemes[range].concat()
+}
+
+fn scroll_view_range(total_rows: usize, visible_rows: usize, offset: usize) -> Range<usize> {
+    let start = offset.min(total_rows.saturating_sub(visible_rows));
+    start..start.saturating_add(visible_rows).min(total_rows)
+}
+
+fn append_scrolled_measured_rows(
+    layout: &mut CorrectionPaneLayout,
+    section: CorrectionPaneTextSection,
+    rows: &[MeasuredPaneTextRow],
+    visible_rows: usize,
+    offset: usize,
+) -> Range<usize> {
+    let visible_range = scroll_view_range(rows.len(), visible_rows, offset);
+    let row_start = layout.lines.len();
+    for row in visible_range.clone() {
+        append_pane_line(layout, rows[row].text.clone());
+    }
+    while layout.lines.len().saturating_sub(row_start) < visible_rows {
+        append_pane_line(layout, String::new());
+    }
+    let row_range = row_start..layout.lines.len();
+    layout.scroll_regions.push(CorrectionPaneScrollRegion {
+        section,
+        row_range: row_range.clone(),
+        total_rows: rows.len(),
+        visible_rows,
+    });
+    row_range
+}
+
+fn extent_at_utf16_boundary(extents: &[i32], utf16_boundary: usize) -> i32 {
+    if utf16_boundary == 0 {
+        0
+    } else {
+        extents
+            .get(utf16_boundary - 1)
+            .copied()
+            .unwrap_or_else(|| extents.last().copied().unwrap_or_default())
+    }
+}
+
+fn measured_editor_display_rows(
+    editor: &CorrectionTextEditor,
+    maximum_width_px: i32,
+    measurements: &mut GdiTextAdvanceCache,
+) -> io::Result<Vec<(String, Range<usize>, Vec<i32>)>> {
+    let marker_extents = measurements.advances("[]|")?;
+    let marker_reserve = marker_extents.last().copied().unwrap_or(0).max(1);
+    let text_rows = measured_pane_text_rows(
+        editor.text(),
+        maximum_width_px.saturating_sub(marker_reserve).max(1),
+        measurements,
+    )?;
+    let graphemes = editor.text().graphemes(true).collect::<Vec<_>>();
+    let selection = editor.selection_graphemes();
+    let cursor = editor.cursor_grapheme();
+    let mut output = Vec::with_capacity(text_rows.len());
+    for (row_index, row) in text_rows.iter().enumerate() {
+        let mut line = String::new();
+        let mut boundary_units = Vec::with_capacity(row.grapheme_range.len().saturating_add(1));
+        for index in row.grapheme_range.start..row.grapheme_range.end {
+            let is_wrapped_start = row_index > 0
+                && text_rows[row_index - 1].grapheme_range.end == row.grapheme_range.start
+                && index == row.grapheme_range.start;
+            boundary_units.push(line.encode_utf16().count());
+            if !is_wrapped_start {
+                append_editor_caret_marker(&mut line, selection.as_ref(), cursor, index);
+            }
+            line.push_str(&safe_pane_display_grapheme(graphemes[index]));
+        }
+        boundary_units.push(line.encode_utf16().count());
+        append_editor_caret_marker(
+            &mut line,
+            selection.as_ref(),
+            cursor,
+            row.grapheme_range.end,
+        );
+        let line_extents = measurements.advances(&line)?;
+        let boundary_x = boundary_units
+            .into_iter()
+            .map(|boundary| extent_at_utf16_boundary(&line_extents, boundary))
+            .collect();
+        output.push((line, row.grapheme_range.clone(), boundary_x));
+    }
+    Ok(output)
+}
+
+fn append_scrolled_editor_rows(
+    layout: &mut CorrectionPaneLayout,
+    rows: &[(String, Range<usize>, Vec<i32>)],
+    visible_rows: usize,
+    offset: usize,
+) -> Range<usize> {
+    let visible_range = scroll_view_range(rows.len(), visible_rows, offset);
+    let row_start = layout.lines.len();
+    for row_index in visible_range {
+        let (line, grapheme_range, boundary_x) = &rows[row_index];
+        append_pane_line(layout, line.clone());
+        layout.editor_grapheme_ranges.push(grapheme_range.clone());
+        layout.editor_row_hit_offsets.push(boundary_x.clone());
+    }
+    while layout.lines.len().saturating_sub(row_start) < visible_rows {
+        append_pane_line(layout, String::new());
+        layout.editor_grapheme_ranges.push(0..0);
+        layout.editor_row_hit_offsets.push(vec![0]);
+    }
+    let row_range = row_start..layout.lines.len();
+    layout.editor_rows = Some(row_range.clone());
+    layout.scroll_regions.push(CorrectionPaneScrollRegion {
+        section: CorrectionPaneTextSection::Draft,
+        row_range: row_range.clone(),
+        total_rows: rows.len(),
+        visible_rows,
+    });
+    row_range
+}
+
+fn inline_editor_cursor_at(
+    layout: &CorrectionPaneLayout,
+    field: InlineEditorField,
+    row: usize,
+    x_px: i32,
+) -> Option<usize> {
+    let inline = layout
+        .inline_editor_rows
+        .iter()
+        .find(|inline| inline.field == field && inline.row_index == row)?;
+    Some(
+        inline
+            .visible_graphemes
+            .start
+            .saturating_add(nearest_grapheme_boundary(&inline.boundary_x, x_px)),
+    )
+}
+
+fn pane_text_width(
+    text: &str,
+    measurements: &mut GdiTextAdvanceCache,
+) -> io::Result<i32> {
+    measurements.advances(text).map(|advances| {
+        advances
+            .last()
+            .copied()
+            .unwrap_or_default()
+    })
+}
+
+fn correction_action_hit_targets(
+    label: &str,
+    measurements: &mut GdiTextAdvanceCache,
+) -> io::Result<Vec<(Range<i32>, CorrectionPaneAction)>> {
+    let advances = measurements.advances(label)?;
+    let boundaries = grapheme_pixel_boundaries(label, &advances);
+    let graphemes = label.graphemes(true).collect::<Vec<_>>();
+    let labels = [
+        ("[Convert]", CorrectionPaneAction::Convert),
+        ("[Save]", CorrectionPaneAction::Save),
+        ("[Reset]", CorrectionPaneAction::Reset),
+        ("[Cancel]", CorrectionPaneAction::Cancel),
+        ("[Copy]", CorrectionPaneAction::Copy),
+    ];
+    let mut cursor = 0usize;
+    let mut targets = Vec::with_capacity(labels.len());
+    for (index, (button, action)) in labels.iter().enumerate() {
+        let start = cursor;
+        let end = start.saturating_add(button.graphemes(true).count());
+        if end > graphemes.len() || end >= boundaries.len() {
+            return Ok(Vec::new());
+        }
+        let hit_end = if index + 1 < labels.len() && graphemes.get(end) == Some(&" ") {
+            end + 1
+        } else {
+            end
+        };
+        targets.push((boundaries[start]..boundaries[hit_end], *action));
+        cursor = hit_end;
+    }
+    Ok(targets)
+}
+
+fn should_process_winit_mouse_input(
+    capture_mode: CaptureMode,
+    origin: MouseMessageOrigin,
+    has_active_canvas_pointer: bool,
+    has_pending_direct_action: bool,
+    targets_pane_action: bool,
+) -> bool {
+    // Unknown origin must remain a usable mouse event; only a confirmed pen
+    // promotion that overlaps Direct-owned input or a pane action is filtered.
+    capture_mode != CaptureMode::DirectWmPointer
+        || (match origin {
+            MouseMessageOrigin::PenPromoted { .. } => {
+                !has_active_canvas_pointer
+                    && !has_pending_direct_action
+                    && !targets_pane_action
+            }
+            MouseMessageOrigin::TouchPromoted { .. } | MouseMessageOrigin::Unknown => true,
+        })
+}
+
+fn move_text_editor_cursor(editor: &mut CorrectionTextEditor, right: bool, extend: bool) {
+    match (right, extend) {
+        (true, true) => editor.move_cursor_right_extending_selection(),
+        (false, true) => editor.move_cursor_left_extending_selection(),
+        (true, false) => editor.move_cursor_right(),
+        (false, false) => editor.move_cursor_left(),
+    }
+}
+
+fn append_editor_caret_marker(
+    line: &mut String,
+    selection: Option<&Range<usize>>,
+    cursor: usize,
+    index: usize,
+) {
+    if let Some(selection) = selection {
+        if selection.start == index {
+            line.push('[');
+        }
+        if selection.end == index {
+            line.push(']');
+        }
+    } else if cursor == index {
+        line.push('|');
+    }
+}
+
+fn inline_text_editor_line(
+    prefix: &str,
+    editor: &CorrectionTextEditor,
+    field: InlineEditorField,
+    maximum_width_px: i32,
+    measurements: &mut GdiTextAdvanceCache,
+) -> io::Result<(String, InlineEditorRowLayout)> {
+    let text = editor
+        .preview_text()
+        .unwrap_or_else(|_| "invalid draft".to_owned());
+    let graphemes = text
+        .graphemes(true)
+        .map(|grapheme| match grapheme {
+            "\n" | "\r\n" | "\r" => "↵".to_owned(),
+            _ if grapheme.chars().any(char::is_control) => "�".to_owned(),
+            _ => grapheme.to_owned(),
+        })
+        .collect::<Vec<_>>();
+    let selection = editor.selection_graphemes();
+    let cursor = editor.cursor_grapheme().min(graphemes.len());
+    let prefix_width = pane_text_width(prefix, measurements)?;
+    let marker_reserve = pane_text_width("[]|", measurements)?.max(1);
+    let ellipsis_width = pane_text_width("…", measurements)?;
+    let capacity = maximum_width_px
+        .saturating_sub(prefix_width)
+        .saturating_sub(marker_reserve)
+        .saturating_sub(ellipsis_width.saturating_mul(2))
+        .max(1);
+    let display_text = graphemes.concat();
+    let display_extents = measurements.advances(&display_text)?;
+    let display_boundaries = grapheme_pixel_boundaries(&display_text, &display_extents);
+    let mut start = cursor;
+    let before_capacity = capacity / 2;
+    while start > 0
+        && display_boundaries[cursor].saturating_sub(display_boundaries[start - 1])
+            <= before_capacity
+    {
+        start -= 1;
+    }
+    let mut end = cursor;
+    while end < graphemes.len()
+        && display_boundaries[end + 1].saturating_sub(display_boundaries[start]) <= capacity
+    {
+        end += 1;
+    }
+    if end == start && end < graphemes.len() {
+        end += 1;
+    }
+
+    let mut line = String::with_capacity(
+        prefix
+            .len()
+            .saturating_add(text.len())
+            .saturating_add(8),
+    );
+    let mut boundary_units = Vec::with_capacity(end.saturating_sub(start).saturating_add(1));
+    line.push_str(prefix);
+    if start > 0 {
+        line.push('…');
+    }
+    for index in start..end {
+        boundary_units.push(line.encode_utf16().count());
+        if let Some(selection) = &selection {
+            if selection.start == index {
+                line.push('[');
+            }
+            if selection.end == index {
+                line.push(']');
+            }
+        } else if cursor == index {
+            line.push('|');
+        }
+        line.push_str(&graphemes[index]);
+    }
+    boundary_units.push(line.encode_utf16().count());
+    if let Some(selection) = &selection {
+        if selection.start == end {
+            line.push('[');
+        }
+        if selection.end == end {
+            line.push(']');
+        }
+    } else if cursor == end {
+        line.push('|');
+    }
+    if end < graphemes.len() {
+        line.push('…');
+    }
+    let line_extents = measurements.advances(&line)?;
+    let boundary_x = boundary_units
+        .into_iter()
+        .map(|boundary| extent_at_utf16_boundary(&line_extents, boundary))
+        .collect();
+    Ok((
+        line,
+        InlineEditorRowLayout {
+            field,
+            row_index: 0,
+            visible_graphemes: start..end,
+            boundary_x,
+        },
+    ))
+}
+
+fn direct_screen_point_in_correction_pane(
+    screen_point: (i32, i32),
+    client_origin: CanvasOrigin,
+    client_size: (u32, u32),
+) -> bool {
+    let client_x = i64::from(screen_point.0) - client_origin.x_screen_px;
+    let client_y = i64::from(screen_point.1) - client_origin.y_screen_px;
+    let width = i64::from(client_size.0);
+    let height = i64::from(client_size.1);
+    correction_pane_contains_client_point(client_x, client_y, width, height)
+}
+
+fn correction_pane_left_edge(client_width: i64) -> i64 {
+    client_width
+        .saturating_sub(i64::from(CORRECTION_PANE_WIDTH_PX))
+        .max(0)
+}
+
+fn correction_pane_left_edge_i32(client_width: i32) -> i32 {
+    i32::try_from(correction_pane_left_edge(i64::from(client_width))).unwrap_or(0)
+}
+
+fn correction_pane_contains_client_point(
+    client_x: i64,
+    client_y: i64,
+    client_width: i64,
+    client_height: i64,
+) -> bool {
+    client_width > 0
+        && client_height > 0
+        && client_x >= correction_pane_left_edge(client_width)
+        && client_x < client_width
+        && client_y >= 0
+        && client_y < client_height
+}
+
+fn direct_pen_screen_point(
+    batch: &win32_pointer::DirectPenHistoryBatch,
+) -> Option<(i32, i32)> {
+    let first = batch.samples.first()?;
+    let device_handle = first.source_device_handle_raw_session_scoped;
+    if batch
+        .samples
+        .iter()
+        .any(|sample| sample.source_device_handle_raw_session_scoped != device_handle)
+    {
+        return None;
+    }
+    let pen_samples = batch.samples.iter().filter(|sample| {
+        sample.pointer_type_raw == windows_sys::Win32::UI::WindowsAndMessaging::PT_PEN
+            && sample.attribution
+                == win32_pointer::PointerAttribution::MatchesRequestedPointer
+            && sample.pointer_id_raw == batch.pointer_id_requested
+            && sample.source_device_handle_raw_session_scoped == device_handle
+    });
+    let sample = if batch.message_kind == PointerMessageKind::Up {
+        pen_samples.last()?
+    } else {
+        pen_samples.into_iter().next()?
+    };
+    Some((
+        sample.position.pt_pixel_location_raw.x,
+        sample.position.pt_pixel_location_raw.y,
+    ))
+}
+
+fn direct_pen_ui_screen_point(
+    batch: &win32_pointer::DirectPenHistoryBatch,
+) -> Option<(i32, i32)> {
+    let first = batch.samples.first()?;
+    let device_handle = first.source_device_handle_raw_session_scoped;
+    if batch
+        .samples
+        .iter()
+        .any(|sample| sample.source_device_handle_raw_session_scoped != device_handle)
+    {
+        return None;
+    }
+    let sample = batch.samples.iter().find(|sample| {
+        sample.pointer_type_raw == windows_sys::Win32::UI::WindowsAndMessaging::PT_PEN
+            && sample.source_device_handle_raw_session_scoped == device_handle
+    })?;
+    Some((
+        sample.position.pt_pixel_location_raw.x,
+        sample.position.pt_pixel_location_raw.y,
+    ))
+}
+
+fn direct_pen_down_starts_in_correction_pane(
+    batch: &win32_pointer::DirectPenHistoryBatch,
+    client_origin: Option<CanvasOrigin>,
+    client_size: Option<(u32, u32)>,
+) -> bool {
+    if batch.message_kind != PointerMessageKind::Down {
+        return false;
+    }
+    let (Some(origin), Some(size), Some(screen_point)) = (
+        client_origin,
+        client_size,
+        direct_pen_ui_screen_point(batch),
+    ) else {
+        return false;
+    };
+    direct_screen_point_in_correction_pane(screen_point, origin, size)
+}
+
+fn correction_pane_action_at_client_layout(
+    x: i32,
+    y: i32,
+    client_size: (u32, u32),
+    layout: &CorrectionPaneLayout,
+) -> Option<CorrectionPaneAction> {
+    let width = i32::try_from(client_size.0).unwrap_or(i32::MAX);
+    let height = i32::try_from(client_size.1).unwrap_or(i32::MAX);
+    if !correction_pane_contains_client_point(
+        i64::from(x),
+        i64::from(y),
+        i64::from(width),
+        i64::from(height),
+    ) {
+        return None;
+    }
+    let pane_left = correction_pane_left_edge_i32(width);
+    let row = usize::try_from(
+        y.saturating_sub(CORRECTION_PANE_PADDING_PX) / CORRECTION_PANE_ROW_HEIGHT_PX,
+    )
+    .ok()?;
+    if layout.action_row == Some(row) {
+        let action_offset = x
+            .saturating_sub(pane_left)
+            .saturating_sub(CORRECTION_PANE_PADDING_PX);
+        return layout
+            .action_hit_targets
+            .iter()
+            .find(|(target, _)| target.contains(&action_offset))
+            .map(|(_, action)| *action);
+    }
+    if layout.load_config_row == Some(row) {
+        return Some(CorrectionPaneAction::LoadProviderConfig);
+    }
+    None
+}
+
+fn correction_pane_action_at_screen_layout(
+    screen_point: (i32, i32),
+    client_origin: Option<CanvasOrigin>,
+    client_size: Option<(u32, u32)>,
+    layout: Option<&CorrectionPaneLayout>,
+) -> Option<CorrectionPaneAction> {
+    let (origin, client_size, layout) = (client_origin?, client_size?, layout?);
+    let x = i64::from(screen_point.0).checked_sub(origin.x_screen_px)?;
+    let y = i64::from(screen_point.1).checked_sub(origin.y_screen_px)?;
+    correction_pane_action_at_client_layout(
+        i32::try_from(x).ok()?,
+        i32::try_from(y).ok()?,
+        client_size,
+        layout,
+    )
+}
+
+fn route_direct_batch_to_correction_ui(
+    owners: &mut DirectUiPointerOwnerTracker,
+    batch: &win32_pointer::DirectPenHistoryBatch,
+    client_origin: Option<CanvasOrigin>,
+    client_size: Option<(u32, u32)>,
+    pane_layout: Option<&CorrectionPaneLayout>,
+) -> (DirectUiPointerRoute, Option<CorrectionPaneAction>) {
+    match batch.message_kind {
+        PointerMessageKind::Down => {
+            let Some(first) = batch.samples.first() else {
+                return (DirectUiPointerRoute::Canvas, None);
+            };
+            let starts_in_ui = direct_pen_down_starts_in_correction_pane(
+                batch,
+                client_origin,
+                client_size,
+            );
+            let action = direct_pen_screen_point(batch).and_then(|point| {
+                correction_pane_action_at_screen_layout(
+                    point,
+                    client_origin,
+                    client_size,
+                    pane_layout,
+                )
+            });
+            (
+                owners.route_down(
+                    (
+                        first.source_device_handle_raw_session_scoped,
+                        batch.pointer_id_requested,
+                    ),
+                    starts_in_ui,
+                    action,
+                ),
+                None,
+            )
+        }
+        PointerMessageKind::Update | PointerMessageKind::Up => {
+            let Some(first) = batch.samples.first() else {
+                if batch.message_kind == PointerMessageKind::Up {
+                    return (
+                        owners.release_pointer_id(batch.pointer_id_requested),
+                        None,
+                    );
+                }
+                return (DirectUiPointerRoute::Canvas, None);
+            };
+            let action_at_release = if batch.message_kind == PointerMessageKind::Up {
+                direct_pen_screen_point(batch).and_then(|point| {
+                    correction_pane_action_at_screen_layout(
+                        point,
+                        client_origin,
+                        client_size,
+                        pane_layout,
+                    )
+                })
+            } else {
+                None
+            };
+            owners.route_continuation(
+                (
+                    first.source_device_handle_raw_session_scoped,
+                    batch.pointer_id_requested,
+                ),
+                batch.message_kind,
+                action_at_release,
+            )
+        }
+    }
+}
+
+fn nearest_grapheme_boundary(boundary_x: &[i32], x_px: i32) -> usize {
+    if boundary_x.len() <= 1 {
+        return 0;
+    }
+    boundary_x
+        .windows(2)
+        .position(|pair| x_px < pair[0].saturating_add(pair[1].saturating_sub(pair[0]) / 2))
+        .unwrap_or(boundary_x.len() - 1)
+}
+
+fn correction_pane_scroll_offset(current: usize, wheel_rows: f64, maximum: usize) -> usize {
+    let current = current.min(maximum);
+    if !wheel_rows.is_finite() || wheel_rows == 0.0 {
+        return current;
+    }
+    let rows = wheel_rows.abs().ceil().max(1.0) as usize;
+    if wheel_rows > 0.0 {
+        current.saturating_sub(rows)
+    } else {
+        current.saturating_add(rows).min(maximum)
+    }
+}
+
+fn correction_editor_scroll_offset_for_caret(
+    current: usize,
+    caret_row: usize,
+    total_rows: usize,
+    visible_rows: usize,
+) -> usize {
+    let maximum = total_rows.saturating_sub(visible_rows);
+    let current = current.min(maximum);
+    if caret_row < current {
+        caret_row.min(maximum)
+    } else if caret_row >= current.saturating_add(visible_rows) {
+        caret_row
+            .saturating_add(1)
+            .saturating_sub(visible_rows)
+            .min(maximum)
+    } else {
+        current
+    }
+}
+
+fn correction_pane_visible_row_count(client_height: u32) -> usize {
+    let height = i32::try_from(client_height).unwrap_or(i32::MAX);
+    usize::try_from(
+        (height - 2 * CORRECTION_PANE_PADDING_PX).max(0) / CORRECTION_PANE_ROW_HEIGHT_PX,
+    )
+    .unwrap_or_default()
+}
+
+fn is_control_alt_shortcut(control: bool, alt: bool, alt_graph: bool) -> bool {
+    control && alt && !alt_graph
+}
+
+fn allows_keyboard_text(control: bool, alt: bool, alt_graph: bool) -> bool {
+    alt_graph || (!control && !alt)
+}
+
+fn should_insert_keyboard_text(
+    control: bool,
+    alt: bool,
+    alt_graph: bool,
+    ime_preedit_active: bool,
+    has_text: bool,
+) -> bool {
+    allows_keyboard_text(control, alt, alt_graph) && !ime_preedit_active && has_text
+}
+
+fn should_process_focused_text_key(
+    state: ElementState,
+    _repeat: bool,
+) -> bool {
+    // Repeated Windows KeyEvents can carry printable text and editing keys should repeat.
+    state == ElementState::Pressed
+}
+
+fn focused_text_measurement_allows_input(
+    focus: CorrectionPaneFocus,
+    measurement_available: bool,
+) -> bool {
+    !focus.is_text_field() || measurement_available
 }
 
 fn convert_context_matches(
@@ -426,6 +1522,17 @@ impl ProbeApp {
             self.request_redraw();
             return;
         }
+        if self.pending_correction.is_some()
+            || self
+                .correction_session
+                .as_ref()
+                .is_some_and(CorrectionSession::is_dirty)
+        {
+            self.canvas_status =
+                "Save or cancel the open correction draft before starting another Convert".to_owned();
+            self.request_redraw();
+            return;
+        }
         if self.project_incomplete_reason.is_some()
             || self.deferred_capture_batch.is_some()
             || self.canvas_scene.has_preview_strokes()
@@ -452,16 +1559,6 @@ impl ProbeApp {
                 return;
             }
         };
-        if self
-            .project_writer
-            .as_ref()
-            .is_none_or(|writer| !writer.is_idle())
-        {
-            self.canvas_status =
-                "Convert waits for all accepted project writes to be acknowledged".to_owned();
-            self.request_redraw();
-            return;
-        }
         let generation = self.next_convert_generation;
         let Some(next_generation) = generation.checked_add(1) else {
             self.canvas_status = "Convert request identifier exhausted".to_owned();
@@ -475,32 +1572,37 @@ impl ProbeApp {
             return;
         };
         let line_id = "line-1".to_owned();
+        let mut pending = PendingConvert {
+            generation,
+            project_generation: self.project_generation,
+            view_generation: self.convert_view_generation,
+            cancelled: false,
+            selected_strokes_in_ui_order: selected_strokes,
+            line_id,
+            request: None,
+            ink_binding: None,
+            generated_raster: None,
+            phase: PendingConvertPhase::Transitioning,
+        };
         let result = self
             .project_writer
             .as_mut()
-            .expect("project writer checked above")
-            .try_snapshot_for_convert(batch_id);
+            .map(|writer| writer.try_snapshot_for_convert(batch_id));
         match result {
-            Ok(()) => {
-                self.pending_convert = Some(PendingConvert {
-                    generation,
-                    project_generation: self.project_generation,
-                    view_generation: self.convert_view_generation,
-                    cancelled: false,
-                    selected_strokes_in_ui_order: selected_strokes,
-                    line_id,
-                    request: None,
-                    ink_binding: None,
-                    generated_raster: None,
-                    phase: PendingConvertPhase::SnapshotForPreparation { batch_id },
-                });
+            Some(Ok(())) => {
+                pending.phase = PendingConvertPhase::SnapshotForPreparation { batch_id };
+                self.pending_convert = Some(pending);
                 self.canvas_status =
-                    "Convert queued: freezing the durable selected region".to_owned();
+                    "Convert queued after accepted project writes; freezing the durable region".to_owned();
             }
-            Err(ProjectQueueError::QueueFull | ProjectQueueError::Backpressure { .. }) => {
-                self.canvas_status = "Convert was not queued: project writer is busy".to_owned();
+            Some(Err(ProjectQueueError::QueueFull | ProjectQueueError::Backpressure { .. })) => {
+                pending.phase = PendingConvertPhase::QueueSnapshotForPreparation { batch_id };
+                self.pending_convert = Some(pending);
+                self.canvas_status =
+                    "Convert intent retained; waiting for project writer capacity".to_owned();
             }
-            Err(ProjectQueueError::WorkerStopped | ProjectQueueError::Stopped { .. }) => {
+            Some(Err(ProjectQueueError::WorkerStopped | ProjectQueueError::Stopped { .. }))
+            | None => {
                 self.canvas_status = "Convert unavailable: project writer stopped".to_owned();
             }
         }
@@ -568,6 +1670,1687 @@ impl ProbeApp {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
+    }
+
+    fn correction_pane_text_width_px(&self) -> i32 {
+        let client_width = self
+            .client_size
+            .map_or(i64::from(CORRECTION_PANE_WIDTH_PX), |(width, _)| i64::from(width));
+        let pane_width = client_width
+            .min(i64::from(CORRECTION_PANE_WIDTH_PX))
+            .max(0);
+        i32::try_from(
+            pane_width.saturating_sub(i64::from(CORRECTION_PANE_PADDING_PX.saturating_mul(2))),
+        )
+        .unwrap_or(1)
+        .max(1)
+    }
+
+    fn refresh_pane_text_measurement_target(&mut self) -> io::Result<()> {
+        let hwnd = match self.window.as_ref() {
+            None => None,
+            Some(window) => {
+                let hwnd = raw_window_hwnd(window).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "pane text measurement could not resolve the live window HWND",
+                    )
+                })?;
+                if hwnd == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "pane text measurement rejects a null live window HWND",
+                    ));
+                }
+                Some(hwnd)
+            }
+        };
+        self.pane_text_measurements.set_hwnd(hwnd);
+        Ok(())
+    }
+
+    fn correction_pane_layout(&mut self) -> io::Result<CorrectionPaneLayout> {
+        self.refresh_pane_text_measurement_target()?;
+        let text_width = self.correction_pane_text_width_px();
+        let mut layout = CorrectionPaneLayout {
+            lines: Vec::new(),
+            editor_rows: None,
+            editor_grapheme_ranges: Vec::new(),
+            editor_row_hit_offsets: Vec::new(),
+            action_row: None,
+            action_hit_targets: Vec::new(),
+            scroll_regions: Vec::new(),
+            inline_editor_rows: Vec::new(),
+            provider_path_row: None,
+            provider_id_row: None,
+            load_config_row: None,
+            export_path_row: None,
+        };
+        append_pane_line(&mut layout, "RESULT / CORRECTION".to_owned());
+        append_pane_line(&mut layout, "Wheel over text to scroll.");
+        let status_rows = measured_pane_text_rows(
+            &self.correction_panel_status,
+            text_width,
+            &mut self.pane_text_measurements,
+        )?;
+        append_scrolled_measured_rows(
+            &mut layout,
+            CorrectionPaneTextSection::Status,
+            &status_rows,
+            2,
+            self.correction_pane_scroll.status,
+        );
+        if let Some(session) = self.correction_session.as_ref() {
+            let projection = session.projection();
+            let candidate = session.candidates().iter().find(|candidate| candidate.rank == 0);
+            let native_score = candidate
+                .and_then(|candidate| candidate.native_score_raw.as_deref())
+                .unwrap_or("unavailable");
+            append_pane_line(&mut layout, "Provider details:".to_owned());
+            let provider_details = format!(
+                "Provider: {}\nProvider version: {}\nModel version: {}\nResource version: {}\nNative score: {} (uncalibrated)",
+                projection.provider.provider_id,
+                projection.provider.provider_version,
+                projection.provider.model_version.as_deref().unwrap_or("unavailable"),
+                projection.provider.resource_version.as_deref().unwrap_or("unavailable"),
+                native_score,
+            );
+            let provider_detail_rows = measured_pane_text_rows(
+                &provider_details,
+                text_width,
+                &mut self.pane_text_measurements,
+            )?;
+            append_scrolled_measured_rows(
+                &mut layout,
+                CorrectionPaneTextSection::ProviderDetails,
+                &provider_detail_rows,
+                4,
+                self.correction_pane_scroll.provider_details,
+            );
+            append_pane_line(&mut layout, "Provider output (immutable):".to_owned());
+            append_pane_line(&mut layout, "rank 0:".to_owned());
+            let recognized_text = candidate.map_or("unavailable", |candidate| {
+                candidate.recognized_text.as_str()
+            });
+            let wrapped = measured_pane_text_rows(
+                recognized_text,
+                text_width,
+                &mut self.pane_text_measurements,
+            )?;
+            append_scrolled_measured_rows(
+                &mut layout,
+                CorrectionPaneTextSection::ProviderOutput,
+                &wrapped,
+                3,
+                self.correction_pane_scroll.provider_output,
+            );
+
+            append_pane_line(
+                &mut layout,
+                format!(
+                    "Corrections: {}; latest saved:",
+                    session.correction_history().len()
+                ),
+            );
+            let saved_text = match session.latest_saved_action() {
+                Some(RegionCorrectionActionV1::SetText(text)) if text.is_empty() => {
+                    "<empty>".to_owned()
+                }
+                Some(RegionCorrectionActionV1::SetText(text)) => text.clone(),
+                Some(RegionCorrectionActionV1::Reset) => "Reset to provider output".to_owned(),
+                None => "none".to_owned(),
+            };
+            let saved_rows = measured_pane_text_rows(
+                &saved_text,
+                text_width,
+                &mut self.pane_text_measurements,
+            )?;
+            append_scrolled_measured_rows(
+                &mut layout,
+                CorrectionPaneTextSection::SavedText,
+                &saved_rows,
+                2,
+                self.correction_pane_scroll.saved_text,
+            );
+            append_pane_line(&mut layout, "Effective text:".to_owned());
+            let effective = session.effective_text().unwrap_or("unavailable");
+            let effective_rows = measured_pane_text_rows(
+                effective,
+                text_width,
+                &mut self.pane_text_measurements,
+            )?;
+            append_scrolled_measured_rows(
+                &mut layout,
+                CorrectionPaneTextSection::EffectiveText,
+                &effective_rows,
+                2,
+                self.correction_pane_scroll.effective_text,
+            );
+            append_pane_line(
+                &mut layout,
+                if self.pending_correction.is_some() {
+                    "Draft (save pending; editing paused):".to_owned()
+                } else {
+                    "Draft (click to edit):".to_owned()
+                },
+            );
+            let editor_rows = measured_editor_display_rows(
+                session.editor(),
+                text_width,
+                &mut self.pane_text_measurements,
+            )?;
+            append_scrolled_editor_rows(
+                &mut layout,
+                &editor_rows,
+                CORRECTION_PANE_MAX_EDITOR_ROWS,
+                self.correction_pane_scroll.draft,
+            );
+            if session.editor().has_preedit()
+                && let Ok(preview) = session.ime_preview_text()
+            {
+                append_pane_line(&mut layout, "IME composition preview (not saved):".to_owned());
+                let preview_rows = measured_pane_text_rows(
+                    &preview,
+                    text_width,
+                    &mut self.pane_text_measurements,
+                )?;
+                append_scrolled_measured_rows(
+                    &mut layout,
+                    CorrectionPaneTextSection::ImePreview,
+                    &preview_rows,
+                    2,
+                    self.correction_pane_scroll.ime_preview,
+                );
+            }
+        } else {
+            append_pane_line(&mut layout, "No stored projection is open.".to_owned());
+            append_pane_line(&mut layout, "Select committed ink and press F4 to convert.".to_owned());
+            append_pane_line(&mut layout, "Provider output and corrections appear here.".to_owned());
+        }
+        let action_label = "[Convert] [Save] [Reset] [Cancel] [Copy]";
+        let action_row = append_pane_line(&mut layout, action_label.to_owned());
+        layout.action_row = Some(action_row);
+        layout.action_hit_targets = correction_action_hit_targets(
+            action_label,
+            &mut self.pane_text_measurements,
+        )?;
+
+        append_pane_line(&mut layout, "Local provider setup (in memory only):".to_owned());
+        let (provider_path_line, mut provider_path_layout) = inline_text_editor_line(
+            "Config path: ",
+            &self.provider_config_path_editor,
+            InlineEditorField::ProviderConfigPath,
+            text_width,
+            &mut self.pane_text_measurements,
+        )?;
+        let provider_path_row = append_pane_line(&mut layout, provider_path_line);
+        provider_path_layout.row_index = provider_path_row;
+        layout.provider_path_row = Some(provider_path_row);
+        layout.inline_editor_rows.push(provider_path_layout);
+        let (provider_id_line, mut provider_id_layout) = inline_text_editor_line(
+            "Provider ID: ",
+            &self.provider_id_editor,
+            InlineEditorField::ProviderId,
+            text_width,
+            &mut self.pane_text_measurements,
+        )?;
+        let provider_id_row = append_pane_line(&mut layout, provider_id_line);
+        provider_id_layout.row_index = provider_id_row;
+        layout.provider_id_row = Some(provider_id_row);
+        layout.inline_editor_rows.push(provider_id_layout);
+        layout.load_config_row = Some(append_pane_line(
+            &mut layout,
+            if self.local_convert_provider.is_some() {
+                "[Load config] loaded".to_owned()
+            } else {
+                "[Load config] click to load".to_owned()
+            },
+        ));
+        let (export_path_line, mut export_path_layout) = inline_text_editor_line(
+            "Export path: ",
+            &self.export_path_editor,
+            InlineEditorField::ExportPath,
+            text_width,
+            &mut self.pane_text_measurements,
+        )?;
+        let export_path_row = append_pane_line(&mut layout, export_path_line);
+        export_path_layout.row_index = export_path_row;
+        layout.export_path_row = Some(export_path_row);
+        layout.inline_editor_rows.push(export_path_layout);
+        append_pane_line(&mut layout, "Export is not implemented.".to_owned());
+        Ok(layout)
+    }
+
+    fn winit_mouse_input_targets_pane_action(
+        &mut self,
+        button: MouseButton,
+        state: ElementState,
+    ) -> bool {
+        if button != MouseButton::Left || state != ElementState::Pressed {
+            return false;
+        }
+        let (Some(cursor), Some((width, height))) = (self.canvas_cursor_client, self.client_size)
+        else {
+            return false;
+        };
+        let client_width = i32::try_from(width).unwrap_or(i32::MAX);
+        let client_height = i32::try_from(height).unwrap_or(i32::MAX);
+        let x = cursor.0.floor() as i32;
+        let y = cursor.1.floor() as i32;
+        if !correction_pane_contains_client_point(
+            i64::from(x),
+            i64::from(y),
+            i64::from(client_width),
+            i64::from(client_height),
+        ) {
+            return false;
+        }
+        let row = usize::try_from(
+            y.saturating_sub(CORRECTION_PANE_PADDING_PX) / CORRECTION_PANE_ROW_HEIGHT_PX,
+        )
+        .unwrap_or(usize::MAX);
+        match self.correction_pane_layout() {
+            Ok(layout) => {
+                layout.action_row == Some(row) || layout.load_config_row == Some(row)
+            }
+            Err(_) => true,
+        }
+    }
+
+    fn handle_correction_pane_wheel(&mut self, delta: &MouseScrollDelta) -> bool {
+        let (Some(cursor), Some((width, height))) = (self.canvas_cursor_client, self.client_size)
+        else {
+            return false;
+        };
+        let client_width = i32::try_from(width).unwrap_or(i32::MAX);
+        let client_height = i32::try_from(height).unwrap_or(i32::MAX);
+        let x = cursor.0.floor() as i32;
+        let y = cursor.1.floor() as i32;
+        if !correction_pane_contains_client_point(
+            i64::from(x),
+            i64::from(y),
+            i64::from(client_width),
+            i64::from(client_height),
+        ) {
+            return false;
+        }
+
+        let row = usize::try_from(
+            y.saturating_sub(CORRECTION_PANE_PADDING_PX) / CORRECTION_PANE_ROW_HEIGHT_PX,
+        )
+        .unwrap_or(usize::MAX);
+        let layout = match self.correction_pane_layout() {
+            Ok(layout) => layout,
+            Err(_) => {
+                self.correction_panel_status =
+                    "Text measurement is unavailable; pane scrolling is paused.".to_owned();
+                self.request_redraw();
+                return true;
+            }
+        };
+        let Some(region) = layout
+            .scroll_regions
+            .iter()
+            .find(|region| region.row_range.contains(&row))
+        else {
+            return true;
+        };
+        let section = region.section;
+        let total_rows = region.total_rows;
+        let visible_rows = region.visible_rows;
+        let wheel_rows = match delta {
+            MouseScrollDelta::LineDelta(_, vertical) => f64::from(*vertical),
+            MouseScrollDelta::PixelDelta(position) => {
+                position.y / f64::from(CORRECTION_PANE_ROW_HEIGHT_PX)
+            }
+        };
+        let maximum = total_rows.saturating_sub(visible_rows);
+        let current = self.correction_pane_scroll.get(section);
+        let mut next = correction_pane_scroll_offset(current, wheel_rows, maximum);
+        if section == CorrectionPaneTextSection::Draft
+            && self.correction_focus == CorrectionPaneFocus::CorrectionEditor
+        {
+            let Some(session) = self.correction_session.as_ref() else {
+                return true;
+            };
+            let cursor = session.editor().cursor_grapheme();
+            let rows = match measured_editor_display_rows(
+                session.editor(),
+                self.correction_pane_text_width_px(),
+                &mut self.pane_text_measurements,
+            ) {
+                Ok(rows) => rows,
+                Err(_) => {
+                    self.correction_panel_status =
+                        "Text measurement is unavailable; pane scrolling is paused.".to_owned();
+                    self.request_redraw();
+                    return true;
+                }
+            };
+            let caret_row = rows
+                .iter()
+                .position(|(_, range, _)| cursor >= range.start && cursor <= range.end)
+                .unwrap_or_else(|| rows.len().saturating_sub(1));
+            if self.focused_ime_preedit_active() {
+                let first_offset = caret_row.saturating_sub(visible_rows.saturating_sub(1));
+                next = next.clamp(first_offset, caret_row.min(maximum));
+            } else {
+                let caret_visible = caret_row >= next
+                    && caret_row < next.saturating_add(visible_rows);
+                if !caret_visible {
+                    self.correction_editor_browse_mode = true;
+                    if let Some(window) = self.window.as_ref() {
+                        window.set_ime_allowed(false);
+                    }
+                } else if self.correction_editor_browse_mode {
+                    self.correction_editor_browse_mode = false;
+                    if let Some(window) = self.window.as_ref() {
+                        window.set_ime_allowed(true);
+                    }
+                }
+            }
+        }
+        if next != current {
+            self.correction_pane_scroll.set(section, next);
+            self.request_redraw();
+        }
+        if section == CorrectionPaneTextSection::Draft
+            && self.correction_focus == CorrectionPaneFocus::CorrectionEditor
+            && !self.correction_editor_browse_mode
+        {
+            self.update_ime_cursor_area();
+        }
+        true
+    }
+
+    fn focused_text(&self) -> Option<&str> {
+        match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor => self
+                .correction_session
+                .as_ref()
+                .map(|session| session.editor().text()),
+            CorrectionPaneFocus::ProviderConfigPath => {
+                Some(self.provider_config_path_editor.text())
+            }
+            CorrectionPaneFocus::ProviderId => Some(self.provider_id_editor.text()),
+            CorrectionPaneFocus::ExportPath => Some(self.export_path_editor.text()),
+            CorrectionPaneFocus::None => None,
+        }
+    }
+
+    fn focused_selected_text(&self) -> Option<&str> {
+        match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor => self
+                .correction_session
+                .as_ref()
+                .and_then(CorrectionSession::selected_text),
+            CorrectionPaneFocus::ProviderConfigPath => {
+                self.provider_config_path_editor.selected_text()
+            }
+            CorrectionPaneFocus::ProviderId => self.provider_id_editor.selected_text(),
+            CorrectionPaneFocus::ExportPath => self.export_path_editor.selected_text(),
+            CorrectionPaneFocus::None => None,
+        }
+    }
+
+    fn focused_ime_preedit_active(&self) -> bool {
+        match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor => self
+                .correction_session
+                .as_ref()
+                .is_some_and(|session| session.editor().has_preedit()),
+            CorrectionPaneFocus::ProviderConfigPath => {
+                self.provider_config_path_editor.has_preedit()
+            }
+            CorrectionPaneFocus::ProviderId => self.provider_id_editor.has_preedit(),
+            CorrectionPaneFocus::ExportPath => self.export_path_editor.has_preedit(),
+            CorrectionPaneFocus::None => false,
+        }
+    }
+
+    fn provider_setup_fields_locked(&self) -> bool {
+        self.pending_convert.is_some() || self.provider_worker.is_some()
+    }
+
+    fn set_correction_focus(&mut self, focus: CorrectionPaneFocus) {
+        if focus != CorrectionPaneFocus::CorrectionEditor {
+            self.correction_editor_browse_mode = false;
+        }
+        if self.correction_focus != focus {
+            match self.correction_focus {
+                CorrectionPaneFocus::CorrectionEditor => {
+                    if let Some(session) = self.correction_session.as_mut() {
+                        session.cancel_ime_preedit();
+                    }
+                }
+                CorrectionPaneFocus::ProviderConfigPath => {
+                    self.provider_config_path_editor.cancel_preedit();
+                }
+                CorrectionPaneFocus::ProviderId => self.provider_id_editor.cancel_preedit(),
+                CorrectionPaneFocus::ExportPath => self.export_path_editor.cancel_preedit(),
+                CorrectionPaneFocus::None => {}
+            }
+        }
+        if focus == CorrectionPaneFocus::CorrectionEditor {
+            if self.correction_session.is_none() {
+                self.correction_panel_status = "There is no stored projection to edit.".to_owned();
+                self.request_redraw();
+                return;
+            }
+            if self.pending_correction.is_some() {
+                self.correction_panel_status =
+                    "Editing is paused until the pending save is acknowledged.".to_owned();
+                self.request_redraw();
+                return;
+            }
+            if let Some(session) = self.correction_session.as_mut()
+                && session.prepare_editor_for_edit().is_err()
+            {
+                self.correction_panel_status =
+                    "The stored correction text could not be opened for editing.".to_owned();
+                self.request_redraw();
+                return;
+            }
+        }
+        self.correction_focus = focus;
+        if let Some(window) = self.window.as_ref() {
+            window.set_ime_allowed(focus.is_text_field());
+            if focus.is_text_field() {
+                self.update_ime_cursor_area();
+            }
+            window.request_redraw();
+        }
+    }
+
+    fn ensure_correction_editor_caret_visible(&mut self) -> io::Result<()> {
+        if self.correction_focus != CorrectionPaneFocus::CorrectionEditor {
+            return Ok(());
+        }
+        self.refresh_pane_text_measurement_target()?;
+        let Some(session) = self.correction_session.as_ref() else {
+            return Ok(());
+        };
+        let rows = measured_editor_display_rows(
+            session.editor(),
+            self.correction_pane_text_width_px(),
+            &mut self.pane_text_measurements,
+        )?;
+        let cursor = session.editor().cursor_grapheme();
+        let caret_row = rows
+            .iter()
+            .position(|(_, range, _)| cursor >= range.start && cursor <= range.end)
+            .unwrap_or_else(|| rows.len().saturating_sub(1));
+        self.correction_pane_scroll.draft = correction_editor_scroll_offset_for_caret(
+            self.correction_pane_scroll.draft,
+            caret_row,
+            rows.len(),
+            CORRECTION_PANE_MAX_EDITOR_ROWS,
+        );
+        if self.correction_editor_browse_mode {
+            self.correction_editor_browse_mode = false;
+            if let Some(window) = self.window.as_ref() {
+                window.set_ime_allowed(true);
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_focused_text_layout(&mut self) -> io::Result<()> {
+        let focus = self.correction_focus;
+        self.correction_pane_layout()?;
+        if focus == CorrectionPaneFocus::CorrectionEditor {
+            self.ensure_correction_editor_caret_visible()?;
+        }
+        Ok(())
+    }
+
+    fn prepare_focused_text_input(&mut self) -> bool {
+        let measurement_available = self.ensure_focused_text_layout().is_ok();
+        if focused_text_measurement_allows_input(self.correction_focus, measurement_available) {
+            return true;
+        }
+        self.correction_panel_status =
+            "Text measurement is unavailable; focused text input is paused.".to_owned();
+        if let Some(window) = self.window.as_ref() {
+            window.set_ime_allowed(false);
+        }
+        self.request_redraw();
+        false
+    }
+
+    fn update_ime_cursor_area(&mut self) {
+        if self.correction_focus == CorrectionPaneFocus::CorrectionEditor
+            && self.correction_editor_browse_mode
+        {
+            return;
+        }
+        if self.correction_focus == CorrectionPaneFocus::CorrectionEditor
+            && self.ensure_correction_editor_caret_visible().is_err()
+        {
+            if let Some(window) = self.window.as_ref() {
+                window.set_ime_allowed(false);
+            }
+            return;
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.set_ime_allowed(false);
+        }
+        let Some((width, _)) = self.client_size else {
+            return;
+        };
+        let Ok(layout) = self.correction_pane_layout() else {
+            return;
+        };
+        let (row, x_offset) = match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor => {
+                let cursor = self
+                    .correction_session
+                    .as_ref()
+                    .map_or(0, |session| session.editor().cursor_grapheme());
+                let Some(editor_rows) = layout.editor_rows.as_ref() else {
+                    return;
+                };
+                let row_index = layout
+                    .editor_grapheme_ranges
+                    .iter()
+                    .position(|range| cursor >= range.start && cursor <= range.end);
+                let Some(row_index) = row_index else {
+                    return;
+                };
+                let range = &layout.editor_grapheme_ranges[row_index];
+                let boundary = cursor
+                    .saturating_sub(range.start)
+                    .min(range.end.saturating_sub(range.start));
+                let Some(x) = layout.editor_row_hit_offsets[row_index].get(boundary).copied() else {
+                    return;
+                };
+                (editor_rows.start.saturating_add(row_index), x)
+            }
+            focus @ (CorrectionPaneFocus::ProviderConfigPath
+            | CorrectionPaneFocus::ProviderId
+            | CorrectionPaneFocus::ExportPath) => {
+                let (field, cursor) = match focus {
+                    CorrectionPaneFocus::ProviderConfigPath => (
+                        InlineEditorField::ProviderConfigPath,
+                        self.provider_config_path_editor.cursor_grapheme(),
+                    ),
+                    CorrectionPaneFocus::ProviderId => (
+                        InlineEditorField::ProviderId,
+                        self.provider_id_editor.cursor_grapheme(),
+                    ),
+                    CorrectionPaneFocus::ExportPath => (
+                        InlineEditorField::ExportPath,
+                        self.export_path_editor.cursor_grapheme(),
+                    ),
+                    _ => return,
+                };
+                let Some(inline) = layout
+                    .inline_editor_rows
+                    .iter()
+                    .find(|inline| inline.field == field)
+                else {
+                    return;
+                };
+                let boundary = cursor
+                    .saturating_sub(inline.visible_graphemes.start)
+                    .min(inline.visible_graphemes.end.saturating_sub(inline.visible_graphemes.start));
+                let Some(x) = inline.boundary_x.get(boundary).copied() else {
+                    return;
+                };
+                (inline.row_index, x)
+            }
+            CorrectionPaneFocus::None => return,
+        };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let client_width = i32::try_from(width).unwrap_or(i32::MAX);
+        let pane_left = correction_pane_left_edge_i32(client_width);
+        let x = pane_left
+            .saturating_add(CORRECTION_PANE_PADDING_PX)
+            .saturating_add(x_offset)
+            .clamp(0, client_width.saturating_sub(1).max(0));
+        let y = CORRECTION_PANE_PADDING_PX.saturating_add(
+            i32::try_from(row)
+                .unwrap_or(i32::MAX)
+                .saturating_mul(CORRECTION_PANE_ROW_HEIGHT_PX),
+        );
+        window.set_ime_allowed(true);
+        window.set_ime_cursor_area(
+            PhysicalPosition::new(x, y),
+            PhysicalSize::new(1, u32::try_from(CORRECTION_PANE_ROW_HEIGHT_PX).unwrap_or(1)),
+        );
+    }
+
+    fn focused_insert_text(&mut self, text: &str) {
+        if self.correction_focus.is_text_field() && !self.prepare_focused_text_input() {
+            return;
+        }
+        if matches!(
+            self.correction_focus,
+            CorrectionPaneFocus::ProviderConfigPath | CorrectionPaneFocus::ProviderId
+        ) && self.provider_setup_fields_locked()
+        {
+            self.correction_panel_status =
+                "Provider configuration is locked while Convert is active.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        let result = match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor => {
+                if self.pending_correction.is_some() {
+                    return;
+                }
+                self.correction_session
+                    .as_mut()
+                    .map(|session| session.insert_text(text))
+            }
+            CorrectionPaneFocus::ProviderConfigPath => {
+                Some(self.provider_config_path_editor.insert_text(text))
+            }
+            CorrectionPaneFocus::ProviderId => Some(self.provider_id_editor.insert_text(text)),
+            CorrectionPaneFocus::ExportPath => Some(self.export_path_editor.insert_text(text)),
+            CorrectionPaneFocus::None => None,
+        };
+        self.note_editor_result(result);
+    }
+
+    fn focused_insert_newline(&mut self) {
+        if matches!(
+            self.correction_focus,
+            CorrectionPaneFocus::ProviderConfigPath | CorrectionPaneFocus::ProviderId
+        ) && self.provider_setup_fields_locked()
+        {
+            self.correction_panel_status =
+                "Provider configuration is locked while Convert is active.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor if self.pending_correction.is_none() => {
+                let result = self
+                    .correction_session
+                    .as_mut()
+                    .map(|session| session.insert_newline());
+                self.note_editor_result(result);
+            }
+            CorrectionPaneFocus::ProviderConfigPath => {
+                let result = self.provider_config_path_editor.insert_newline();
+                self.note_editor_result(Some(result));
+            }
+            CorrectionPaneFocus::ProviderId => {
+                let result = self.provider_id_editor.insert_newline();
+                self.note_editor_result(Some(result));
+            }
+            CorrectionPaneFocus::ExportPath => {
+                let result = self.export_path_editor.insert_newline();
+                self.note_editor_result(Some(result));
+            }
+            _ => {}
+        }
+    }
+
+    fn focused_delete(&mut self, backward: bool) {
+        if matches!(
+            self.correction_focus,
+            CorrectionPaneFocus::ProviderConfigPath | CorrectionPaneFocus::ProviderId
+        ) && self.provider_setup_fields_locked()
+        {
+            self.correction_panel_status =
+                "Provider configuration is locked while Convert is active.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor if self.pending_correction.is_none() => {
+                let result = self
+                    .correction_session
+                    .as_mut()
+                    .map(|session| {
+                        if backward {
+                            session.delete_backward()
+                        } else {
+                            session.delete_forward()
+                        }
+                    });
+                self.note_editor_result(result);
+            }
+            CorrectionPaneFocus::ProviderConfigPath => {
+                let result = if backward {
+                    self.provider_config_path_editor.delete_backward()
+                } else {
+                    self.provider_config_path_editor.delete_forward()
+                };
+                self.note_editor_result(Some(result));
+            }
+            CorrectionPaneFocus::ProviderId => {
+                let result = if backward {
+                    self.provider_id_editor.delete_backward()
+                } else {
+                    self.provider_id_editor.delete_forward()
+                };
+                self.note_editor_result(Some(result));
+            }
+            CorrectionPaneFocus::ExportPath => {
+                let result = if backward {
+                    self.export_path_editor.delete_backward()
+                } else {
+                    self.export_path_editor.delete_forward()
+                };
+                self.note_editor_result(Some(result));
+            }
+            _ => {}
+        }
+    }
+
+    fn focused_move_cursor(&mut self, right: bool, extend: bool) {
+        match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor if self.pending_correction.is_none() => {
+                if let Some(session) = self.correction_session.as_mut() {
+                    match (right, extend) {
+                        (true, true) => session.move_cursor_right_extending_selection(),
+                        (false, true) => session.move_cursor_left_extending_selection(),
+                        (true, false) => session.move_cursor_right(),
+                        (false, false) => session.move_cursor_left(),
+                    }
+                }
+            }
+            CorrectionPaneFocus::ProviderConfigPath => {
+                move_text_editor_cursor(&mut self.provider_config_path_editor, right, extend)
+            }
+            CorrectionPaneFocus::ProviderId => {
+                move_text_editor_cursor(&mut self.provider_id_editor, right, extend)
+            }
+            CorrectionPaneFocus::ExportPath => {
+                move_text_editor_cursor(&mut self.export_path_editor, right, extend)
+            }
+            _ => {}
+        }
+        self.request_redraw();
+        self.update_ime_cursor_area();
+    }
+
+    fn focused_move_vertical(&mut self, down: bool, extend: bool) {
+        match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor if self.pending_correction.is_none() => {
+                let visual_rows = self.refresh_pane_text_measurement_target().and_then(|()| {
+                    if let Some(session) = self.correction_session.as_ref() {
+                        measured_editor_display_rows(
+                            session.editor(),
+                            self.correction_pane_text_width_px(),
+                            &mut self.pane_text_measurements,
+                        )
+                        .map(|rows| {
+                            rows.into_iter()
+                                .map(|(_, range, _)| range)
+                                .collect::<Vec<_>>()
+                        })
+                    } else {
+                        Ok(Vec::new())
+                    }
+                });
+                match visual_rows {
+                    Ok(visual_rows) => {
+                        if let Some(session) = self.correction_session.as_mut() {
+                            session.move_cursor_on_visual_rows(
+                                &visual_rows,
+                                if down { 1 } else { -1 },
+                                extend,
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        self.correction_panel_status =
+                            "Text measurement is unavailable; correction editing is paused.".to_owned();
+                    }
+                }
+            }
+            CorrectionPaneFocus::ProviderConfigPath => {
+                if down {
+                    self.provider_config_path_editor.move_cursor_down(extend);
+                } else {
+                    self.provider_config_path_editor.move_cursor_up(extend);
+                }
+            }
+            CorrectionPaneFocus::ProviderId => {
+                if down {
+                    self.provider_id_editor.move_cursor_down(extend);
+                } else {
+                    self.provider_id_editor.move_cursor_up(extend);
+                }
+            }
+            CorrectionPaneFocus::ExportPath => {
+                if down {
+                    self.export_path_editor.move_cursor_down(extend);
+                } else {
+                    self.export_path_editor.move_cursor_up(extend);
+                }
+            }
+            _ => {}
+        }
+        self.request_redraw();
+        self.update_ime_cursor_area();
+    }
+
+    fn focused_move_line_edge(&mut self, end: bool, extend: bool) {
+        match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor if self.pending_correction.is_none() => {
+                if let Some(session) = self.correction_session.as_mut() {
+                    if end {
+                        session.move_to_line_end(extend);
+                    } else {
+                        session.move_to_line_start(extend);
+                    }
+                }
+            }
+            CorrectionPaneFocus::ProviderConfigPath => {
+                if end {
+                    self.provider_config_path_editor.move_to_line_end(extend);
+                } else {
+                    self.provider_config_path_editor.move_to_line_start(extend);
+                }
+            }
+            CorrectionPaneFocus::ProviderId => {
+                if end {
+                    self.provider_id_editor.move_to_line_end(extend);
+                } else {
+                    self.provider_id_editor.move_to_line_start(extend);
+                }
+            }
+            CorrectionPaneFocus::ExportPath => {
+                if end {
+                    self.export_path_editor.move_to_line_end(extend);
+                } else {
+                    self.export_path_editor.move_to_line_start(extend);
+                }
+            }
+            _ => {}
+        }
+        self.request_redraw();
+        self.update_ime_cursor_area();
+    }
+
+    fn focused_set_cursor(&mut self, cursor: usize) {
+        match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor if self.pending_correction.is_none() => {
+                if let Some(session) = self.correction_session.as_mut() {
+                    session.set_cursor_grapheme(cursor);
+                }
+            }
+            CorrectionPaneFocus::ProviderConfigPath => {
+                self.provider_config_path_editor.set_cursor_grapheme(cursor)
+            }
+            CorrectionPaneFocus::ProviderId => self.provider_id_editor.set_cursor_grapheme(cursor),
+            CorrectionPaneFocus::ExportPath => self.export_path_editor.set_cursor_grapheme(cursor),
+            _ => {}
+        }
+        self.request_redraw();
+        self.update_ime_cursor_area();
+    }
+
+    fn focused_select_graphemes(&mut self, start: usize, end: usize) {
+        match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor if self.pending_correction.is_none() => {
+                if let Some(session) = self.correction_session.as_mut() {
+                    session.select_graphemes(start, end);
+                }
+            }
+            CorrectionPaneFocus::ProviderConfigPath => {
+                self.provider_config_path_editor.select_graphemes(start, end)
+            }
+            CorrectionPaneFocus::ProviderId => self.provider_id_editor.select_graphemes(start, end),
+            CorrectionPaneFocus::ExportPath => self.export_path_editor.select_graphemes(start, end),
+            _ => {}
+        }
+        self.request_redraw();
+    }
+
+    fn correction_text_caret_at(&mut self, cursor: (f64, f64)) -> Option<usize> {
+        let (width, height) = self.client_size?;
+        let client_width = i32::try_from(width).unwrap_or(i32::MAX);
+        let client_height = i32::try_from(height).unwrap_or(i32::MAX);
+        let pane_left = correction_pane_left_edge_i32(client_width);
+        let x = cursor.0.floor() as i32;
+        let y = cursor.1.floor() as i32;
+        let local_y = y.saturating_sub(CORRECTION_PANE_PADDING_PX);
+        if !correction_pane_contains_client_point(
+            i64::from(x),
+            i64::from(y),
+            i64::from(client_width),
+            i64::from(client_height),
+        ) {
+            return None;
+        }
+        let row = usize::try_from(local_y / CORRECTION_PANE_ROW_HEIGHT_PX).ok()?;
+        let layout = self.correction_pane_layout().ok()?;
+        let rows = layout.editor_rows?;
+        if !rows.contains(&row) {
+            return None;
+        }
+        let relative_row = row.saturating_sub(rows.start);
+        let range = layout.editor_grapheme_ranges.get(relative_row)?;
+        let boundary_x = layout.editor_row_hit_offsets.get(relative_row)?;
+        let content_x = x
+            .saturating_sub(pane_left)
+            .saturating_sub(CORRECTION_PANE_PADDING_PX)
+            .max(0);
+        let column = nearest_grapheme_boundary(boundary_x, content_x);
+        Some(range.start.saturating_add(column.min(range.end.saturating_sub(range.start))))
+    }
+
+    fn handle_correction_mouse_button(&mut self, button: MouseButton, state: ElementState) -> bool {
+        if button == MouseButton::Left
+            && state == ElementState::Released
+            && self.correction_mouse_selecting
+        {
+            if let (Some(cursor), Some(anchor)) = (
+                self.canvas_cursor_client,
+                self.correction_mouse_selection_anchor,
+            ) && let Some(caret) = self.correction_text_caret_at(cursor)
+            {
+                self.focused_select_graphemes(anchor, caret);
+            }
+            self.correction_mouse_selecting = false;
+            return true;
+        }
+        if state == ElementState::Released
+            && ((button == MouseButton::Left
+                && (self.canvas_selection_drag_start.is_some()
+                    || self.canvas_move_drag_start.is_some()))
+                || (matches!(button, MouseButton::Middle | MouseButton::Right)
+                    && self.canvas_pan_drag_last.is_some()))
+        {
+            // A gesture that began on the canvas keeps its original owner even
+            // when its release lands over the overlay pane.
+            return false;
+        }
+        let Some(cursor) = self.canvas_cursor_client else {
+            return false;
+        };
+        let Some((width, height)) = self.client_size else {
+            return false;
+        };
+        let client_width = i32::try_from(width).unwrap_or(i32::MAX);
+        let client_height = i32::try_from(height).unwrap_or(i32::MAX);
+        let pane_left = correction_pane_left_edge_i32(client_width);
+        let x = cursor.0.floor() as i32;
+        let y = cursor.1.floor() as i32;
+        if !correction_pane_contains_client_point(
+            i64::from(x),
+            i64::from(y),
+            i64::from(client_width),
+            i64::from(client_height),
+        ) {
+            return false;
+        }
+        if button != MouseButton::Left {
+            return true;
+        }
+        if state == ElementState::Released {
+            return true;
+        }
+
+        self.canvas_pan_drag_last = None;
+        self.canvas_selection_drag_start = None;
+        self.canvas_move_drag_start = None;
+        self.canvas_scene.set_selection_rect(None);
+        self.correction_mouse_selecting = false;
+        let row = usize::try_from(
+            y.saturating_sub(CORRECTION_PANE_PADDING_PX) / CORRECTION_PANE_ROW_HEIGHT_PX,
+        )
+        .unwrap_or(usize::MAX);
+        let Ok(layout) = self.correction_pane_layout() else {
+            return true;
+        };
+        if layout.action_row == Some(row) {
+            let action_offset = x
+                .saturating_sub(pane_left)
+                .saturating_sub(CORRECTION_PANE_PADDING_PX);
+            if let Some((_, action)) = layout
+                .action_hit_targets
+                .iter()
+                .find(|(target, _)| target.contains(&action_offset))
+            {
+                self.dispatch_pane_action(action);
+            }
+            return true;
+        }
+        if layout.load_config_row == Some(row) {
+            self.dispatch_pane_action(CorrectionPaneAction::LoadProviderConfig);
+            return true;
+        }
+        if layout.provider_path_row == Some(row) {
+            let cursor = inline_editor_cursor_at(
+                &layout,
+                InlineEditorField::ProviderConfigPath,
+                row,
+                x.saturating_sub(pane_left)
+                    .saturating_sub(CORRECTION_PANE_PADDING_PX),
+            )
+            .unwrap_or_default();
+            self.set_correction_focus(CorrectionPaneFocus::ProviderConfigPath);
+            self.provider_config_path_editor
+                .set_cursor_grapheme(cursor.min(self.provider_config_path_editor.grapheme_count()));
+            self.update_ime_cursor_area();
+            return true;
+        }
+        if layout.provider_id_row == Some(row) {
+            let cursor = inline_editor_cursor_at(
+                &layout,
+                InlineEditorField::ProviderId,
+                row,
+                x.saturating_sub(pane_left)
+                    .saturating_sub(CORRECTION_PANE_PADDING_PX),
+            )
+            .unwrap_or_default();
+            self.set_correction_focus(CorrectionPaneFocus::ProviderId);
+            self.provider_id_editor
+                .set_cursor_grapheme(cursor.min(self.provider_id_editor.grapheme_count()));
+            self.update_ime_cursor_area();
+            return true;
+        }
+        if layout.export_path_row == Some(row) {
+            let cursor = inline_editor_cursor_at(
+                &layout,
+                InlineEditorField::ExportPath,
+                row,
+                x.saturating_sub(pane_left)
+                    .saturating_sub(CORRECTION_PANE_PADDING_PX),
+            )
+            .unwrap_or_default();
+            self.set_correction_focus(CorrectionPaneFocus::ExportPath);
+            self.export_path_editor
+                .set_cursor_grapheme(cursor.min(self.export_path_editor.grapheme_count()));
+            self.update_ime_cursor_area();
+            return true;
+        }
+        if layout
+            .editor_rows
+            .as_ref()
+            .is_some_and(|rows| rows.contains(&row))
+        {
+            self.correction_editor_browse_mode = false;
+            self.set_correction_focus(CorrectionPaneFocus::CorrectionEditor);
+            if self.correction_focus == CorrectionPaneFocus::CorrectionEditor {
+                let Some(caret) = self.correction_text_caret_at(cursor) else {
+                    return true;
+                };
+                self.focused_set_cursor(caret);
+                self.correction_mouse_selection_anchor = Some(caret);
+                self.correction_mouse_selecting = true;
+            }
+            return true;
+        }
+        self.set_correction_focus(CorrectionPaneFocus::None);
+        true
+    }
+
+    fn handle_focused_text_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if !self.correction_focus.is_text_field() {
+            return false;
+        }
+        if event.logical_key == Key::Named(NamedKey::AltGraph) {
+            self.alt_graph_active = event.state == ElementState::Pressed;
+            return true;
+        }
+        if !self.prepare_focused_text_input() {
+            return true;
+        }
+        if !should_process_focused_text_key(event.state, event.repeat) {
+            return true;
+        }
+        if self.correction_focus == CorrectionPaneFocus::CorrectionEditor
+            && self.pending_correction.is_some()
+        {
+            self.correction_panel_status =
+                "Editing is paused until the pending save is acknowledged.".to_owned();
+            self.request_redraw();
+            return true;
+        }
+        if matches!(
+            self.correction_focus,
+            CorrectionPaneFocus::ProviderConfigPath | CorrectionPaneFocus::ProviderId
+        ) && self.provider_setup_fields_locked()
+        {
+            self.correction_panel_status =
+                "Provider configuration is locked while Convert is active.".to_owned();
+            self.request_redraw();
+            return true;
+        }
+        if self.focused_ime_preedit_active() {
+            if event.physical_key == PhysicalKey::Code(KeyCode::Escape) {
+                match self.correction_focus {
+                    CorrectionPaneFocus::CorrectionEditor => {
+                        if let Some(session) = self.correction_session.as_mut() {
+                            session.cancel_ime_preedit();
+                        }
+                    }
+                    CorrectionPaneFocus::ProviderConfigPath => {
+                        self.provider_config_path_editor.cancel_preedit();
+                    }
+                    CorrectionPaneFocus::ProviderId => self.provider_id_editor.cancel_preedit(),
+                    CorrectionPaneFocus::ExportPath => self.export_path_editor.cancel_preedit(),
+                    CorrectionPaneFocus::None => {}
+                }
+                self.request_redraw();
+            }
+            // During composition the IME owns navigation/edit keys. In particular,
+            // do not commit ordinary KeyEvent text alongside Ime::Commit.
+            return true;
+        }
+        let control = self.canvas_modifiers.control_key();
+        let shift = self.canvas_modifiers.shift_key();
+        let alt_gr = self.alt_graph_active;
+        let control_alt_shortcut =
+            is_control_alt_shortcut(control, self.canvas_modifiers.alt_key(), alt_gr);
+        if control_alt_shortcut {
+            return true;
+        }
+        match event.physical_key {
+            PhysicalKey::Code(KeyCode::Escape) => {
+                if self.correction_focus == CorrectionPaneFocus::CorrectionEditor {
+                    self.cancel_correction_draft();
+                } else {
+                    self.set_correction_focus(CorrectionPaneFocus::None);
+                }
+            }
+            PhysicalKey::Code(KeyCode::Enter)
+                if control && self.correction_focus == CorrectionPaneFocus::CorrectionEditor =>
+            {
+                self.save_correction()
+            }
+            PhysicalKey::Code(KeyCode::Enter) if control => {}
+            PhysicalKey::Code(KeyCode::Enter) => self.focused_insert_newline(),
+            PhysicalKey::Code(KeyCode::Backspace) => self.focused_delete(true),
+            PhysicalKey::Code(KeyCode::Delete) => self.focused_delete(false),
+            PhysicalKey::Code(KeyCode::ArrowLeft) => self.focused_move_cursor(false, shift),
+            PhysicalKey::Code(KeyCode::ArrowRight) => self.focused_move_cursor(true, shift),
+            PhysicalKey::Code(KeyCode::ArrowUp) => self.focused_move_vertical(false, shift),
+            PhysicalKey::Code(KeyCode::ArrowDown) => self.focused_move_vertical(true, shift),
+            PhysicalKey::Code(KeyCode::Home) => self.focused_move_line_edge(false, shift),
+            PhysicalKey::Code(KeyCode::End) => self.focused_move_line_edge(true, shift),
+            PhysicalKey::Code(KeyCode::KeyA) if control => self.focused_select_all(),
+            PhysicalKey::Code(KeyCode::KeyC) if control => self.copy_focused_text(),
+            PhysicalKey::Code(KeyCode::KeyV) if control => self.paste_focused_text(),
+            PhysicalKey::Code(KeyCode::KeyZ) if control => self.focused_undo_redo(false),
+            PhysicalKey::Code(KeyCode::KeyY) if control => self.focused_undo_redo(true),
+            PhysicalKey::Code(KeyCode::KeyS)
+                if control && self.correction_focus == CorrectionPaneFocus::CorrectionEditor =>
+            {
+                self.save_correction()
+            }
+            _ => {
+                // With the pinned Winit Windows backend, IME WM_CHAR messages
+                // without a pending key event are dropped by its keyboard
+                // builder and delivered through Ime::Commit instead. During
+                // visible preedit the guard above also suppresses KeyEvent text.
+                if should_insert_keyboard_text(
+                    control,
+                    self.canvas_modifiers.alt_key(),
+                    alt_gr,
+                    self.focused_ime_preedit_active(),
+                    event.text.is_some(),
+                )
+                    && let Some(text) = event.text.as_ref()
+                    && !text.chars().all(char::is_control)
+                {
+                    self.focused_insert_text(text.as_str());
+                }
+            }
+        }
+        self.request_redraw();
+        true
+    }
+
+    fn handle_ime_event(&mut self, event: Ime) {
+        if !self.correction_focus.is_text_field() {
+            return;
+        }
+        if !self.prepare_focused_text_input() {
+            return;
+        }
+        if matches!(
+            self.correction_focus,
+            CorrectionPaneFocus::ProviderConfigPath | CorrectionPaneFocus::ProviderId
+        ) && self.provider_setup_fields_locked()
+        {
+            self.correction_panel_status =
+                "Provider configuration is locked while Convert is active.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        match event {
+            Ime::Enabled => self.update_ime_cursor_area(),
+            Ime::Preedit(text, _) => {
+                if self.correction_focus == CorrectionPaneFocus::CorrectionEditor
+                    && self.pending_correction.is_some()
+                {
+                    return;
+                }
+                let result = match self.correction_focus {
+                    CorrectionPaneFocus::CorrectionEditor => self
+                        .correction_session
+                        .as_mut()
+                        .map(|session| session.update_ime_preedit(&text).map(|()| true)),
+                    CorrectionPaneFocus::ProviderConfigPath => {
+                        let has_composition = !text.is_empty();
+                        Some(
+                            self.provider_config_path_editor
+                                .update_preedit(&text)
+                                .map(|()| has_composition),
+                        )
+                    }
+                    CorrectionPaneFocus::ProviderId => {
+                        let has_composition = !text.is_empty();
+                        Some(
+                            self.provider_id_editor
+                                .update_preedit(&text)
+                                .map(|()| has_composition),
+                        )
+                    }
+                    CorrectionPaneFocus::ExportPath => {
+                        Some(self.export_path_editor.update_preedit(&text).map(|()| false))
+                    }
+                    CorrectionPaneFocus::None => None,
+                };
+                self.note_editor_result(result);
+            }
+            Ime::Commit(text) => {
+                if self.correction_focus == CorrectionPaneFocus::CorrectionEditor
+                    && self.pending_correction.is_some()
+                {
+                    return;
+                }
+                let result = match self.correction_focus {
+                    CorrectionPaneFocus::CorrectionEditor => self
+                        .correction_session
+                        .as_mut()
+                        .map(|session| session.commit_ime_text(&text)),
+                    CorrectionPaneFocus::ProviderConfigPath => {
+                        Some(self.provider_config_path_editor.commit_ime_text(&text))
+                    }
+                    CorrectionPaneFocus::ProviderId => {
+                        Some(self.provider_id_editor.commit_ime_text(&text))
+                    }
+                    CorrectionPaneFocus::ExportPath => {
+                        Some(self.export_path_editor.commit_ime_text(&text))
+                    }
+                    CorrectionPaneFocus::None => None,
+                };
+                self.note_editor_result(result);
+            }
+            Ime::Disabled => {
+                match self.correction_focus {
+                    CorrectionPaneFocus::CorrectionEditor => {
+                        if let Some(session) = self.correction_session.as_mut() {
+                            session.cancel_ime_preedit();
+                        }
+                    }
+                    CorrectionPaneFocus::ProviderConfigPath => {
+                        self.provider_config_path_editor.cancel_preedit();
+                    }
+                    CorrectionPaneFocus::ProviderId => self.provider_id_editor.cancel_preedit(),
+                    CorrectionPaneFocus::ExportPath => self.export_path_editor.cancel_preedit(),
+                    CorrectionPaneFocus::None => {}
+                }
+                self.request_redraw();
+            }
+        }
+    }
+
+    fn focused_select_all(&mut self) {
+        match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor if self.pending_correction.is_none() => {
+                if let Some(session) = self.correction_session.as_mut() {
+                    session.select_all();
+                }
+            }
+            CorrectionPaneFocus::ProviderConfigPath => self.provider_config_path_editor.select_all(),
+            CorrectionPaneFocus::ProviderId => self.provider_id_editor.select_all(),
+            CorrectionPaneFocus::ExportPath => self.export_path_editor.select_all(),
+            _ => {}
+        }
+        self.request_redraw();
+    }
+
+    fn focused_undo_redo(&mut self, redo: bool) {
+        let changed = match self.correction_focus {
+            CorrectionPaneFocus::CorrectionEditor if self.pending_correction.is_none() => self
+                .correction_session
+                .as_mut()
+                .is_some_and(|session| if redo { session.redo() } else { session.undo() }),
+            CorrectionPaneFocus::ProviderConfigPath => {
+                if redo {
+                    self.provider_config_path_editor.redo()
+                } else {
+                    self.provider_config_path_editor.undo()
+                }
+            }
+            CorrectionPaneFocus::ProviderId => {
+                if redo {
+                    self.provider_id_editor.redo()
+                } else {
+                    self.provider_id_editor.undo()
+                }
+            }
+            CorrectionPaneFocus::ExportPath => {
+                if redo {
+                    self.export_path_editor.redo()
+                } else {
+                    self.export_path_editor.undo()
+                }
+            }
+            _ => false,
+        };
+        if changed {
+            if matches!(
+                self.correction_focus,
+                CorrectionPaneFocus::ProviderConfigPath | CorrectionPaneFocus::ProviderId
+            ) {
+                self.mark_provider_setup_changed();
+            } else {
+                self.correction_panel_status = if redo {
+                    "Draft redone; Save is still required.".to_owned()
+                } else {
+                    "Draft undo applied; Save is still required.".to_owned()
+                };
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn note_editor_result(
+        &mut self,
+        result: Option<Result<bool, journal::JournalError>>,
+    ) {
+        match result {
+            Some(Err(_)) => {
+                self.correction_panel_status =
+                    "Text edit exceeds the correction or setup field limits.".to_owned();
+            }
+            Some(Ok(true))
+                if matches!(
+                    self.correction_focus,
+                    CorrectionPaneFocus::ProviderConfigPath | CorrectionPaneFocus::ProviderId
+                ) =>
+            {
+                self.mark_provider_setup_changed();
+            }
+            Some(Ok(_)) => self.correction_panel_status.clear(),
+            None => {}
+        }
+        self.request_redraw();
+        self.update_ime_cursor_area();
+    }
+
+    fn mark_provider_setup_changed(&mut self) {
+        self.local_convert_provider = None;
+        self.correction_panel_status =
+            "Provider settings changed; click Load config before Convert.".to_owned();
+    }
+
+    fn load_local_provider_from_pane(&mut self) {
+        if self.pending_convert.is_some() || self.provider_worker.is_some() {
+            self.correction_panel_status =
+                "Load a provider configuration only after the current Convert has ended.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        if self.provider_config_path_editor.has_preedit() || self.provider_id_editor.has_preedit() {
+            self.correction_panel_status =
+                "Finish or cancel the active IME composition before loading config.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        let path_text = self.provider_config_path_editor.text().trim();
+        let provider_id = self.provider_id_editor.text().trim();
+        if path_text.is_empty() {
+            self.correction_panel_status = "Enter a local provider configuration path first.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        let selection = (!provider_id.is_empty()).then_some(provider_id);
+        match LocalConvertProviderV1::load(Path::new(path_text), selection) {
+            Ok(provider) => {
+                self.local_convert_provider = Some(provider);
+                self.correction_panel_status =
+                    "Provider configuration loaded; no worker was launched.".to_owned();
+            }
+            Err(_) => {
+                self.local_convert_provider = None;
+                self.provider_worker = None;
+                self.correction_panel_status =
+                    "Provider configuration could not be loaded; check the local file and ID.".to_owned();
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn dispatch_pane_action(&mut self, action: CorrectionPaneAction) {
+        if self.deferred_capture_batch.is_some() {
+            if self.deferred_pane_actions.len() >= MAX_DEFERRED_PANE_ACTIONS
+                || self.deferred_pane_actions.try_reserve(1).is_err()
+            {
+                self.correction_panel_status =
+                    "Pane action queue is full while capture waits for storage.".to_owned();
+                self.request_redraw();
+                return;
+            }
+            self.deferred_pane_actions.push(action);
+            self.correction_panel_status =
+                "Pane action queued behind pending pen capture.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        match action {
+            CorrectionPaneAction::Convert => self.start_or_cancel_convert(),
+            CorrectionPaneAction::Save => self.save_correction(),
+            CorrectionPaneAction::Reset => self.reset_correction_draft(),
+            CorrectionPaneAction::Cancel => self.cancel_correction_draft(),
+            CorrectionPaneAction::Copy => self.copy_correction_text(),
+            CorrectionPaneAction::LoadProviderConfig => self.load_local_provider_from_pane(),
+        }
+    }
+
+    fn save_correction(&mut self) {
+        if self.pending_correction.is_some() {
+            self.correction_panel_status = "A correction save is already pending.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        let Some(session) = self.correction_session.as_ref() else {
+            self.correction_panel_status = "There is no stored projection to correct.".to_owned();
+            self.request_redraw();
+            return;
+        };
+        if session.editor().has_preedit() {
+            self.correction_panel_status =
+                "Finish or cancel the active IME composition before saving.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        if !session.is_dirty() {
+            self.correction_panel_status = "No correction draft to save.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        let counter = self.next_correction_id;
+        let Some(next_counter) = counter.checked_add(1) else {
+            self.correction_panel_status = "Correction identifier capacity was exhausted.".to_owned();
+            self.request_redraw();
+            return;
+        };
+        let correction_id = format!("correction-{}-{counter}", self.active_session_id);
+        let correction = match session.build_correction(&correction_id) {
+            Ok(Some(correction)) => correction,
+            Ok(None) => {
+                self.correction_panel_status = "No correction draft to save.".to_owned();
+                self.request_redraw();
+                return;
+            }
+            Err(_) => {
+                self.correction_panel_status = "Correction draft is invalid or exceeds its limit.".to_owned();
+                self.request_redraw();
+                return;
+            }
+        };
+        let Some(batch_id) = self.allocate_project_batch_id() else {
+            self.correction_panel_status = "Project command identifier capacity was exhausted.".to_owned();
+            self.request_redraw();
+            return;
+        };
+        self.next_correction_id = next_counter;
+        self.pending_correction = Some(PendingCorrectionWrite {
+            batch_id,
+            correction: Box::new(correction),
+            enqueued: false,
+        });
+        self.retry_pending_correction();
+    }
+
+    fn retry_pending_correction(&mut self) {
+        let Some(pending) = self.pending_correction.as_ref() else {
+            return;
+        };
+        if pending.enqueued {
+            return;
+        }
+        let Some(writer) = self.project_writer.as_mut() else {
+            self.correction_panel_status = "Project writer is unavailable; draft remains editable.".to_owned();
+            self.request_redraw();
+            return;
+        };
+        let batch_id = pending.batch_id;
+        let correction = (*pending.correction).clone();
+        match writer.try_append_region_correction(
+            batch_id,
+            correction,
+            self.app_clock_origin.elapsed().as_nanos(),
+        ) {
+            Ok(()) => {
+                if let Some(pending) = self.pending_correction.as_mut() {
+                    pending.enqueued = true;
+                }
+                self.correction_panel_status =
+                    "Correction queued; waiting for durable journal acknowledgement.".to_owned();
+            }
+            Err(CorrectionQueueError::QueueFull(returned)) => {
+                if let Some(pending) = self.pending_correction.as_mut() {
+                    pending.correction = returned;
+                    pending.enqueued = false;
+                }
+                self.correction_panel_status =
+                    "Project writer busy; the correction is retained and will retry.".to_owned();
+            }
+            Err(CorrectionQueueError::WorkerStopped) => {
+                self.pending_correction = None;
+                self.correction_panel_status =
+                    "Project writer stopped; the correction draft remains unsaved.".to_owned();
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn reset_correction_draft(&mut self) {
+        if self.pending_correction.is_some() {
+            self.correction_panel_status = "Reset is unavailable while a save is pending.".to_owned();
+        } else if let Some(session) = self.correction_session.as_mut() {
+            match session.reset() {
+                Ok(()) => {
+                    self.correction_panel_status =
+                        "Reset staged; Save records it as a distinct history action.".to_owned();
+                }
+                Err(_) => self.correction_panel_status = "Reset could not be staged.".to_owned(),
+            }
+        } else {
+            self.correction_panel_status = "There is no stored projection to reset.".to_owned();
+        }
+        self.request_redraw();
+    }
+
+    fn cancel_correction_draft(&mut self) {
+        if self.pending_correction.is_some() {
+            self.correction_panel_status = "Cancel is unavailable while a save is pending.".to_owned();
+        } else if let Some(session) = self.correction_session.as_mut() {
+            session.cancel_ime_preedit();
+            session.cancel();
+            self.correction_panel_status =
+                "Draft canceled; the saved correction or provider output is displayed.".to_owned();
+        } else {
+            self.correction_panel_status = "There is no correction draft to cancel.".to_owned();
+        }
+        self.request_redraw();
+    }
+
+    fn copy_focused_text(&mut self) {
+        let Some(hwnd) = self.window.as_ref().and_then(raw_window_hwnd) else {
+            self.correction_panel_status = "Clipboard is unavailable for this window.".to_owned();
+            return;
+        };
+        let text = self
+            .focused_selected_text()
+            .or_else(|| self.focused_text())
+            .map(str::to_owned)
+            .or_else(|| {
+                self.correction_session.as_ref().and_then(|session| {
+                    if session.is_cancelled() {
+                        Some(session.text().to_owned())
+                    } else {
+                        session.effective_text().map(str::to_owned)
+                    }
+                })
+            });
+        let Some(text) = text else {
+            self.correction_panel_status = "There is no text to copy.".to_owned();
+            self.request_redraw();
+            return;
+        };
+        self.correction_panel_status = match windows_clipboard::copy_unicode_text(hwnd, &text) {
+            Ok(()) => "Text copied to the Windows clipboard.".to_owned(),
+            Err(_) => "Clipboard copy failed; the draft remains local.".to_owned(),
+        };
+        self.request_redraw();
+    }
+
+    fn copy_correction_text(&mut self) {
+        let Some(hwnd) = self.window.as_ref().and_then(raw_window_hwnd) else {
+            self.correction_panel_status = "Clipboard is unavailable for this window.".to_owned();
+            self.request_redraw();
+            return;
+        };
+        let text = self.correction_session.as_ref().and_then(|session| {
+            if let Some(selected) = session.selected_text() {
+                Some(selected.to_owned())
+            } else if session.is_dirty() || session.is_cancelled() {
+                Some(session.text().to_owned())
+            } else {
+                session.effective_text().map(str::to_owned)
+            }
+        });
+        let Some(text) = text else {
+            self.correction_panel_status = "There is no correction text to copy.".to_owned();
+            self.request_redraw();
+            return;
+        };
+        self.correction_panel_status = match windows_clipboard::copy_unicode_text(hwnd, &text) {
+            Ok(()) => "Correction text copied to the Windows clipboard.".to_owned(),
+            Err(_) => "Clipboard copy failed; the draft remains local.".to_owned(),
+        };
+        self.request_redraw();
+    }
+
+    fn paste_focused_text(&mut self) {
+        let Some(hwnd) = self.window.as_ref().and_then(raw_window_hwnd) else {
+            self.correction_panel_status = "Clipboard is unavailable for this window.".to_owned();
+            self.request_redraw();
+            return;
+        };
+        match windows_clipboard::read_unicode_text(hwnd) {
+            Ok(Some(text)) => self.focused_insert_text(&text),
+            Ok(None) => self.correction_panel_status = "Clipboard has no Unicode text.".to_owned(),
+            Err(_) => self.correction_panel_status = "Clipboard paste failed; no text was inserted.".to_owned(),
+        }
+        self.request_redraw();
     }
 
     fn submit_project_edit(&mut self, command: EditCommand, label: &str) {
@@ -1243,7 +4026,7 @@ impl ProbeApp {
                 ProjectWriterAck::ConvertSnapshot { batch_id, state } => {
                     self.handle_convert_snapshot(batch_id, *state);
                 }
-                ProjectWriterAck::RecognitionProjectionCommitted { batch_id, .. } => {
+                ProjectWriterAck::RecognitionProjectionCommitted { batch_id, record } => {
                     let matches_pending = self.pending_convert.as_ref().is_some_and(|pending| {
                         matches!(
                             &pending.phase,
@@ -1258,6 +4041,30 @@ impl ProbeApp {
                     if matches_pending {
                         self.pending_convert = None;
                         if is_current {
+                            if let JournalEvent::RecognitionProjection {
+                                app_arrival_elapsed_ns,
+                                projection,
+                            } = record.event
+                            {
+                                let stored_projection = StoredRecognitionProjection {
+                                    sequence: record.sequence,
+                                    app_epoch_id: record.app_epoch_id,
+                                    app_arrival_elapsed_ns,
+                                    projection: *projection,
+                                };
+                                match CorrectionSession::from_durable_projection(stored_projection)
+                                {
+                                    Ok(session) => {
+                                        self.correction_session = Some(session);
+                                        self.correction_panel_status =
+                                            "New durable provider output opened; raw result is immutable.".to_owned();
+                                    }
+                                    Err(_) => {
+                                        self.correction_panel_status =
+                                            "Saved projection could not be opened for correction.".to_owned();
+                                    }
+                                }
+                            }
                             self.canvas_status =
                                 "Convert result was durably saved as a projection".to_owned();
                             self.request_redraw();
@@ -1298,16 +4105,67 @@ impl ProbeApp {
                         );
                     }
                 }
-                ProjectWriterAck::RegionCorrectionCommitted { .. } => {}
+                ProjectWriterAck::RegionCorrectionCommitted { batch_id, record } => {
+                    let matches_pending = self.pending_correction.as_ref().is_some_and(|pending| {
+                        pending.batch_id == batch_id && pending.enqueued
+                    });
+                    if matches_pending {
+                        let saved_correction = match record.event {
+                            JournalEvent::RegionCorrection { correction, .. } => Some(*correction),
+                            _ => None,
+                        };
+                        let exact = saved_correction.as_ref().is_some_and(|saved| {
+                            self.pending_correction
+                                .as_ref()
+                                .is_some_and(|pending| *saved == *pending.correction)
+                        });
+                        if exact {
+                            let acknowledged = saved_correction.as_ref().is_some_and(|saved| {
+                                self.correction_session
+                                    .as_mut()
+                                    .is_some_and(|session| session.acknowledge_committed(saved).is_ok())
+                            });
+                            if acknowledged {
+                                self.pending_correction = None;
+                                self.correction_panel_status =
+                                    "Correction durably saved for this projection.".to_owned();
+                            } else {
+                                self.mark_project_incomplete(
+                                    "durable correction acknowledgement did not match the frozen draft"
+                                        .to_owned(),
+                                );
+                            }
+                        } else {
+                            self.pending_correction = None;
+                            self.correction_panel_status =
+                                "Correction acknowledgement did not match; the draft remains unsaved."
+                                    .to_owned();
+                        }
+                        self.request_redraw();
+                    }
+                }
                 ProjectWriterAck::RegionCorrectionFailed {
-                    writer_poisoned, ..
+                    batch_id,
+                    error: _,
+                    writer_poisoned,
                 } => {
+                    let matches_pending = self
+                        .pending_correction
+                        .as_ref()
+                        .is_some_and(|pending| pending.batch_id == batch_id);
+                    if matches_pending {
+                        self.pending_correction = None;
+                    }
                     if writer_poisoned {
                         self.mark_project_incomplete(
                             "project journal synchronization failed while saving a correction"
                                 .to_owned(),
                         );
+                    } else if matches_pending {
+                        self.correction_panel_status =
+                            "Correction was stale or invalid; the draft is retained and can be copied or edited.".to_owned();
                     }
+                    self.request_redraw();
                 }
                 ProjectWriterAck::Finished(result) => {
                     if let Err(error) = result {
@@ -1476,6 +4334,43 @@ impl ProbeApp {
         };
         let phase = std::mem::replace(&mut pending.phase, PendingConvertPhase::Transitioning);
         match phase {
+            PendingConvertPhase::QueueSnapshotForPreparation { batch_id } => {
+                if pending.cancelled || !self.convert_context_is_current(&pending) {
+                    self.canvas_status =
+                        "Convert intent was discarded because its selected view changed".to_owned();
+                    self.request_redraw();
+                    return true;
+                }
+                let result = self
+                    .project_writer
+                    .as_mut()
+                    .map(|writer| writer.try_snapshot_for_convert(batch_id));
+                match result {
+                    Some(Ok(())) => {
+                        pending.phase = PendingConvertPhase::SnapshotForPreparation { batch_id };
+                        self.canvas_status =
+                            "Convert snapshot queued after earlier accepted writes".to_owned();
+                    }
+                    Some(Err(
+                        ProjectQueueError::QueueFull | ProjectQueueError::Backpressure { .. },
+                    )) => {
+                        pending.phase = PendingConvertPhase::QueueSnapshotForPreparation { batch_id };
+                        self.canvas_status =
+                            "Convert intent retained; waiting for project writer capacity".to_owned();
+                    }
+                    Some(Err(ProjectQueueError::WorkerStopped | ProjectQueueError::Stopped { .. }))
+                    | None => {
+                        self.canvas_status =
+                            "Convert intent was not submitted because the project writer stopped"
+                                .to_owned();
+                        self.request_redraw();
+                        return true;
+                    }
+                }
+                self.pending_convert = Some(pending);
+                self.request_redraw();
+                true
+            }
             PendingConvertPhase::QueueSnapshotForValidation {
                 batch_id,
                 execution,
@@ -2068,6 +4963,7 @@ impl ProbeApp {
         };
         let Some(project_writer) = self.project_writer.as_mut() else {
             let omitted_samples = direct_capture_sample_count(&events);
+            self.deferred_pane_actions.clear();
             self.mark_project_incomplete(format!(
                 "project writer unavailable; deferred batch {batch_id} had {} events and {omitted_samples} samples not accepted",
                 events.len()
@@ -2080,6 +4976,10 @@ impl ProbeApp {
                 self.last_project_message_sequence = last_message_sequence;
                 let intents = std::mem::take(&mut self.deferred_canvas_intents);
                 self.apply_canvas_tool_intents(intents);
+                let pane_actions = std::mem::take(&mut self.deferred_pane_actions);
+                for action in pane_actions {
+                    self.dispatch_pane_action(action);
+                }
             }
             Err(ProjectQueueError::Backpressure {
                 batch_id,
@@ -2100,6 +5000,7 @@ impl ProbeApp {
                 batch_id: stopped_batch_id,
                 events,
             }) => {
+                self.deferred_pane_actions.clear();
                 let omitted_samples = direct_capture_sample_count(&events);
                 self.mark_project_incomplete(format!(
                     "project writer stopped before queued batch {stopped_batch_id} committed; {} events and {omitted_samples} samples remain unwritten",
@@ -2107,6 +5008,7 @@ impl ProbeApp {
                 ));
             }
             Err(ProjectQueueError::QueueFull | ProjectQueueError::WorkerStopped) => {
+                self.deferred_pane_actions.clear();
                 self.mark_project_incomplete(
                     "project writer command queue is unavailable".to_owned(),
                 );
@@ -2116,6 +5018,7 @@ impl ProbeApp {
 
     fn process_pending_project_capture(&mut self) {
         self.drain_project_writer_acks();
+        self.retry_pending_correction();
         if self.deferred_capture_batch.is_some() {
             self.try_send_deferred_capture_batch();
             return;
@@ -2135,8 +5038,30 @@ impl ProbeApp {
             return;
         }
 
+        let capture_mode = self.capture_mode;
+        let prior_message_sequence = self.last_project_message_sequence;
+        let client_origin = self.canvas_origin;
+        let client_size = self.client_size;
+        let direct_pane_layout = if capture_mode == CaptureMode::DirectWmPointer {
+            match self.correction_pane_layout() {
+                Ok(layout) => Some(layout),
+                Err(_) => {
+                    self.correction_panel_status =
+                        "Pane measurement is unavailable; Direct pane actions are paused."
+                            .to_owned();
+                    self.request_redraw();
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let current_stroke_view_frame = (capture_mode == CaptureMode::DirectWmPointer)
+            .then(|| self.current_stroke_view_frame());
+
         let mut events = Vec::new();
         let mut tool_intents = Vec::new();
+        let mut pane_actions = Vec::new();
         let mut last_message_sequence = self.last_project_message_sequence;
         let mut conversion_error = None;
         {
@@ -2144,39 +5069,97 @@ impl ProbeApp {
             for record in &state.pending_records()[new_range] {
                 match record {
                     ProbeRecord::DirectPenHistory(batch)
-                        if self.capture_mode == CaptureMode::DirectWmPointer
-                            && batch.message_sequence > self.last_project_message_sequence =>
+                        if capture_mode == CaptureMode::DirectWmPointer
+                            && batch.message_sequence > prior_message_sequence =>
                     {
-                        let view_frame = match self.current_stroke_view_frame() {
-                            Ok(frame) => frame,
-                            Err(error) => {
-                                conversion_error = Some(error);
+                        let (ui_route, completed_action) = route_direct_batch_to_correction_ui(
+                            &mut self.direct_ui_pointer_owners,
+                            batch,
+                            client_origin,
+                            client_size,
+                            direct_pane_layout.as_ref(),
+                        );
+                        if ui_route == DirectUiPointerRoute::CapacityExceeded {
+                            conversion_error = Some(
+                                "Direct pointer ownership capacity reached; capture stopped rather than reassigning a live gesture"
+                                    .to_owned(),
+                            );
+                            break;
+                        }
+                        if let Some(action) = completed_action {
+                            if pane_actions.len() >= MAX_DEFERRED_PANE_ACTIONS
+                                || pane_actions.try_reserve(1).is_err()
+                            {
+                                conversion_error = Some(
+                                    "correction-pane action batch exceeded its fixed capacity"
+                                        .to_owned(),
+                                );
                                 break;
                             }
-                        };
-                        let converted = if self.canvas_scene.tool() == CanvasTool::Pen {
-                            self.direct_input_tracker
-                                .direct_batch_to_events(
+                            pane_actions.push(action);
+                        }
+                        let converted = if ui_route == DirectUiPointerRoute::Unowned {
+                            (|| {
+                                let mut raw_events = if batch.message_kind == PointerMessageKind::Down {
+                                    self.canvas_tool_gesture_tracker
+                                        .cancel_pointer_id(Some(batch.pointer_id_requested));
+                                    self.direct_input_tracker.interrupt_pointer_id(
+                                        batch.pointer_id_requested,
+                                        StrokeInterruptionReason::PointerDownBeforePenUp,
+                                        batch.hook_observed_elapsed_ns,
+                                    )?
+                                } else {
+                                    Vec::new()
+                                };
+                                let mut unowned = canvas::CanvasInputTracker::direct_batch_to_unowned_events(
                                     batch,
-                                    &self.project_journal_id,
                                     &self.active_session_id,
                                     Some(&self.active_config_id),
-                                    view_frame,
-                                )
-                                .map(|events| (events, None))
+                                )?;
+                                raw_events
+                                    .try_reserve(unowned.len())
+                                    .map_err(|_| canvas::CanvasError::PointCapacityReached)?;
+                                raw_events.append(&mut unowned);
+                                Ok((raw_events, None))
+                            })()
                         } else {
-                            self.canvas_tool_gesture_tracker
-                                .direct_batch_to_tool_events(
-                                    self.canvas_scene.tool(),
-                                    batch,
-                                    CanvasToolCaptureContext {
-                                        session_id: &self.active_session_id,
-                                        config_id: Some(&self.active_config_id),
+                            let view_frame = match current_stroke_view_frame.as_ref() {
+                                Some(Ok(frame)) => *frame,
+                                Some(Err(error)) => {
+                                    conversion_error = Some(error.clone());
+                                    break;
+                                }
+                                None => {
+                                    conversion_error = Some(
+                                        "current stroke view frame was not prepared".to_owned(),
+                                    );
+                                    break;
+                                }
+                            };
+                            if self.canvas_scene.tool() == CanvasTool::Pen {
+                                self.direct_input_tracker
+                                    .direct_batch_to_events(
+                                        batch,
+                                        &self.project_journal_id,
+                                        &self.active_session_id,
+                                        Some(&self.active_config_id),
                                         view_frame,
-                                        scene: &self.canvas_scene,
-                                        viewport: self.canvas_viewport,
-                                    },
-                                )
+                                    )
+                                    .map(|events| (events, None))
+                            } else {
+                                self.canvas_tool_gesture_tracker
+                                    .direct_batch_to_tool_events(
+                                        self.canvas_scene.tool(),
+                                        batch,
+                                        CanvasToolCaptureContext {
+                                            session_id: &self.active_session_id,
+                                            config_id: Some(&self.active_config_id),
+                                            view_frame,
+                                            scene: &self.canvas_scene,
+                                            viewport: self.canvas_viewport,
+                                        },
+                                    )
+                            }
                         };
                         match converted {
                             Ok(converted) => {
@@ -2208,6 +5191,8 @@ impl ProbeApp {
                         if record.source == CaptureSource::DirectWin32Lifecycle
                             || record.kind == LifecycleEventKind::WindowFocusLost =>
                     {
+                        self.direct_ui_pointer_owners
+                            .observe_lifecycle(record.kind, record.pointer_id_raw);
                         self.canvas_tool_gesture_tracker
                             .cancel_pointer_id(record.pointer_id_raw);
                         match self.direct_input_tracker.on_direct_lifecycle(
@@ -2242,6 +5227,9 @@ impl ProbeApp {
         if events.is_empty() {
             self.last_project_message_sequence = last_message_sequence;
             self.apply_canvas_tool_intents(tool_intents);
+            for action in pane_actions {
+                self.dispatch_pane_action(action);
+            }
             return;
         }
         if let Err(error) = self.apply_capture_preview_events(&events) {
@@ -2263,6 +5251,9 @@ impl ProbeApp {
             Ok(()) => {
                 self.last_project_message_sequence = last_message_sequence;
                 self.apply_canvas_tool_intents(tool_intents);
+                for action in pane_actions {
+                    self.dispatch_pane_action(action);
+                }
             }
             Err(ProjectQueueError::Backpressure {
                 batch_id,
@@ -2271,6 +5262,7 @@ impl ProbeApp {
             }) => {
                 self.deferred_capture_batch = Some((batch_id, last_message_sequence, events));
                 self.deferred_canvas_intents = tool_intents;
+                self.deferred_pane_actions = pane_actions;
                 self.probe_state
                     .borrow_mut()
                     .mark_project_writer_backpressure(queued_samples, 8);
@@ -2284,6 +5276,7 @@ impl ProbeApp {
                 batch_id: stopped_batch_id,
                 events,
             }) => {
+                self.deferred_pane_actions.clear();
                 let omitted_samples = direct_capture_sample_count(&events);
                 self.discard_preview_capture_events(&events);
                 self.deferred_canvas_intents.clear();
@@ -2293,6 +5286,7 @@ impl ProbeApp {
                 ));
             }
             Err(ProjectQueueError::QueueFull | ProjectQueueError::WorkerStopped) => {
+                self.deferred_pane_actions.clear();
                 self.mark_project_incomplete(
                     "project writer command queue is unavailable".to_owned(),
                 );
@@ -2312,12 +5306,21 @@ impl ProbeApp {
             ));
         }
         let deadline = Instant::now() + Duration::from_secs(5);
-        while self.deferred_capture_batch.is_some() && Instant::now() < deadline {
+        while (self.deferred_capture_batch.is_some() || self.pending_correction.is_some())
+            && Instant::now() < deadline
+        {
             self.drain_project_writer_acks();
+            self.retry_pending_correction();
             self.try_send_deferred_capture_batch();
-            if self.deferred_capture_batch.is_some() {
+            if self.deferred_capture_batch.is_some() || self.pending_correction.is_some() {
                 std::thread::sleep(Duration::from_millis(2));
             }
+        }
+        if self.pending_correction.take().is_some() {
+            self.mark_project_incomplete(
+                "shutdown ended before the requested correction received a durable acknowledgement"
+                    .to_owned(),
+            );
         }
         if let Some((batch_id, _, events)) = self.deferred_capture_batch.take() {
             let omitted_samples = direct_capture_sample_count(&events);
@@ -2591,7 +5594,9 @@ impl ApplicationHandler for ProbeApp {
             return;
         }
 
-        let attributes = Window::default_attributes().with_title(STATUS);
+        let attributes = Window::default_attributes()
+            .with_title(STATUS)
+            .with_min_inner_size(PhysicalSize::new(960, 720));
         match event_loop.create_window(attributes) {
             Ok(window) => {
                 let size = window.inner_size();
@@ -2599,6 +5604,9 @@ impl ApplicationHandler for ProbeApp {
                 let hwnd = raw_window_hwnd(&window).unwrap_or(0);
                 let dpi_scale_factor = window.scale_factor();
                 self.window = Some(window);
+                self.pane_text_measurements.clear();
+                self.pane_text_measurements
+                    .set_hwnd((hwnd != 0).then_some(hwnd));
                 if let Some(origin) = self.window.as_ref().and_then(raw_client_screen_origin) {
                     self.canvas_origin = Some(origin);
                     self.canvas_dpi_scale_factor = dpi_scale_factor;
@@ -2721,6 +5729,9 @@ impl ApplicationHandler for ProbeApp {
 
         match event {
             WindowEvent::CloseRequested => {
+                if let Some(window) = self.window.as_ref() {
+                    window.set_ime_allowed(false);
+                }
                 self.record_application_lifecycle(
                     LifecycleEventKind::WindowCloseRequested,
                     None,
@@ -2736,6 +5747,18 @@ impl ApplicationHandler for ProbeApp {
             WindowEvent::Focused(focused) => {
                 self.focused = Some(focused);
                 if !focused {
+                    self.correction_mouse_selecting = false;
+                    self.alt_graph_active = false;
+                    if let Some(session) = self.correction_session.as_mut() {
+                        session.cancel_ime_preedit();
+                        session.on_focus_lost();
+                    }
+                    self.provider_config_path_editor.cancel_preedit();
+                    self.provider_id_editor.cancel_preedit();
+                    self.export_path_editor.cancel_preedit();
+                    if let Some(window) = self.window.as_ref() {
+                        window.set_ime_allowed(false);
+                    }
                     self.canvas_tool_gesture_tracker.cancel_all();
                     let canceled = cancel_mouse_canvas_gestures(
                         &mut self.canvas_cursor_client,
@@ -2749,6 +5772,11 @@ impl ApplicationHandler for ProbeApp {
                             "Mouse canvas drag canceled on focus loss; no edit was written"
                                 .to_owned();
                     }
+                } else if self.correction_focus.is_text_field()
+                    && let Some(window) = self.window.as_ref()
+                {
+                    window.set_ime_allowed(true);
+                    self.update_ime_cursor_area();
                 }
                 self.record_application_lifecycle(
                     if focused {
@@ -2783,36 +5811,62 @@ impl ApplicationHandler for ProbeApp {
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.pane_text_measurements.clear();
                 self.observe_canvas_window_frame(Some(scale_factor));
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(window) = self.window.as_ref()
-                    && let Err(error) = paint_gdi(
-                        window,
-                        &self.canvas_scene,
-                        self.canvas_viewport,
-                        &format!(
-                            "{} | source {} (no fallback) | zoom {:.0}% pan {:.0},{:.0} | Ctrl+Z/Y undo/redo | arrows move selected",
-                            self.canvas_status,
-                            match self.capture_mode {
-                                CaptureMode::DirectWmPointer => "Direct WM_POINTER",
-                                CaptureMode::Wintab =>
-                                    "explicit Wintab; canvas adapter unavailable",
-                            },
-                            self.canvas_viewport.zoom() * 100.0,
-                            self.canvas_viewport.pan().0,
-                            self.canvas_viewport.pan().1,
-                        ),
-                    )
-                {
-                    self.startup_error = Some(format!("canvas repaint failed: {error}"));
-                    self.record_lifecycle_issue(
-                        LifecycleEventKind::WindowInitializationFailed,
-                        format!("canvas repaint failed: {error}"),
-                    );
+                match self.correction_pane_layout() {
+                    Ok(side_pane) => {
+                        if let Some(window) = self.window.as_ref()
+                            && let Err(error) = paint_gdi_with_side_pane(
+                                window,
+                                &self.canvas_scene,
+                                self.canvas_viewport,
+                                &format!(
+                                    "{} | source {} (no fallback) | zoom {:.0}% pan {:.0},{:.0} | Ctrl+Z/Y undo/redo | arrows move selected",
+                                    self.canvas_status,
+                                    match self.capture_mode {
+                                        CaptureMode::DirectWmPointer => "Direct WM_POINTER",
+                                        CaptureMode::Wintab =>
+                                            "explicit Wintab; canvas adapter unavailable",
+                                    },
+                                    self.canvas_viewport.zoom() * 100.0,
+                                    self.canvas_viewport.pan().0,
+                                    self.canvas_viewport.pan().1,
+                                ),
+                                &side_pane.lines,
+                            )
+                        {
+                            self.startup_error = Some(format!("canvas repaint failed: {error}"));
+                            self.record_lifecycle_issue(
+                                LifecycleEventKind::WindowInitializationFailed,
+                                format!("canvas repaint failed: {error}"),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!("correction pane text measurement failed: {error}");
+                        self.startup_error = Some(message.clone());
+                        self.correction_panel_status =
+                            "Pane measurement is unavailable; correction controls are paused."
+                                .to_owned();
+                        self.record_lifecycle_issue(
+                            LifecycleEventKind::WindowInitializationFailed,
+                            message,
+                        );
+                        if let Some(window) = self.window.as_ref() {
+                            let _ = paint_gdi_with_side_pane(
+                                window,
+                                &self.canvas_scene,
+                                self.canvas_viewport,
+                                &self.correction_panel_status,
+                                &[],
+                            );
+                        }
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. }
@@ -2831,14 +5885,29 @@ impl ApplicationHandler for ProbeApp {
                     return;
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => self.handle_canvas_key(&event),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.logical_key == Key::Named(NamedKey::AltGraph) {
+                    self.alt_graph_active = event.state == ElementState::Pressed;
+                }
+                if !self.handle_focused_text_key(&event) {
+                    self.handle_canvas_key(&event);
+                }
+            }
+            WindowEvent::Ime(ime) => self.handle_ime_event(ime),
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.canvas_modifiers = modifiers.state();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let cursor = (position.x, position.y);
                 self.canvas_cursor_client = Some(cursor);
-                if let Some(last) = self.canvas_pan_drag_last {
+                if self.correction_mouse_selecting {
+                    if let (Some(anchor), Some(caret)) = (
+                        self.correction_mouse_selection_anchor,
+                        self.correction_text_caret_at(cursor),
+                    ) {
+                        self.focused_select_graphemes(anchor, caret);
+                    }
+                } else if let Some(last) = self.canvas_pan_drag_last {
                     if cursor != last {
                         self.interrupt_active_canvas_strokes(
                             StrokeInterruptionReason::CanvasViewTransformChanged,
@@ -2872,6 +5941,7 @@ impl ApplicationHandler for ProbeApp {
                 self.canvas_cursor_client = None;
                 self.canvas_pan_drag_last = None;
                 self.canvas_selection_drag_start = None;
+                self.correction_mouse_selecting = false;
                 if self.canvas_move_drag_start.take().is_some() {
                     self.canvas_status =
                         "Move cancelled when the cursor left the canvas; no edit was written"
@@ -2883,27 +5953,67 @@ impl ApplicationHandler for ProbeApp {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                self.handle_canvas_mouse_button(button, state);
+                let window_hwnd = self.window.as_ref().and_then(raw_window_hwnd);
+                let origin = self.probe_state.borrow().public_mouse_input_origin(
+                    window_hwnd,
+                    state,
+                    button,
+                );
+                let (
+                    has_active_canvas_pointer,
+                    has_pending_direct_action,
+                    targets_pane_action,
+                ) =
+                    if self.capture_mode == CaptureMode::DirectWmPointer
+                        && matches!(origin, MouseMessageOrigin::PenPromoted { .. })
+                    {
+                        let active_canvas_pointer =
+                            self.direct_ui_pointer_owners.has_active_canvas_pointer();
+                        let pending_direct_action =
+                            self.direct_ui_pointer_owners.has_pending_direct_action();
+                        let targets_pane_action =
+                            self.winit_mouse_input_targets_pane_action(button, state);
+                        (
+                            active_canvas_pointer,
+                            pending_direct_action,
+                            targets_pane_action,
+                        )
+                    } else {
+                        (false, false, false)
+                    };
+                if should_process_winit_mouse_input(
+                    self.capture_mode,
+                    origin,
+                    has_active_canvas_pointer,
+                    has_pending_direct_action,
+                    targets_pane_action,
+                ) {
+                    if !self.handle_correction_mouse_button(button, state) {
+                        self.handle_canvas_mouse_button(button, state);
+                    }
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let steps = match delta {
-                    MouseScrollDelta::LineDelta(_, vertical) => f64::from(vertical),
-                    MouseScrollDelta::PixelDelta(position) => position.y / 120.0,
-                };
-                if let Some((anchor_x, anchor_y)) = self.canvas_cursor_client {
-                    self.interrupt_active_canvas_strokes(
-                        StrokeInterruptionReason::CanvasViewTransformChanged,
-                    );
-                    if let Err(error) =
-                        self.canvas_viewport
-                            .zoom_about(anchor_x, anchor_y, 1.1_f64.powf(steps))
-                    {
-                        self.canvas_status = format!("Zoom failed: {error:?}");
-                    } else {
-                        self.note_convert_view_change();
-                    }
-                    if let Some(window) = self.window.as_ref() {
-                        window.request_redraw();
+                if !self.handle_correction_pane_wheel(&delta) {
+                    let steps = match delta {
+                        MouseScrollDelta::LineDelta(_, vertical) => f64::from(vertical),
+                        MouseScrollDelta::PixelDelta(position) => position.y / 120.0,
+                    };
+                    if let Some((anchor_x, anchor_y)) = self.canvas_cursor_client {
+                        self.interrupt_active_canvas_strokes(
+                            StrokeInterruptionReason::CanvasViewTransformChanged,
+                        );
+                        if let Err(error) =
+                            self.canvas_viewport
+                                .zoom_about(anchor_x, anchor_y, 1.1_f64.powf(steps))
+                        {
+                            self.canvas_status = format!("Zoom failed: {error:?}");
+                        } else {
+                            self.note_convert_view_change();
+                        }
+                        if let Some(window) = self.window.as_ref() {
+                            window.request_redraw();
+                        }
                     }
                 }
             }
@@ -2979,6 +6089,12 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
         .as_deref()
         .map(|path| LocalConvertProviderV1::load(path, options.provider_selection_id.as_deref()))
         .transpose()?;
+    let provider_config_path_text = options
+        .provider_config_path
+        .as_deref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let provider_id_text = options.provider_selection_id.clone().unwrap_or_default();
     let capture_mode = options.capture_mode;
     let app_clock_origin = Instant::now();
     let session_started_unix_ns = SystemTime::now()
@@ -3194,6 +6310,23 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
             app_arrival_elapsed_ns: 0,
         })?;
     }
+    let initial_correction_session = project
+        .replay_state()
+        .recognition_projections
+        .last()
+        .map(|stored| {
+            CorrectionSession::open(
+                project.replay_state(),
+                &stored.projection.projection_id,
+            )
+        })
+        .transpose()
+        .map_err(|_| io::Error::other("could not open the latest stored correction projection"))?;
+    let initial_correction_status = if initial_correction_session.is_some() {
+        "Stored projection opened; no correction draft is pending.".to_owned()
+    } else {
+        String::new()
+    };
     let incomplete_stroke_count = project.replay_state().incomplete_stroke_count();
     let historical_interrupted_strokes_at_start = project.replay_state().stroke_interruptions.len();
     let session_writer = SessionWriter::create(options.session_path.clone(), &metadata)?;
@@ -3245,6 +6378,22 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
         local_convert_provider,
         provider_worker: None,
         pending_convert: None,
+        correction_session: initial_correction_session,
+        pending_correction: None,
+        next_correction_id: 1,
+        correction_focus: CorrectionPaneFocus::None,
+        correction_panel_status: initial_correction_status,
+        provider_config_path_editor: CorrectionTextEditor::new(&provider_config_path_text)?,
+        provider_id_editor: CorrectionTextEditor::new(&provider_id_text)?,
+        export_path_editor: CorrectionTextEditor::new("")?,
+        direct_ui_pointer_owners: DirectUiPointerOwnerTracker::default(),
+        deferred_pane_actions: Vec::new(),
+        correction_pane_scroll: CorrectionPaneScrollOffsets::default(),
+        pane_text_measurements: GdiTextAdvanceCache::default(),
+        correction_editor_browse_mode: false,
+        correction_mouse_selection_anchor: None,
+        correction_mouse_selecting: false,
+        alt_graph_active: false,
         next_convert_generation: 1,
         project_generation: 1,
         convert_view_generation: 0,
@@ -3883,6 +7032,564 @@ mod pending_record_cursor_tests {
 }
 
 #[cfg(test)]
+mod correction_pane_pointer_owner_tests {
+    use super::{
+        CanvasOrigin, CorrectionPaneAction, DirectUiPointerOwnerTracker, DirectUiPointerRoute,
+        CORRECTION_PANE_PADDING_PX, GdiTextAdvanceCache, MAX_UI_POINTER_OWNERS,
+        correction_action_hit_targets,
+        correction_pane_contains_client_point, correction_pane_left_edge,
+        correction_pane_scroll_offset, direct_screen_point_in_correction_pane,
+        should_process_winit_mouse_input,
+    };
+    use crate::win32_pointer::{CaptureMode, MouseMessageOrigin, PointerMessageKind};
+
+    #[test]
+    fn direct_pointer_owner_is_frozen_at_down_when_gesture_crosses_pane() {
+        let mut owners = DirectUiPointerOwnerTracker::default();
+        let canvas_key = (0x1111, 7);
+        let pane_key = (0x2222, 8);
+
+        assert_eq!(
+            owners.route_down(canvas_key, false, None),
+            DirectUiPointerRoute::Canvas
+        );
+        assert!(owners.has_active_canvas_pointer());
+        // A canvas-owned gesture stays with CanvasInputTracker when later
+        // updates cross the side-pane area.
+        assert_eq!(
+            owners.route_continuation(canvas_key, PointerMessageKind::Update, None),
+            (DirectUiPointerRoute::Canvas, None)
+        );
+        assert_eq!(
+            owners.route_continuation(
+                canvas_key,
+                PointerMessageKind::Up,
+                Some(CorrectionPaneAction::Convert)
+            ),
+            (DirectUiPointerRoute::Canvas, None)
+        );
+        assert!(!should_process_winit_mouse_input(
+            CaptureMode::DirectWmPointer,
+            MouseMessageOrigin::PenPromoted { cursor_id: 7 },
+            false,
+            false,
+            true,
+        ));
+        assert!(!should_process_winit_mouse_input(
+            CaptureMode::DirectWmPointer,
+            MouseMessageOrigin::PenPromoted { cursor_id: 7 },
+            true,
+            false,
+            false,
+        ));
+        assert!(!owners.has_active_canvas_pointer());
+
+        assert_eq!(
+            owners.route_down(pane_key, true, Some(CorrectionPaneAction::Save)),
+            DirectUiPointerRoute::Unowned
+        );
+        assert!(owners.has_pending_action(CorrectionPaneAction::Save));
+        // A UI-owned down remains raw/non-stroke even after moving over canvas.
+        assert_eq!(
+            owners.route_continuation(pane_key, PointerMessageKind::Update, None),
+            (DirectUiPointerRoute::Unowned, None)
+        );
+        assert_eq!(
+            owners.route_continuation(
+                pane_key,
+                PointerMessageKind::Up,
+                Some(CorrectionPaneAction::Save)
+            ),
+            (DirectUiPointerRoute::Unowned, Some(CorrectionPaneAction::Save))
+        );
+        assert_eq!(
+            owners.route_continuation(pane_key, PointerMessageKind::Update, None),
+            (DirectUiPointerRoute::Canvas, None)
+        );
+        assert!(!owners.has_pending_action(CorrectionPaneAction::Save));
+    }
+
+    #[test]
+    fn pointer_owner_capacity_fails_closed_instead_of_reassigning_a_ui_gesture() {
+        let mut owners = DirectUiPointerOwnerTracker::default();
+        for pointer_id in 0..u32::try_from(MAX_UI_POINTER_OWNERS).unwrap() {
+            assert_eq!(
+                owners.route_down(
+                    (isize::try_from(pointer_id).unwrap(), pointer_id),
+                    true,
+                    None,
+                ),
+                DirectUiPointerRoute::Unowned
+            );
+        }
+        let overflow = (isize::MAX, u32::MAX);
+        assert_eq!(
+            owners.route_down(overflow, true, None),
+            DirectUiPointerRoute::Unowned
+        );
+        assert_eq!(
+            owners.route_continuation(overflow, PointerMessageKind::Update, None),
+            (DirectUiPointerRoute::Unowned, None)
+        );
+        assert_eq!(
+            owners.route_down((isize::MAX - 1, u32::MAX - 1), true, None),
+            DirectUiPointerRoute::CapacityExceeded
+        );
+        assert_eq!(
+            owners.route_continuation(overflow, PointerMessageKind::Up, None),
+            (DirectUiPointerRoute::Unowned, None)
+        );
+    }
+
+    #[test]
+    fn correction_pane_hit_test_uses_the_captured_physical_client_frame() {
+        let origin = CanvasOrigin {
+            x_screen_px: 1_000,
+            y_screen_px: 2_000,
+        };
+        let size = (1_200, 700);
+        assert!(direct_screen_point_in_correction_pane((1_840, 2_000), origin, size));
+        assert!(!direct_screen_point_in_correction_pane((1_839, 2_000), origin, size));
+        assert!(!direct_screen_point_in_correction_pane((2_200, 2_000), origin, size));
+        assert!(!direct_screen_point_in_correction_pane((1_840, 2_700), origin, size));
+    }
+
+    #[test]
+    fn same_action_real_mouse_after_pen_is_honored_and_confirmed_promotion_is_filtered() {
+        let mut actions = vec![CorrectionPaneAction::Convert];
+        if should_process_winit_mouse_input(
+            CaptureMode::DirectWmPointer,
+            MouseMessageOrigin::Unknown,
+            false,
+            false,
+            false,
+        ) {
+            actions.push(CorrectionPaneAction::Convert);
+        }
+        assert_eq!(actions, vec![CorrectionPaneAction::Convert, CorrectionPaneAction::Convert]);
+        assert!(!should_process_winit_mouse_input(
+            CaptureMode::DirectWmPointer,
+            MouseMessageOrigin::PenPromoted { cursor_id: 7 },
+            false,
+            false,
+            true,
+        ));
+        assert!(should_process_winit_mouse_input(
+            CaptureMode::DirectWmPointer,
+            MouseMessageOrigin::TouchPromoted { cursor_id: 9 },
+            false,
+            false,
+            true,
+        ));
+        assert!(should_process_winit_mouse_input(
+            CaptureMode::DirectWmPointer,
+            MouseMessageOrigin::Unknown,
+            true,
+            false,
+            true,
+        ));
+        assert!(should_process_winit_mouse_input(
+            CaptureMode::DirectWmPointer,
+            MouseMessageOrigin::PenPromoted { cursor_id: 7 },
+            false,
+            false,
+            false,
+        ));
+        let mut owners = DirectUiPointerOwnerTracker::default();
+        assert_eq!(
+            owners.route_down((0x4444, 10), true, Some(CorrectionPaneAction::Convert)),
+            DirectUiPointerRoute::Unowned,
+        );
+        assert!(owners.has_pending_direct_action());
+        assert!(!should_process_winit_mouse_input(
+            CaptureMode::DirectWmPointer,
+            MouseMessageOrigin::PenPromoted { cursor_id: 7 },
+            false,
+            owners.has_pending_direct_action(),
+            false,
+        ));
+    }
+
+    #[test]
+    fn action_hit_targets_follow_measured_labels_and_spacing() {
+        let mut measurements = GdiTextAdvanceCache::default();
+        let targets = correction_action_hit_targets(
+            "[Convert] [Save] [Reset] [Cancel] [Copy]",
+            &mut measurements,
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 5);
+        assert_eq!(targets[0].1, CorrectionPaneAction::Convert);
+        assert_eq!(targets[1].1, CorrectionPaneAction::Save);
+        assert_eq!(targets[2].1, CorrectionPaneAction::Reset);
+        assert_eq!(targets[3].1, CorrectionPaneAction::Cancel);
+        assert_eq!(targets[4].1, CorrectionPaneAction::Copy);
+        assert_eq!(targets[0].0, 0..80);
+        assert_eq!(targets[4].0, 272..320);
+    }
+
+    #[test]
+    fn pane_hit_bounds_match_render_width_and_reject_off_client_releases() {
+        for (width, expected_left) in [(0, 0), (1, 0), (359, 0), (360, 0), (960, 600)] {
+            assert_eq!(correction_pane_left_edge(width), expected_left);
+            assert!(!correction_pane_contains_client_point(-1, 20, width, 80));
+            assert!(!correction_pane_contains_client_point(width, 20, width, 80));
+            assert_eq!(
+                correction_pane_contains_client_point(expected_left, 20, width, 80),
+                width > 0,
+            );
+        }
+
+        let width = 1_i64;
+        let off_client_x = -200_i64;
+        let naive_left = width - 360;
+        let naive_offset = i32::try_from(
+            off_client_x - naive_left - i64::from(CORRECTION_PANE_PADDING_PX),
+        )
+        .unwrap();
+        assert_eq!(naive_offset, 147);
+        let measured_actions = correction_action_hit_targets(
+            "[Convert] [Save] [Reset] [Cancel] [Copy]",
+            &mut GdiTextAdvanceCache::default(),
+        )
+        .unwrap();
+        assert_eq!(measured_actions[2].1, CorrectionPaneAction::Reset);
+        assert!(measured_actions[2].0.contains(&naive_offset));
+
+        let origin = CanvasOrigin {
+            x_screen_px: 100,
+            y_screen_px: 200,
+        };
+        let release_point = ((origin.x_screen_px - 200) as i32, 220);
+        assert!(!direct_screen_point_in_correction_pane(
+            release_point,
+            origin,
+            (1, 80),
+        ));
+        let action_at_release = correction_pane_contains_client_point(
+            off_client_x,
+            20,
+            width,
+            80,
+        )
+        .then_some(CorrectionPaneAction::Reset);
+        let mut owners = DirectUiPointerOwnerTracker::default();
+        let key = (0x3333, 9);
+        assert_eq!(
+            owners.route_down(key, true, Some(CorrectionPaneAction::Reset)),
+            DirectUiPointerRoute::Unowned,
+        );
+        assert_eq!(
+            owners.route_continuation(key, PointerMessageKind::Up, action_at_release),
+            (DirectUiPointerRoute::Unowned, None),
+        );
+    }
+}
+
+#[cfg(test)]
+mod correction_pane_scroll_tests {
+    use super::{
+        CanvasViewport, CorrectionPaneLayout, CorrectionPaneScrollOffsets,
+        CorrectionPaneTextSection, GdiTextAdvanceCache, append_pane_line,
+        append_scrolled_measured_rows, correction_pane_scroll_offset,
+        correction_editor_scroll_offset_for_caret, correction_pane_visible_row_count,
+        measured_editor_display_rows,
+        measured_pane_text_rows, scroll_view_range, inline_editor_cursor_at,
+    };
+    use crate::correction::CorrectionTextEditor;
+
+    #[test]
+    fn section_scroll_reaches_provider_effective_and_draft_ends_without_editing() {
+        let provider = format!("PROVIDER-HEAD-{}-MIDDLE-{}-PROVIDER-TAIL", "p".repeat(48), "q".repeat(48));
+        let effective = format!("ORIGINAL-HEAD-{}-MIDDLE-{}-EFFECTIVE-TAIL", "e".repeat(48), "f".repeat(48));
+        let draft_text = format!("DRAFT-HEAD-{}-MIDDLE-{}-DRAFT-TAIL", "d".repeat(72), "x".repeat(72));
+        let mut editor = CorrectionTextEditor::new(&draft_text).unwrap();
+        let draft_before = editor.text().to_owned();
+        let viewport = CanvasViewport::default();
+        let zoom_before = viewport.zoom();
+        let pan_before = viewport.pan();
+        let mut measurements = GdiTextAdvanceCache::default();
+
+        let provider_rows = measured_pane_text_rows(&provider, 64, &mut measurements).unwrap();
+        let effective_rows = measured_pane_text_rows(&effective, 64, &mut measurements).unwrap();
+        let draft_rows = measured_editor_display_rows(&editor, 64, &mut measurements).unwrap();
+        let provider_first = scroll_view_range(provider_rows.len(), 3, 0);
+        let provider_last = scroll_view_range(provider_rows.len(), 3, usize::MAX);
+        assert!(provider_rows[provider_first].iter().map(|row| row.text.as_str()).collect::<String>().contains("PROVIDER-HEAD"));
+        assert!(provider_rows[provider_last].iter().map(|row| row.text.as_str()).collect::<String>().contains("PROVIDER-TAIL"));
+        assert!(provider_rows.iter().map(|row| row.text.as_str()).collect::<String>().contains("MIDDLE"));
+
+        let effective_first = scroll_view_range(effective_rows.len(), 2, 0);
+        let effective_last = scroll_view_range(effective_rows.len(), 2, usize::MAX);
+        assert!(effective_rows[effective_first].iter().map(|row| row.text.as_str()).collect::<String>().contains("ORIGINAL-HEAD"));
+        assert!(effective_rows[effective_last].iter().map(|row| row.text.as_str()).collect::<String>().contains("EFFECTIVE-TAIL"));
+
+        let draft_first = scroll_view_range(draft_rows.len(), 4, 0);
+        let draft_last = scroll_view_range(draft_rows.len(), 4, usize::MAX);
+        assert!(draft_rows[draft_first].iter().map(|row| row.0.as_str()).collect::<String>().contains("DRAFT-HEAD"));
+        assert!(draft_rows[draft_last].iter().map(|row| row.0.as_str()).collect::<String>().contains("DRAFT-TAIL"));
+
+        let mut offsets = CorrectionPaneScrollOffsets::default();
+        let max_provider_offset = provider_rows.len().saturating_sub(3);
+        offsets.set(
+            CorrectionPaneTextSection::ProviderOutput,
+            correction_pane_scroll_offset(0, -1.0, max_provider_offset),
+        );
+        assert_eq!(offsets.get(CorrectionPaneTextSection::ProviderOutput), 1);
+        assert_eq!(viewport.zoom(), zoom_before);
+        assert_eq!(viewport.pan(), pan_before);
+        assert_eq!(editor.text(), draft_before);
+
+        let mut top_layout = CorrectionPaneLayout::default();
+        append_scrolled_measured_rows(
+            &mut top_layout,
+            CorrectionPaneTextSection::ProviderOutput,
+            &provider_rows,
+            3,
+            0,
+        );
+        let top_actions = append_pane_line(&mut top_layout, "[Convert] [Save] [Reset] [Cancel] [Copy]".to_owned());
+        let top_config = append_pane_line(&mut top_layout, "[Load config]".to_owned());
+
+        let mut bottom_layout = CorrectionPaneLayout::default();
+        append_scrolled_measured_rows(
+            &mut bottom_layout,
+            CorrectionPaneTextSection::ProviderOutput,
+            &provider_rows,
+            3,
+            usize::MAX,
+        );
+        let bottom_actions = append_pane_line(&mut bottom_layout, "[Convert] [Save] [Reset] [Cancel] [Copy]".to_owned());
+        let bottom_config = append_pane_line(&mut bottom_layout, "[Load config]".to_owned());
+        assert_eq!(top_actions, bottom_actions);
+        assert_eq!(top_config, bottom_config);
+        assert!(correction_pane_visible_row_count(720) >= bottom_layout.lines.len());
+    }
+
+    #[test]
+    fn wheel_scroll_offsets_are_bounded_in_both_directions() {
+        assert_eq!(correction_pane_scroll_offset(0, 1.0, 9), 0);
+        assert_eq!(correction_pane_scroll_offset(4, 2.0, 9), 2);
+        assert_eq!(correction_pane_scroll_offset(8, -4.0, 9), 9);
+        assert_eq!(correction_pane_scroll_offset(9, -4.0, 9), 9);
+    }
+
+    #[test]
+    fn draft_caret_recenters_after_read_only_browsing() {
+        assert_eq!(correction_editor_scroll_offset_for_caret(0, 9, 10, 4), 6);
+        assert_eq!(correction_editor_scroll_offset_for_caret(6, 4, 10, 4), 4);
+        assert_eq!(correction_editor_scroll_offset_for_caret(6, 7, 10, 4), 6);
+    }
+
+    #[test]
+    fn measured_editor_rows_drive_up_down_shift_selection_and_caret_view() {
+        let text = format!("a👩‍💻{}", "b".repeat(20));
+        let mut editor = CorrectionTextEditor::new(&text).unwrap();
+        let mut measurements = GdiTextAdvanceCache::default();
+        let rows = measured_editor_display_rows(&editor, 64, &mut measurements).unwrap();
+        let ranges = rows
+            .iter()
+            .map(|(_, range, _)| range.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ranges, vec![0..5, 5..10, 10..15, 15..20, 20..22]);
+
+        editor.set_cursor_grapheme(6);
+        editor.move_cursor_on_visual_rows(&ranges, -1, false);
+        assert_eq!(editor.cursor_grapheme(), 1);
+        editor.move_cursor_on_visual_rows(&ranges, 1, false);
+        assert_eq!(editor.cursor_grapheme(), 6);
+
+        editor.set_cursor_grapheme(1);
+        editor.move_cursor_on_visual_rows(&ranges, 1, true);
+        assert_eq!(editor.cursor_grapheme(), 6);
+        assert_eq!(editor.selection_graphemes(), Some(1..6));
+        assert!(editor.selection_graphemes().is_some_and(|range| {
+            range.start <= editor.grapheme_count() && range.end <= editor.grapheme_count()
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "guarded hosted Windows GDI pane measurement and scroll fixture"]
+    fn gdi_measurement_keeps_wide_vietnamese_nfd_text_reachable_at_minimum_pane_width() {
+        super::require_native_ui_test_opt_in();
+        let class_name: Vec<u16> = "STATIC".encode_utf16().chain(Some(0)).collect();
+        let title: Vec<u16> = "LassoInk pane measurement fixture".encode_utf16().chain(Some(0)).collect();
+        // SAFETY: a null module handle requests the current module; no pointer is retained.
+        let instance = unsafe {
+            windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null())
+        };
+        assert_ne!(instance, 0);
+        // SAFETY: STATIC is a built-in window class and the test owns the resulting HWND.
+        let hwnd = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                0,
+                0,
+                0,
+                960,
+                720,
+                0,
+                0,
+                instance,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(hwnd, 0);
+
+        let mut measurements = GdiTextAdvanceCache::default();
+        measurements.set_hwnd(Some(hwnd as isize));
+        // SAFETY: hwnd is the live fixture window; GetDC is paired with ReleaseDC below.
+        let hdc = unsafe { windows_sys::Win32::Graphics::Gdi::GetDC(hwnd) };
+        assert_ne!(hdc, 0);
+        // SAFETY: TEXTMETRICW is integer output storage and hdc is live.
+        let mut font_metrics: windows_sys::Win32::Graphics::Gdi::TEXTMETRICW =
+            unsafe { std::mem::zeroed() };
+        assert_ne!(
+            unsafe { windows_sys::Win32::Graphics::Gdi::GetTextMetricsW(hdc, &mut font_metrics) },
+            0
+        );
+        assert!(font_metrics.tmHeight <= CORRECTION_PANE_ROW_HEIGHT_PX);
+        // SAFETY: hdc was acquired from this exact hwnd above.
+        assert_ne!(unsafe { windows_sys::Win32::Graphics::Gdi::ReleaseDC(hwnd, hdc) }, 0);
+        let wide = measurements.advances("WWWW").unwrap();
+        let narrow = measurements.advances("iiii").unwrap();
+        assert!(wide.last().copied().unwrap_or_default() > narrow.last().copied().unwrap_or_default());
+        let action_label = "[Convert] [Save] [Reset] [Cancel] [Copy]";
+        assert!(
+            measurements
+                .advances(action_label)
+                .unwrap()
+                .last()
+                .copied()
+                .unwrap_or_default()
+                <= 336,
+            "measured action buttons must fit the 960-pixel minimum pane"
+        );
+
+        let path_text = format!("C:\\Users\\{}", "W".repeat(100));
+        let mut path_editor = CorrectionTextEditor::new(&path_text).unwrap();
+        path_editor.set_cursor_grapheme(path_editor.grapheme_count());
+        let (path_line, path_layout) = inline_text_editor_line(
+            "Config path: ",
+            &path_editor,
+            InlineEditorField::ProviderConfigPath,
+            336,
+            &mut measurements,
+        )
+        .unwrap();
+        assert!(path_layout.visible_graphemes.start > 0);
+        assert_eq!(path_layout.visible_graphemes.end, path_editor.grapheme_count());
+        assert!(path_layout.boundary_x[0] > 0, "measured prefix width must be included");
+        assert!(path_layout
+            .boundary_x
+            .get(path_layout.visible_graphemes.end - path_layout.visible_graphemes.start)
+            .is_some());
+        let mut inline_layout = CorrectionPaneLayout::default();
+        inline_layout.inline_editor_rows.push(path_layout.clone());
+        assert_eq!(
+            inline_editor_cursor_at(
+                &inline_layout,
+                path_layout.field,
+                path_layout.row_index,
+                *path_layout.boundary_x.last().unwrap(),
+            ),
+            Some(path_editor.grapheme_count()),
+        );
+        assert!(measurements
+            .advances(&path_line)
+            .unwrap()
+            .last()
+            .copied()
+            .unwrap_or_default()
+            <= 336);
+
+        let text = format!(
+            "VIETNAMESE-NFD-HEAD {} MIDDLE {} TAIL-NFD-END",
+            "W".repeat(70),
+            "e\u{301}".repeat(70),
+        );
+        let rows = measured_pane_text_rows(&text, 336, &mut measurements).unwrap();
+        assert!(rows.len() > 3);
+        assert_eq!(rows.iter().map(|row| row.text.as_str()).collect::<String>(), text);
+        let head = scroll_view_range(rows.len(), 3, 0);
+        let tail = scroll_view_range(rows.len(), 3, usize::MAX);
+        assert!(rows[head].iter().map(|row| row.text.as_str()).collect::<String>().contains("VIETNAMESE-NFD-HEAD"));
+        assert!(rows[tail].iter().map(|row| row.text.as_str()).collect::<String>().contains("TAIL-NFD-END"));
+
+        // SAFETY: hwnd is the owned fixture window created immediately above.
+        let destroyed = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd)
+        };
+        assert_ne!(destroyed, 0);
+    }
+}
+
+#[cfg(test)]
+mod correction_text_routing_tests {
+    use super::{
+        CorrectionPaneFocus, ElementState, allows_keyboard_text, is_control_alt_shortcut,
+        focused_text_measurement_allows_input, should_insert_keyboard_text,
+        should_process_focused_text_key,
+    };
+
+    #[test]
+    fn altgr_character_input_is_not_mistaken_for_a_control_shortcut() {
+        assert!(is_control_alt_shortcut(true, true, false));
+        assert!(!is_control_alt_shortcut(true, true, true));
+        assert!(allows_keyboard_text(true, true, true));
+        assert!(!allows_keyboard_text(true, true, false));
+        assert!(allows_keyboard_text(false, false, false));
+        assert!(should_insert_keyboard_text(false, false, false, false, true));
+        assert!(!should_insert_keyboard_text(false, false, false, true, true));
+        assert!(should_insert_keyboard_text(true, true, true, false, true));
+    }
+
+    #[test]
+    fn focused_text_fields_process_repeated_pressed_key_events() {
+        assert!(should_process_focused_text_key(ElementState::Pressed, true));
+        assert!(should_process_focused_text_key(ElementState::Pressed, false));
+        assert!(!should_process_focused_text_key(ElementState::Released, true));
+        assert!(should_insert_keyboard_text(false, false, false, false, true));
+    }
+
+    #[test]
+    fn focused_text_input_waits_for_live_measurement() {
+        assert!(!focused_text_measurement_allows_input(
+            CorrectionPaneFocus::CorrectionEditor,
+            false,
+        ));
+        assert!(!focused_text_measurement_allows_input(
+            CorrectionPaneFocus::ProviderConfigPath,
+            false,
+        ));
+        assert!(!focused_text_measurement_allows_input(
+            CorrectionPaneFocus::ProviderId,
+            false,
+        ));
+        assert!(!focused_text_measurement_allows_input(
+            CorrectionPaneFocus::ExportPath,
+            false,
+        ));
+        assert!(focused_text_measurement_allows_input(
+            CorrectionPaneFocus::ProviderConfigPath,
+            true,
+        ));
+    }
+
+    #[test]
+    fn only_explicit_editor_fields_receive_text_focus() {
+        assert!(!CorrectionPaneFocus::None.is_text_field());
+        assert!(CorrectionPaneFocus::CorrectionEditor.is_text_field());
+        assert!(CorrectionPaneFocus::ProviderConfigPath.is_text_field());
+        assert!(CorrectionPaneFocus::ProviderId.is_text_field());
+        assert!(CorrectionPaneFocus::ExportPath.is_text_field());
+    }
+}
+
+#[cfg(test)]
 mod canvas_focus_cancel_tests {
     use super::cancel_mouse_canvas_gestures;
 
@@ -4121,6 +7828,22 @@ mod convert_controller_tests {
             local_convert_provider: None,
             provider_worker: None,
             pending_convert: None,
+            correction_session: None,
+            pending_correction: None,
+            next_correction_id: 1,
+            correction_focus: CorrectionPaneFocus::None,
+            correction_panel_status: String::new(),
+            provider_config_path_editor: CorrectionTextEditor::new("").unwrap(),
+            provider_id_editor: CorrectionTextEditor::new("").unwrap(),
+            export_path_editor: CorrectionTextEditor::new("").unwrap(),
+            direct_ui_pointer_owners: DirectUiPointerOwnerTracker::default(),
+            deferred_pane_actions: Vec::new(),
+            correction_pane_scroll: CorrectionPaneScrollOffsets::default(),
+            pane_text_measurements: GdiTextAdvanceCache::default(),
+            correction_editor_browse_mode: false,
+            correction_mouse_selection_anchor: None,
+            correction_mouse_selecting: false,
+            alt_graph_active: false,
             next_convert_generation: 1,
             project_generation: 1,
             convert_view_generation: 0,
@@ -4313,8 +8036,17 @@ mod f4_convert_mock_pipeline_tests {
     use crate::{
         canvas::PROVISIONAL_DIRECT_SOURCE_API,
         convert::{LocalConvertProviderV1, prepare_conversion},
-        journal::{PhysicalSample, ProjectionInputModalityV1, RawPosition, StrokeRef},
+        journal::{
+            PhysicalSample, ProjectionInkBindingV1, ProjectionInputModalityV1,
+            ProjectionProviderProvenanceV1, RawPosition, RecognitionCandidateV1,
+            RecognitionProjectionV1, RegionCorrectionV1, StrokeRef, StoredRegionCorrection,
+        },
         project_runtime::ProjectWriterAck,
+        win32_pointer::{
+            CaptureSource, CoordinateSpace, CoordinateUnits, DirectPenHistoryBatch,
+            OwnedPointerSample, PointerAttribution, PointerMessageKind, PressureValidity,
+            RawPoint, RawScreenPosition,
+        },
         provider_protocol::{
             PROVIDER_PROTOCOL_VERSION, ProviderCandidateV1, ProviderCapabilitiesV1,
             ProviderIdentityV1, ProviderInputCapabilityV1, ProviderOutputCapabilityV1,
@@ -4471,6 +8203,66 @@ mod f4_convert_mock_pipeline_tests {
         }
     }
 
+    fn direct_ui_batch(
+        message_sequence: u64,
+        message_kind: PointerMessageKind,
+        x_screen_px: i32,
+        y_screen_px: i32,
+    ) -> DirectPenHistoryBatch {
+        let pointer_id = 29;
+        let device_handle = 0xD129;
+        DirectPenHistoryBatch {
+            source: CaptureSource::DirectWmPointerPenHistory,
+            message_sequence,
+            message_id_raw: 0,
+            message_hwnd_raw_session_scoped: 0xBEEF,
+            message_time_ms_raw: Some(u32::try_from(message_sequence).unwrap_or_default()),
+            message_kind,
+            pointer_id_requested: pointer_id,
+            hook_observed_elapsed_ns: u128::from(message_sequence),
+            hook_qpc_count_raw: Some(message_sequence),
+            hook_qpc_issue: None,
+            qpc_frequency_hz: Some(10_000_000),
+            native_history_count: 1,
+            samples: vec![OwnedPointerSample {
+                history_index_newest_first: 0,
+                chronological_index: 0,
+                attribution: PointerAttribution::MatchesRequestedPointer,
+                pointer_type_raw: windows_sys::Win32::UI::WindowsAndMessaging::PT_PEN,
+                pointer_id_raw: pointer_id,
+                frame_id_raw: u32::try_from(message_sequence).unwrap_or_default(),
+                source_device_handle_raw_session_scoped: device_handle,
+                target_hwnd_raw_session_scoped: 0xBEEF,
+                pointer_flags_raw: 0,
+                button_change_type_raw: 0,
+                position: RawScreenPosition {
+                    coordinate_space: CoordinateSpace::WindowsScreenCoordinates,
+                    pixel_units: CoordinateUnits::ScreenPixel,
+                    pt_pixel_location_raw: RawPoint {
+                        x: x_screen_px,
+                        y: y_screen_px,
+                    },
+                    himetric_units: CoordinateUnits::HimetricHundredthMillimeter,
+                    pt_himetric_location_raw: RawPoint { x: 0, y: 0 },
+                },
+                performance_count_qpc_raw: message_sequence,
+                dw_time_ms_wrapping_raw: u32::try_from(message_sequence).unwrap_or_default(),
+                history_count_raw: 1,
+                input_data_raw: 0,
+                key_states_raw: 0,
+                pen_flags_raw: 0,
+                pen_mask_raw: 0,
+                pressure_raw: 0,
+                pressure_validity: PressureValidity::NotReported,
+                rotation_raw: 0,
+                tilt_x_raw: 0,
+                tilt_y_raw: 0,
+                tilt: None,
+                validation_issues: Vec::new(),
+            }],
+        }
+    }
+
     fn provider_for_expected_request(
         directory: &std::path::Path,
         executable: &std::path::Path,
@@ -4537,6 +8329,22 @@ mod f4_convert_mock_pipeline_tests {
             local_convert_provider: Some(provider),
             provider_worker: None,
             pending_convert: None,
+            correction_session: None,
+            pending_correction: None,
+            next_correction_id: 1,
+            correction_focus: CorrectionPaneFocus::None,
+            correction_panel_status: String::new(),
+            provider_config_path_editor: CorrectionTextEditor::new("").unwrap(),
+            provider_id_editor: CorrectionTextEditor::new("").unwrap(),
+            export_path_editor: CorrectionTextEditor::new("").unwrap(),
+            direct_ui_pointer_owners: DirectUiPointerOwnerTracker::default(),
+            deferred_pane_actions: Vec::new(),
+            correction_pane_scroll: CorrectionPaneScrollOffsets::default(),
+            pane_text_measurements: GdiTextAdvanceCache::default(),
+            correction_editor_browse_mode: false,
+            correction_mouse_selection_anchor: None,
+            correction_mouse_selecting: false,
+            alt_graph_active: false,
             next_convert_generation: 1,
             project_generation: 1,
             convert_view_generation: 0,
@@ -4564,6 +8372,556 @@ mod f4_convert_mock_pipeline_tests {
             canvas_pan_drag_last: None,
             canvas_status: "synthetic F4 controller test".to_owned(),
         }
+    }
+
+    fn scroll_state_correction_session(
+        journal_id: &str,
+    ) -> (CorrectionSession, String, String, String) {
+        let projection_id = "pane-scroll-projection";
+        let provider_text = format!(
+            "PROVIDER-HEAD-{}-PROVIDER-TAIL",
+            "p".repeat(220)
+        );
+        let saved_text = format!("SAVED-ORIGINAL-HEAD-{}-SAVED-TAIL", "s".repeat(64));
+        let draft_text = format!("DIRTY-DRAFT-HEAD-{}-DIRTY-DRAFT-TAIL", "d".repeat(260));
+        let ink = ProjectionInkBindingV1 {
+            journal_id: journal_id.to_owned(),
+            logical_revision: 1,
+            last_sequence: 1,
+            region_id: "pane-scroll-region".to_owned(),
+            line_id: Some("pane-scroll-line".to_owned()),
+            input_view_id: "input-view-v1-0000000000000001".to_owned(),
+            ink_binding_sha256: "a".repeat(64),
+            selected_strokes: Vec::new(),
+            source_sample_sequences: Vec::new(),
+            stroke_views: Vec::new(),
+        };
+        let projection = RecognitionProjectionV1 {
+            projection_id: projection_id.to_owned(),
+            ink: ink.clone(),
+            provider: ProjectionProviderProvenanceV1 {
+                provider_id: "pane-scroll-provider".to_owned(),
+                provider_version: "synthetic-v1".to_owned(),
+                model_version: Some("model-scroll-v1".to_owned()),
+                resource_version: Some("resource-scroll-v1".to_owned()),
+                configuration_id: "pane-scroll-config".to_owned(),
+                configuration_fingerprint: "provider-config-v1-fnv64-0000000000000001"
+                    .to_owned(),
+            },
+            candidates: vec![RecognitionCandidateV1 {
+                rank: 0,
+                recognized_text: provider_text.clone(),
+                native_score_raw: Some("0.875".to_owned()),
+                stroke_ranges: Vec::new(),
+            }],
+            input_modalities: None,
+            generated_raster: None,
+        };
+        let saved_correction = RegionCorrectionV1 {
+            correction_id: "pane-scroll-saved-correction".to_owned(),
+            projection_id: projection_id.to_owned(),
+            ink,
+            action: RegionCorrectionActionV1::SetText(saved_text.clone()),
+        };
+        let mut state = JournalReplayState::default();
+        state.journal_id = journal_id.to_owned();
+        state
+            .recognition_projections
+            .push(StoredRecognitionProjection {
+                sequence: 1,
+                app_epoch_id: "pane-scroll-session".to_owned(),
+                app_arrival_elapsed_ns: 1,
+                projection,
+            });
+        state.region_corrections.push(StoredRegionCorrection {
+            sequence: 2,
+            app_epoch_id: "pane-scroll-session".to_owned(),
+            app_arrival_elapsed_ns: 2,
+            correction: saved_correction,
+        });
+        let mut session = CorrectionSession::open(&state, projection_id).unwrap();
+        session.set_text(&draft_text).unwrap();
+        session.select_graphemes(5, 21);
+        (session, provider_text, saved_text, draft_text)
+    }
+
+    #[test]
+    fn pane_wheel_preserves_dirty_session_candidates_and_convert_intent() {
+        let directory = std::env::temp_dir().join(format!(
+            "lassoink-pane-scroll-state-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let project_path = directory.join("pane-scroll-state.inkj");
+        let journal_id = "pane-scroll-state-project";
+        let session_id = "pane-scroll-state-session";
+        let journal_writer = JournalWriter::create(
+            project_path.clone(),
+            JournalHeader {
+                journal_id: journal_id.to_owned(),
+                session_id: session_id.to_owned(),
+                config_id: Some("pane-scroll-config".to_owned()),
+                device_model_declared: None,
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        let writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        let config_path = provider_config_path(
+            &directory,
+            &std::env::current_exe().unwrap(),
+            &[],
+        );
+        let provider = LocalConvertProviderV1::load(&config_path, None).unwrap();
+        let mut app = make_test_app(
+            project_path,
+            journal_id.to_owned(),
+            session_id.to_owned(),
+            writer,
+            provider,
+            CanvasScene::default(),
+            Instant::now(),
+        );
+        app.client_size = Some((960, 720));
+        app.correction_focus = CorrectionPaneFocus::CorrectionEditor;
+        let (session, provider_text, saved_text, draft_text) =
+            scroll_state_correction_session(journal_id);
+        app.correction_session = Some(session);
+        app.convert_view_generation = 41;
+        app.pending_convert = Some(PendingConvert {
+            generation: 7,
+            project_generation: app.project_generation,
+            view_generation: app.convert_view_generation,
+            cancelled: false,
+            selected_strokes_in_ui_order: Vec::new(),
+            line_id: "pane-scroll-line".to_owned(),
+            request: None,
+            ink_binding: None,
+            generated_raster: None,
+            phase: PendingConvertPhase::SnapshotForPreparation { batch_id: 77 },
+        });
+
+        let viewport_before = app.canvas_viewport;
+        let view_generation_before = app.convert_view_generation;
+        let session = app.correction_session.as_ref().unwrap();
+        let candidate_before = session.projection().candidates[0].recognized_text.clone();
+        let effective_before = session.effective_text().map(str::to_owned);
+        let history_before = session.correction_history().to_vec();
+        let latest_saved_before = session.latest_saved_action().cloned();
+        let draft_action_before = session.draft_action();
+        let selected_text_before = session.selected_text().map(str::to_owned);
+        let selection_before = session.editor().selection_graphemes();
+        let cursor_before = session.editor().cursor_grapheme();
+        let undo_depth_before = session.editor().undo_depth();
+        assert!(session.is_dirty());
+        assert_eq!(candidate_before, provider_text);
+        assert_eq!(latest_saved_before, Some(RegionCorrectionActionV1::SetText(saved_text)));
+        assert_eq!(session.text(), draft_text);
+        let pending_batch_before = 77_u64;
+
+        for section in [
+            CorrectionPaneTextSection::ProviderOutput,
+            CorrectionPaneTextSection::EffectiveText,
+            CorrectionPaneTextSection::Draft,
+        ] {
+            let layout = app.correction_pane_layout().unwrap();
+            let region = layout
+                .scroll_regions
+                .iter()
+                .find(|region| region.section == section)
+                .unwrap();
+            assert!(region.total_rows > region.visible_rows);
+            let row = region.row_range.start;
+            let offset_before = app.correction_pane_scroll.get(section);
+            app.canvas_cursor_client = Some((
+                f64::from(960 - CORRECTION_PANE_WIDTH_PX + CORRECTION_PANE_PADDING_PX + 1),
+                f64::from(
+                    CORRECTION_PANE_PADDING_PX
+                        + i32::try_from(row).unwrap() * CORRECTION_PANE_ROW_HEIGHT_PX
+                        + 1,
+                ),
+            ));
+            assert!(app.handle_correction_pane_wheel(&MouseScrollDelta::LineDelta(0.0, -1.0)));
+            assert_eq!(app.correction_pane_scroll.get(section), offset_before + 1);
+
+            let session = app.correction_session.as_ref().unwrap();
+            assert_eq!(session.projection().candidates[0].recognized_text, candidate_before);
+            assert_eq!(session.effective_text().map(str::to_owned), effective_before);
+            assert_eq!(session.text(), draft_text);
+            assert_eq!(session.draft_action(), draft_action_before);
+            assert_eq!(session.correction_history(), history_before.as_slice());
+            assert_eq!(session.latest_saved_action(), latest_saved_before.as_ref());
+            assert_eq!(session.selected_text().map(str::to_owned), selected_text_before);
+            assert_eq!(session.editor().selection_graphemes(), selection_before);
+            assert_eq!(session.editor().cursor_grapheme(), cursor_before);
+            assert_eq!(session.editor().undo_depth(), undo_depth_before);
+            assert!(matches!(
+                app.pending_convert.as_ref(),
+                Some(PendingConvert {
+                    generation: 7,
+                    cancelled: false,
+                    phase: PendingConvertPhase::SnapshotForPreparation { batch_id },
+                    ..
+                }) if *batch_id == pending_batch_before
+            ));
+            assert_eq!(app.canvas_viewport.zoom(), viewport_before.zoom());
+            assert_eq!(app.canvas_viewport.pan(), viewport_before.pan());
+            assert_eq!(app.convert_view_generation, view_generation_before);
+        }
+
+        app.finish_project_writer().unwrap();
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    #[ignore = "guarded hosted Windows Convert intent retry and writer ordering fixture"]
+    fn queued_convert_intent_retries_snapshot_after_accepted_raw_rows() {
+        require_native_ui_test_opt_in();
+        let directory = std::env::temp_dir().join(format!(
+            "lassoink-convert-intent-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let project_path = directory.join("convert-intent.inkj");
+        let journal_id = "convert-intent-project";
+        let active_session_id = "convert-intent-session";
+        let target = direct_target(journal_id, active_session_id, "selected-stroke");
+        let frame = StrokeViewFrame::default();
+        let mut journal_writer = JournalWriter::create(
+            project_path.clone(),
+            JournalHeader {
+                journal_id: journal_id.to_owned(),
+                session_id: active_session_id.to_owned(),
+                config_id: Some("f4-synthetic-config".to_owned()),
+                device_model_declared: None,
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        journal_writer.start_stroke(target.clone(), frame, 1).unwrap();
+        journal_writer
+            .append_sample(direct_sample(&target, 1, 120))
+            .unwrap();
+        journal_writer.commit_stroke(target.clone(), 2).unwrap();
+        let initial_state = journal_writer.replay_state().clone();
+        let mut scene =
+            CanvasScene::from_journal(&initial_state, PROVISIONAL_DIRECT_SOURCE_API).unwrap();
+        scene.select_target(Some(target.clone())).unwrap();
+        let project_writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        let config_path = provider_config_path(
+            &directory,
+            &std::env::current_exe().unwrap(),
+            &[],
+        );
+        let provider = LocalConvertProviderV1::load(&config_path, None).unwrap();
+        let mut app = make_test_app(
+            project_path.clone(),
+            journal_id.to_owned(),
+            active_session_id.to_owned(),
+            project_writer,
+            provider,
+            scene,
+            Instant::now(),
+        );
+
+        let mut unowned_sample = direct_sample(&target, 2, 240);
+        unowned_sample.stroke_id = None;
+        app.project_writer
+            .as_mut()
+            .unwrap()
+            .try_capture_batch(
+                1,
+                vec![DirectCaptureEvent::PhysicalSample(Box::new(
+                    unowned_sample.clone(),
+                ))],
+            )
+            .unwrap();
+        for batch_id in 2..=8 {
+            app.project_writer
+                .as_mut()
+                .unwrap()
+                .try_snapshot_for_convert(batch_id)
+                .unwrap();
+        }
+        app.next_project_batch_id = 9;
+        app.start_or_cancel_convert();
+        assert!(matches!(
+            app.pending_convert.as_ref(),
+            Some(PendingConvert {
+                phase: PendingConvertPhase::QueueSnapshotForPreparation { batch_id: 9 },
+                ..
+            })
+        ));
+        assert!(app.canvas_status.contains("intent retained"));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut initial_acks = Vec::new();
+        while !app.project_writer.as_ref().unwrap().is_idle() {
+            initial_acks.extend(app.project_writer.as_mut().unwrap().drain_acks());
+            assert!(Instant::now() < deadline, "writer queue did not drain for Convert retry");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        initial_acks.extend(app.project_writer.as_mut().unwrap().drain_acks());
+        assert!(matches!(
+            initial_acks.first(),
+            Some(ProjectWriterAck::CaptureCommitted { records, .. })
+                if records.len() == 1
+                    && matches!(&records[0].event,
+                        JournalEvent::PhysicalSample(sample) if sample.stroke_id.is_none())
+        ));
+
+        app.poll_convert();
+        assert!(matches!(
+            app.pending_convert.as_ref(),
+            Some(PendingConvert {
+                phase: PendingConvertPhase::SnapshotForPreparation { batch_id: 9 },
+                ..
+            })
+        ));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut retried_snapshot = None;
+        while retried_snapshot.is_none() {
+            for ack in app.project_writer.as_mut().unwrap().drain_acks() {
+                if let ProjectWriterAck::ConvertSnapshot { batch_id: 9, state } = ack {
+                    retried_snapshot = Some(*state);
+                }
+            }
+            assert!(Instant::now() < deadline, "retained Convert snapshot did not ACK");
+            if retried_snapshot.is_none() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let frozen_state = retried_snapshot.unwrap();
+        assert_eq!(frozen_state.physical_samples.len(), 2);
+        assert_eq!(frozen_state.physical_samples[1].sample, unowned_sample);
+        assert!(frozen_state.physical_samples[1].sample.stroke_id.is_none());
+        assert_eq!(frozen_state.stroke_starts.len(), 1);
+
+        app.cancel_convert("test cleanup".to_owned());
+        app.finish_project_writer().unwrap();
+        let persisted = read_journal(&project_path).unwrap();
+        assert_eq!(persisted.state.physical_samples.len(), 2);
+        assert_eq!(persisted.state.physical_samples[1].sample, unowned_sample);
+        assert_eq!(persisted.state.stroke_starts.len(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "guarded hosted Windows Direct-pointer pane action and writer ordering fixture"]
+    fn direct_pen_convert_click_queues_raw_rows_before_one_snapshot_and_suppresses_mouse_promotion() {
+        require_native_ui_test_opt_in();
+        let directory = std::env::temp_dir().join(format!(
+            "lassoink-direct-pane-action-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let project_path = directory.join("direct-pane-action.inkj");
+        let journal_id = "direct-pane-action-project";
+        let session_id = "direct-pane-action-session";
+        let target = direct_target(journal_id, session_id, "committed-selection");
+        let frame = StrokeViewFrame::default();
+        let initial_sample = direct_sample(&target, 1, 40);
+        let mut journal_writer = JournalWriter::create(
+            project_path.clone(),
+            JournalHeader {
+                journal_id: journal_id.to_owned(),
+                session_id: session_id.to_owned(),
+                config_id: Some("f4-synthetic-config".to_owned()),
+                device_model_declared: None,
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        journal_writer
+            .start_stroke(target.clone(), frame, 1)
+            .unwrap();
+        journal_writer.append_sample(initial_sample).unwrap();
+        journal_writer.commit_stroke(target.clone(), 2).unwrap();
+        let initial_state = journal_writer.replay_state().clone();
+        let mut scene =
+            CanvasScene::from_journal(&initial_state, PROVISIONAL_DIRECT_SOURCE_API).unwrap();
+        scene.select_target(Some(target)).unwrap();
+        let writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        let config_path = provider_config_path(
+            &directory,
+            &std::env::current_exe().unwrap(),
+            &[],
+        );
+        let provider = LocalConvertProviderV1::load(&config_path, None).unwrap();
+        let mut app = make_test_app(
+            project_path.clone(),
+            journal_id.to_owned(),
+            session_id.to_owned(),
+            writer,
+            provider,
+            scene,
+            Instant::now(),
+        );
+        // Setup/config parsing is explicit and does not start the worker.
+        assert!(config_path.is_file());
+        app.canvas_origin = Some(CanvasOrigin::default());
+        app.client_size = Some((960, 720));
+
+        let layout = app.correction_pane_layout().unwrap();
+        let action_row = layout.action_row.unwrap();
+        let click_x = 600 + CORRECTION_PANE_PADDING_PX + 16;
+        let click_y = CORRECTION_PANE_PADDING_PX
+            + i32::try_from(action_row).unwrap() * CORRECTION_PANE_ROW_HEIGHT_PX
+            + 2;
+        let down = direct_ui_batch(1, PointerMessageKind::Down, click_x, click_y);
+        let up = direct_ui_batch(2, PointerMessageKind::Up, click_x, click_y);
+        app.probe_state
+            .borrow_mut()
+            .record(ProbeRecord::DirectPenHistory(down));
+        app.probe_state
+            .borrow_mut()
+            .record(ProbeRecord::DirectPenHistory(up));
+
+        let before_visible_strokes = app
+            .canvas_scene
+            .render_plan(app.canvas_viewport)
+            .unwrap()
+            .len();
+        app.process_pending_project_capture();
+        assert_eq!(before_visible_strokes, 1);
+        assert_eq!(
+            app.canvas_scene
+                .render_plan(app.canvas_viewport)
+                .unwrap()
+                .len(),
+            before_visible_strokes,
+            "pane-started Direct gesture must not add visible ink"
+        );
+        assert!(matches!(
+            app.pending_convert.as_ref(),
+            Some(PendingConvert {
+                generation: 1,
+                phase: PendingConvertPhase::SnapshotForPreparation { batch_id: 2 },
+                ..
+            })
+        ));
+        assert!(
+            !app.project_writer.as_ref().unwrap().is_idle(),
+            "capture and snapshot ACKs should still be pending"
+        );
+
+        app.correction_panel_status = format!(
+            "SCROLL-HEAD-{}-SCROLL-MIDDLE-{}-SCROLL-TAIL",
+            "s".repeat(60),
+            "t".repeat(60),
+        );
+        let pane_before_scroll = app.correction_pane_layout().unwrap();
+        assert!(correction_pane_visible_row_count(720) >= pane_before_scroll.lines.len());
+        let action_row_before_scroll = pane_before_scroll.action_row;
+        let provider_path_row_before_scroll = pane_before_scroll.provider_path_row;
+        let provider_id_row_before_scroll = pane_before_scroll.provider_id_row;
+        let load_row_before_scroll = pane_before_scroll.load_config_row;
+        let export_row_before_scroll = pane_before_scroll.export_path_row;
+        let status_region = pane_before_scroll
+            .scroll_regions
+            .iter()
+            .find(|region| region.section == CorrectionPaneTextSection::Status)
+            .unwrap();
+        assert!(status_region.total_rows > status_region.visible_rows);
+        let scroll_offset_before = app
+            .correction_pane_scroll
+            .get(CorrectionPaneTextSection::Status);
+        let viewport_before_scroll = app.canvas_viewport;
+        let generation_before_scroll = app.convert_view_generation;
+        app.canvas_cursor_client = Some((
+            f64::from(960 - CORRECTION_PANE_WIDTH_PX + CORRECTION_PANE_PADDING_PX + 1),
+            f64::from(
+                CORRECTION_PANE_PADDING_PX
+                    + i32::try_from(status_region.row_range.start).unwrap()
+                        * CORRECTION_PANE_ROW_HEIGHT_PX
+                    + 1,
+            ),
+        ));
+        assert!(app.handle_correction_pane_wheel(&MouseScrollDelta::LineDelta(0.0, -1.0)));
+        assert!(
+            app.correction_pane_scroll
+                .get(CorrectionPaneTextSection::Status)
+                > scroll_offset_before
+        );
+        assert_eq!(app.canvas_viewport.zoom(), viewport_before_scroll.zoom());
+        assert_eq!(app.canvas_viewport.pan(), viewport_before_scroll.pan());
+        assert_eq!(app.convert_view_generation, generation_before_scroll);
+        let pane_after_scroll = app.correction_pane_layout().unwrap();
+        assert_eq!(pane_after_scroll.action_row, action_row_before_scroll);
+        assert_eq!(pane_after_scroll.provider_path_row, provider_path_row_before_scroll);
+        assert_eq!(pane_after_scroll.provider_id_row, provider_id_row_before_scroll);
+        assert_eq!(pane_after_scroll.load_config_row, load_row_before_scroll);
+        assert_eq!(pane_after_scroll.export_path_row, export_row_before_scroll);
+        assert!(matches!(
+            app.pending_convert.as_ref().map(|pending| &pending.phase),
+            Some(PendingConvertPhase::SnapshotForPreparation { batch_id: 2 })
+        ));
+
+        app.canvas_cursor_client = Some((f64::from(click_x), f64::from(click_y)));
+        let promoted_mouse_hits_pane_action =
+            app.winit_mouse_input_targets_pane_action(MouseButton::Left, ElementState::Pressed);
+        if super::should_process_winit_mouse_input(
+            CaptureMode::DirectWmPointer,
+            MouseMessageOrigin::PenPromoted { cursor_id: 7 },
+            app.direct_ui_pointer_owners.has_active_canvas_pointer(),
+            app.direct_ui_pointer_owners.has_pending_direct_action(),
+            promoted_mouse_hits_pane_action,
+        ) {
+            assert!(app.handle_correction_mouse_button(MouseButton::Left, ElementState::Pressed));
+        }
+        assert_eq!(app.next_project_batch_id, 3, "promoted mouse click must not queue a second snapshot");
+        assert!(matches!(
+            app.pending_convert.as_ref().map(|pending| &pending.phase),
+            Some(PendingConvertPhase::SnapshotForPreparation { batch_id: 2 })
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut acknowledgements = Vec::new();
+        while !app.project_writer.as_ref().unwrap().is_idle() {
+            acknowledgements.extend(app.project_writer.as_mut().unwrap().drain_acks());
+            assert!(Instant::now() < deadline, "capture/snapshot ACK sequence timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        acknowledgements.extend(app.project_writer.as_mut().unwrap().drain_acks());
+        let [
+            ProjectWriterAck::CaptureCommitted { records, .. },
+            ProjectWriterAck::ConvertSnapshot { batch_id: 2, state },
+        ] = acknowledgements.as_slice()
+        else {
+            panic!("expected ordered raw capture then Convert snapshot acknowledgements");
+        };
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| matches!(
+            &record.event,
+            JournalEvent::PhysicalSample(sample) if sample.stroke_id.is_none()
+        )));
+        assert_eq!(state.physical_samples.len(), 3);
+        assert!(state.physical_samples[1..]
+            .iter()
+            .all(|sample| sample.sample.stroke_id.is_none()));
+        assert_eq!(state.stroke_starts.len(), 1);
+
+        app.cancel_convert("test cleanup".to_owned());
+        app.finish_project_writer().unwrap();
+        let persisted = read_journal(&project_path).unwrap();
+        assert_eq!(persisted.state.physical_samples.len(), 3);
+        assert_eq!(persisted.state.stroke_starts.len(), 1);
+        assert!(persisted.state.physical_samples[1..]
+            .iter()
+            .all(|sample| sample.sample.stroke_id.is_none()));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn wait_for_app(app: &mut ProbeApp, timeout: Duration, finished: impl Fn(&ProbeApp) -> bool) {
@@ -4646,6 +9004,105 @@ mod f4_convert_mock_pipeline_tests {
                 && app.canvas_status == "Convert result was durably saved as a projection"
         });
         assert!(app.project_writer.as_ref().unwrap().is_idle());
+        let pane = app.correction_pane_layout().unwrap();
+        assert!(pane.lines.iter().any(|line| line == "Provider output (immutable):"));
+        assert!(pane
+            .lines
+            .iter()
+            .any(|line| line.contains("F4 synthetic conversion result")));
+        assert!(pane
+            .lines
+            .iter()
+            .any(|line| line == "Model version: unavailable"));
+        assert!(pane
+            .lines
+            .iter()
+            .any(|line| line == "Resource version: unavailable"));
+        assert!(pane
+            .lines
+            .iter()
+            .any(|line| line.contains("Native score: unavailable (uncalibrated)")));
+        assert!(pane.provider_path_row.is_some());
+        assert!(pane.provider_id_row.is_some());
+        assert!(pane.load_config_row.is_some());
+        assert!(pane.export_path_row.is_some());
+        assert!(pane
+            .lines
+            .iter()
+            .any(|line| line.contains("Export is not implemented")));
+        assert!(app
+            .correction_session
+            .as_ref()
+            .is_some_and(|session| !session.is_dirty()));
+        app.set_correction_focus(CorrectionPaneFocus::CorrectionEditor);
+        assert!(app
+            .correction_session
+            .as_ref()
+            .is_some_and(|session| session.text() == "F4 synthetic conversion result"
+                && !session.is_dirty()));
+        app.canvas_origin = Some(CanvasOrigin::default());
+        app.client_size = Some((960, 720));
+        app.correction_session
+            .as_mut()
+            .unwrap()
+            .insert_text(" corrected by user")
+            .unwrap();
+        let save_row = app.correction_pane_layout().unwrap().action_row.unwrap();
+        let save_x = 600 + CORRECTION_PANE_PADDING_PX + 88;
+        let save_y = CORRECTION_PANE_PADDING_PX
+            + i32::try_from(save_row).unwrap() * CORRECTION_PANE_ROW_HEIGHT_PX
+            + 2;
+        app.probe_state
+            .borrow_mut()
+            .record(ProbeRecord::DirectPenHistory(direct_ui_batch(
+                1,
+                PointerMessageKind::Down,
+                save_x,
+                save_y,
+            )));
+        app.probe_state
+            .borrow_mut()
+            .record(ProbeRecord::DirectPenHistory(direct_ui_batch(
+                2,
+                PointerMessageKind::Up,
+                save_x,
+                save_y,
+            )));
+        app.process_pending_project_capture();
+        assert!(app
+            .pending_correction
+            .as_ref()
+            .is_some_and(|pending| pending.enqueued));
+        assert!(
+            !app.project_writer.as_ref().unwrap().is_idle(),
+            "raw pen and correction ACKs should still be pending"
+        );
+        app.canvas_cursor_client = Some((f64::from(save_x), f64::from(save_y)));
+        let next_batch_after_direct_save = app.next_project_batch_id;
+        let promoted_mouse_hits_pane_action =
+            app.winit_mouse_input_targets_pane_action(MouseButton::Left, ElementState::Pressed);
+        if super::should_process_winit_mouse_input(
+            CaptureMode::DirectWmPointer,
+            MouseMessageOrigin::PenPromoted { cursor_id: 7 },
+            app.direct_ui_pointer_owners.has_active_canvas_pointer(),
+            app.direct_ui_pointer_owners.has_pending_direct_action(),
+            promoted_mouse_hits_pane_action,
+        ) {
+            assert!(app.handle_correction_mouse_button(MouseButton::Left, ElementState::Pressed));
+        }
+        assert_eq!(
+            app.next_project_batch_id, next_batch_after_direct_save,
+            "promoted Winit mouse click must not enqueue a second correction"
+        );
+        wait_for_app(&mut app, Duration::from_secs(10), |app| {
+            app.pending_correction.is_none()
+                && app.correction_panel_status.contains("durably saved")
+        });
+        assert!(app
+            .correction_session
+            .as_ref()
+            .is_some_and(|session| !session.is_dirty()
+                && session.correction_history().len() == 1));
 
         let snapshot_batch_id = app.allocate_project_batch_id().unwrap();
         app.project_writer
@@ -4673,7 +9130,13 @@ mod f4_convert_mock_pipeline_tests {
             std::thread::sleep(Duration::from_millis(2));
         };
         assert_eq!(current_state.recognition_projections.len(), 1);
-        assert_eq!(current_state.physical_samples.len(), 1);
+        assert_eq!(current_state.region_corrections.len(), 1);
+        assert_eq!(current_state.physical_samples.len(), 3);
+        assert!(current_state.physical_samples[1..]
+            .iter()
+            .all(|sample| sample.sample.stroke_id.is_none()));
+        assert!(current_state.region_corrections[0].sequence
+            > current_state.physical_samples[2].sequence);
 
         let (second_config_path, _provider_before_second, expected_second) =
             provider_for_expected_request(
@@ -4781,6 +9244,30 @@ mod f4_convert_mock_pipeline_tests {
             .unwrap();
         app.note_convert_view_change();
 
+        app.set_correction_focus(CorrectionPaneFocus::CorrectionEditor);
+        app.correction_session
+            .as_mut()
+            .unwrap()
+            .insert_text(" stale draft")
+            .unwrap();
+        app.save_correction();
+        let correction_deadline = Instant::now() + Duration::from_secs(10);
+        while app.pending_correction.is_some() {
+            app.drain_project_writer_acks();
+            assert!(
+                Instant::now() < correction_deadline,
+                "stale correction did not receive a recoverable writer response"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app
+            .correction_panel_status
+            .contains("draft is retained"));
+        assert!(app
+            .correction_session
+            .as_ref()
+            .is_some_and(CorrectionSession::is_dirty));
+
         let continued_target = direct_target(journal_id, active_session_id, "after-stale-capture");
         let continued_sample = direct_sample(&continued_target, 1, 240);
         let capture_events = vec![
@@ -4826,16 +9313,27 @@ mod f4_convert_mock_pipeline_tests {
             Some(vec![ProjectionInputModalityV1::Raster])
         );
         assert!(projection.generated_raster.is_some());
-        assert_eq!(persisted.state.physical_samples.len(), 2);
+        assert_eq!(persisted.state.physical_samples.len(), 4);
         assert_eq!(persisted.state.physical_samples[0].sample, initial_sample);
-        assert_eq!(persisted.state.physical_samples[1].sample, continued_sample);
+        assert!(persisted.state.physical_samples[1..3]
+            .iter()
+            .all(|sample| sample.sample.stroke_id.is_none()));
+        assert_eq!(persisted.state.physical_samples[3].sample, continued_sample);
         assert!(persisted.state.edit_actions.iter().any(|action| {
             matches!(
                 &action.command,
                 EditCommand::Move { target: moved, .. } if moved == &target
             )
         }));
-        assert!(persisted.state.region_corrections.is_empty());
+        assert_eq!(persisted.state.region_corrections.len(), 1);
+        assert_eq!(
+            persisted.state.region_corrections[0]
+                .correction
+                .action,
+            RegionCorrectionActionV1::SetText(
+                "F4 synthetic conversion result corrected by user".to_owned()
+            )
+        );
     }
 
     #[test]

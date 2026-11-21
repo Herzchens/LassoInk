@@ -41,7 +41,7 @@ struct ImePreedit {
     text: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CorrectionTextEditor {
     text: String,
     cursor_grapheme: usize,
@@ -78,6 +78,13 @@ impl CorrectionTextEditor {
 
     pub(crate) fn selection_graphemes(&self) -> Option<Range<usize>> {
         self.selection_graphemes.clone()
+    }
+
+    pub(crate) fn selected_text(&self) -> Option<&str> {
+        let range = self.selection_graphemes.as_ref()?;
+        let start = byte_offset_for_grapheme(&self.text, range.start);
+        let end = byte_offset_for_grapheme(&self.text, range.end);
+        Some(&self.text[start..end])
     }
 
     pub(crate) fn has_preedit(&self) -> bool {
@@ -133,6 +140,134 @@ impl CorrectionTextEditor {
         } else {
             self.cursor_grapheme = (self.cursor_grapheme + 1).min(self.grapheme_count());
         }
+    }
+
+    pub(crate) fn move_cursor_up(&mut self, extend: bool) {
+        self.move_cursor_vertical(-1, extend);
+    }
+
+    pub(crate) fn move_cursor_down(&mut self, extend: bool) {
+        self.move_cursor_vertical(1, extend);
+    }
+
+    pub(crate) fn move_cursor_up_wrapped(&mut self, columns: usize, extend: bool) {
+        self.move_cursor_vertical_wrapped(-1, columns, extend);
+    }
+
+    pub(crate) fn move_cursor_down_wrapped(&mut self, columns: usize, extend: bool) {
+        self.move_cursor_vertical_wrapped(1, columns, extend);
+    }
+
+    pub(crate) fn move_cursor_on_visual_rows(
+        &mut self,
+        visual_rows: &[Range<usize>],
+        delta: isize,
+        extend: bool,
+    ) {
+        if visual_rows.is_empty() {
+            return;
+        }
+        self.cancel_preedit();
+        self.move_cursor_to_vertical_line(visual_rows, delta, extend);
+    }
+
+    pub(crate) fn visual_line_ranges(&self, columns: usize) -> Vec<Range<usize>> {
+        grapheme_visual_line_ranges(&self.text, columns)
+    }
+
+    pub(crate) fn move_to_line_start(&mut self, extend: bool) {
+        self.move_to_line_edge(false, extend);
+    }
+
+    pub(crate) fn move_to_line_end(&mut self, extend: bool) {
+        self.move_to_line_edge(true, extend);
+    }
+
+    fn move_cursor_vertical(&mut self, delta: isize, extend: bool) {
+        self.cancel_preedit();
+        let lines = grapheme_line_ranges(&self.text);
+        self.move_cursor_to_vertical_line(&lines, delta, extend);
+    }
+
+    fn move_cursor_vertical_wrapped(&mut self, delta: isize, columns: usize, extend: bool) {
+        self.cancel_preedit();
+        let lines = grapheme_visual_line_ranges(&self.text, columns);
+        self.move_cursor_to_vertical_line(&lines, delta, extend);
+    }
+
+    fn move_cursor_to_vertical_line(&mut self, lines: &[Range<usize>], delta: isize, extend: bool) {
+        let current_line = lines
+            .iter()
+            .position(|range| self.cursor_grapheme >= range.start && self.cursor_grapheme <= range.end)
+            .unwrap_or_else(|| lines.len().saturating_sub(1));
+        let current = isize::try_from(current_line).unwrap_or(isize::MAX);
+        let target = usize::try_from(
+            current
+                .saturating_add(delta)
+                .clamp(0, isize::try_from(lines.len().saturating_sub(1)).unwrap_or(isize::MAX)),
+        )
+        .unwrap_or_default();
+        let current_range = &lines[current_line];
+        let column = self.cursor_grapheme.saturating_sub(current_range.start);
+        let target_range = &lines[target];
+        let cursor = target_range
+            .start
+            .saturating_add(column.min(target_range.end.saturating_sub(target_range.start)));
+        self.move_cursor_to(cursor, extend);
+    }
+
+    fn move_to_line_edge(&mut self, end: bool, extend: bool) {
+        self.cancel_preedit();
+        let lines = grapheme_line_ranges(&self.text);
+        let range = lines
+            .iter()
+            .find(|range| self.cursor_grapheme >= range.start && self.cursor_grapheme <= range.end)
+            .unwrap_or_else(|| lines.last().expect("empty text has one grapheme line"));
+        self.move_cursor_to(if end { range.end } else { range.start }, extend);
+    }
+
+    fn move_cursor_to(&mut self, cursor: usize, extend: bool) {
+        let cursor = cursor.min(self.grapheme_count());
+        if !extend {
+            self.cursor_grapheme = cursor;
+            self.selection_graphemes = None;
+            return;
+        }
+        let anchor = self.selection_graphemes.as_ref().map_or(self.cursor_grapheme, |range| {
+            if self.cursor_grapheme == range.start {
+                range.end
+            } else {
+                range.start
+            }
+        });
+        self.cursor_grapheme = cursor;
+        self.selection_graphemes = (anchor != cursor).then_some(anchor.min(cursor)..anchor.max(cursor));
+    }
+
+    pub(crate) fn move_cursor_left_extending_selection(&mut self) {
+        self.move_cursor_extending_selection(false);
+    }
+
+    pub(crate) fn move_cursor_right_extending_selection(&mut self) {
+        self.move_cursor_extending_selection(true);
+    }
+
+    fn move_cursor_extending_selection(&mut self, right: bool) {
+        self.cancel_preedit();
+        let anchor = self.selection_graphemes.as_ref().map_or(self.cursor_grapheme, |range| {
+            if self.cursor_grapheme == range.start {
+                range.end
+            } else {
+                range.start
+            }
+        });
+        let cursor = if right {
+            (self.cursor_grapheme + 1).min(self.grapheme_count())
+        } else {
+            self.cursor_grapheme.saturating_sub(1)
+        };
+        self.cursor_grapheme = cursor;
+        self.selection_graphemes = (anchor != cursor).then_some(anchor.min(cursor)..anchor.max(cursor));
     }
 
     pub(crate) fn set_text(&mut self, text: &str) -> Result<bool, JournalError> {
@@ -230,6 +365,19 @@ impl CorrectionTextEditor {
                 Err(error)
             }
         }
+    }
+
+    /// Commits the text supplied by Winit's authoritative Ime::Commit event.
+    /// The preedit's replacement range is used, but its display text is never
+    /// committed a second time.
+    pub(crate) fn commit_ime_text(&mut self, text: &str) -> Result<bool, JournalError> {
+        let replacement = self.preedit.take().map(|preedit| preedit.replacement_graphemes);
+        let range = replacement.unwrap_or_else(|| {
+            self.selection_graphemes
+                .clone()
+                .unwrap_or(self.cursor_grapheme..self.cursor_grapheme)
+        });
+        self.replace_grapheme_range(range, text)
     }
 
     pub(crate) fn cancel_preedit(&mut self) -> bool {
@@ -364,6 +512,25 @@ pub(crate) struct CorrectionSession {
 }
 
 impl CorrectionSession {
+    /// Opens a newly persisted projection received through its durable writer
+    /// acknowledgement. New projections have no correction history yet.
+    pub(crate) fn from_durable_projection(
+        stored_projection: StoredRecognitionProjection,
+    ) -> Result<Self, CorrectionSessionError> {
+        let editor = CorrectionTextEditor::new("")
+            .map_err(|_| CorrectionSessionError::PersistedTextInvalid)?;
+        Ok(Self {
+            stored_projection,
+            correction_history: Vec::new(),
+            editor,
+            draft_kind: None,
+            selected_candidate_rank: None,
+            cancelled: false,
+            undo_modes: VecDeque::new(),
+            redo_modes: VecDeque::new(),
+        })
+    }
+
     pub(crate) fn open(
         state: &JournalReplayState,
         projection_id: &str,
@@ -466,6 +633,10 @@ impl CorrectionSession {
         &self.editor
     }
 
+    pub(crate) fn selected_text(&self) -> Option<&str> {
+        self.editor.selected_text()
+    }
+
     pub(crate) fn selected_candidate_rank(&self) -> Option<u16> {
         self.selected_candidate_rank
     }
@@ -475,7 +646,7 @@ impl CorrectionSession {
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
-        self.draft_action().as_ref() != self.latest_saved_action()
+        !self.cancelled && self.draft_action().as_ref() != self.latest_saved_action()
     }
 
     pub(crate) fn draft_action(&self) -> Option<RegionCorrectionActionV1> {
@@ -580,6 +751,7 @@ impl CorrectionSession {
         &mut self,
         edit: impl FnOnce(&mut CorrectionTextEditor) -> Result<bool, JournalError>,
     ) -> Result<bool, JournalError> {
+        self.prepare_editor_for_edit()?;
         let before_mode = self.mode();
         let changed = edit(&mut self.editor)?;
         if changed {
@@ -589,6 +761,32 @@ impl CorrectionSession {
             self.cancelled = false;
         }
         Ok(changed)
+    }
+
+    /// Seeds the editor from the effective saved/provider text without
+    /// creating a correction draft. This lets the UI put the caret in the
+    /// displayed base result while an untouched session remains a no-op.
+    pub(crate) fn prepare_editor_for_edit(&mut self) -> Result<(), JournalError> {
+        if self.cancelled {
+            let saved_kind = match self.latest_saved_action() {
+                Some(RegionCorrectionActionV1::SetText(_)) => Some(DraftKind::SetText),
+                Some(RegionCorrectionActionV1::Reset) => Some(DraftKind::Reset),
+                None => None,
+            };
+            let text = self.effective_text().unwrap_or_default().to_owned();
+            self.editor = CorrectionTextEditor::new(&text)?;
+            self.draft_kind = saved_kind;
+            self.selected_candidate_rank = None;
+            self.cancelled = false;
+            return Ok(());
+        }
+        if !matches!(self.draft_kind, Some(DraftKind::SetText)) {
+            let text = self.effective_text().unwrap_or_default().to_owned();
+            if self.editor.text() != text {
+                self.editor = CorrectionTextEditor::new(&text)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn set_cursor_grapheme(&mut self, cursor: usize) {
@@ -607,6 +805,52 @@ impl CorrectionSession {
         self.editor.move_cursor_right();
     }
 
+    pub(crate) fn move_cursor_up(&mut self, extend: bool) {
+        self.editor.move_cursor_up(extend);
+    }
+
+    pub(crate) fn move_cursor_down(&mut self, extend: bool) {
+        self.editor.move_cursor_down(extend);
+    }
+
+    pub(crate) fn move_cursor_up_wrapped(&mut self, columns: usize, extend: bool) {
+        self.editor.move_cursor_up_wrapped(columns, extend);
+    }
+
+    pub(crate) fn move_cursor_down_wrapped(&mut self, columns: usize, extend: bool) {
+        self.editor.move_cursor_down_wrapped(columns, extend);
+    }
+
+    pub(crate) fn move_cursor_on_visual_rows(
+        &mut self,
+        visual_rows: &[Range<usize>],
+        delta: isize,
+        extend: bool,
+    ) {
+        self.editor
+            .move_cursor_on_visual_rows(visual_rows, delta, extend);
+    }
+
+    pub(crate) fn move_to_line_start(&mut self, extend: bool) {
+        self.editor.move_to_line_start(extend);
+    }
+
+    pub(crate) fn move_to_line_end(&mut self, extend: bool) {
+        self.editor.move_to_line_end(extend);
+    }
+
+    pub(crate) fn move_cursor_left_extending_selection(&mut self) {
+        self.editor.move_cursor_left_extending_selection();
+    }
+
+    pub(crate) fn move_cursor_right_extending_selection(&mut self) {
+        self.editor.move_cursor_right_extending_selection();
+    }
+
+    pub(crate) fn select_all(&mut self) {
+        self.editor.select_all();
+    }
+
     pub(crate) fn update_ime_preedit(&mut self, text: &str) -> Result<(), JournalError> {
         self.editor.update_preedit(text)
     }
@@ -619,11 +863,16 @@ impl CorrectionSession {
         self.apply_text_edit(CorrectionTextEditor::commit_preedit)
     }
 
+    pub(crate) fn commit_ime_text(&mut self, text: &str) -> Result<bool, JournalError> {
+        self.apply_text_edit(|editor| editor.commit_ime_text(text))
+    }
+
     pub(crate) fn cancel_ime_preedit(&mut self) -> bool {
         self.editor.cancel_preedit()
     }
 
-    /// Ordinary focus loss intentionally leaves the draft and preedit intact.
+    /// Ordinary focus loss preserves committed draft text; the platform UI
+    /// may discard only the transient IME composition when it loses focus.
     pub(crate) fn on_focus_lost(&mut self) {}
 
     pub(crate) fn undo(&mut self) -> bool {
@@ -744,6 +993,44 @@ fn cursor_at_or_after_byte(text: &str, byte: usize) -> usize {
         .enumerate()
         .find_map(|(index, (start, _))| (start >= byte).then_some(index))
         .unwrap_or_else(|| text.graphemes(true).count())
+}
+
+fn grapheme_line_ranges(text: &str) -> Vec<Range<usize>> {
+    let graphemes = text.graphemes(true).collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (index, grapheme) in graphemes.iter().enumerate() {
+        if matches!(*grapheme, "\n" | "\r\n" | "\r") {
+            lines.push(start..index);
+            start = index + 1;
+        }
+    }
+    lines.push(start..graphemes.len());
+    lines
+}
+
+fn grapheme_visual_line_ranges(text: &str, columns: usize) -> Vec<Range<usize>> {
+    let columns = columns.max(1);
+    let graphemes = text.graphemes(true).collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut columns_used = 0;
+    for (index, grapheme) in graphemes.iter().enumerate() {
+        if matches!(*grapheme, "\n" | "\r\n" | "\r") {
+            lines.push(start..index);
+            start = index + 1;
+            columns_used = 0;
+            continue;
+        }
+        if columns_used >= columns {
+            lines.push(start..index);
+            start = index;
+            columns_used = 0;
+        }
+        columns_used += 1;
+    }
+    lines.push(start..graphemes.len());
+    lines
 }
 
 fn push_bounded<T>(queue: &mut VecDeque<T>, value: T) {
@@ -1003,6 +1290,33 @@ mod tests {
     }
 
     #[test]
+    fn preparing_editor_from_provider_base_is_not_a_correction_until_text_changes() {
+        let projection = test_projection(
+            "projection-editor-base",
+            "journal-editor-base",
+            "region-editor-base",
+            vec![candidate(0, "provider base")],
+        );
+        let state = test_state(vec![projection.clone()], Vec::new());
+        let mut session = CorrectionSession::open(&state, &projection.projection_id).unwrap();
+
+        session.prepare_editor_for_edit().unwrap();
+        assert_eq!(session.text(), "provider base");
+        assert_eq!(session.effective_text(), Some("provider base"));
+        assert!(!session.is_dirty());
+        assert!(session.build_correction("untouched-editor").unwrap().is_none());
+
+        session.set_cursor_grapheme(3);
+        session.insert_text("X").unwrap();
+        assert_eq!(session.text(), "proXvider base");
+        assert!(session.is_dirty());
+        assert_eq!(
+            session.build_correction("edited-base").unwrap().unwrap().action,
+            RegionCorrectionActionV1::SetText("proXvider base".to_owned())
+        );
+    }
+
+    #[test]
     fn correction_session_opens_only_the_latest_history_for_its_projection() {
         let first = test_projection(
             "projection-first",
@@ -1166,6 +1480,43 @@ mod tests {
     }
 
     #[test]
+    fn multiline_caret_and_vertical_selection_stay_on_grapheme_boundaries() {
+        let mut editor = CorrectionTextEditor::new("ab👩‍💻\nxy\n").unwrap();
+        assert_eq!(editor.grapheme_count(), 7);
+        editor.set_cursor_grapheme(2);
+        editor.move_cursor_down(false);
+        assert_eq!(editor.cursor_grapheme(), 6);
+        editor.move_cursor_up(false);
+        assert_eq!(editor.cursor_grapheme(), 2);
+        editor.move_cursor_down(true);
+        assert_eq!(editor.selection_graphemes(), Some(2..6));
+        editor.delete_backward().unwrap();
+        assert_eq!(editor.text(), "ab\n");
+    }
+
+    #[test]
+    fn wrapped_vertical_caret_and_shift_selection_stay_on_grapheme_boundaries() {
+        let text = format!("a👩‍💻{}", "b".repeat(40));
+        let mut editor = CorrectionTextEditor::new(&text).unwrap();
+        assert_eq!(editor.grapheme_count(), 42);
+        assert_eq!(editor.visual_line_ranges(38), vec![0..38, 38..42]);
+
+        editor.set_cursor_grapheme(39);
+        editor.move_cursor_up_wrapped(38, false);
+        assert_eq!(editor.cursor_grapheme(), 1);
+        editor.move_cursor_down_wrapped(38, false);
+        assert_eq!(editor.cursor_grapheme(), 39);
+
+        editor.set_cursor_grapheme(1);
+        editor.move_cursor_down_wrapped(38, true);
+        assert_eq!(editor.cursor_grapheme(), 39);
+        assert_eq!(editor.selection_graphemes(), Some(1..39));
+        assert!(editor.selection_graphemes().is_some_and(|range| {
+            range.start <= editor.grapheme_count() && range.end <= editor.grapheme_count()
+        }));
+    }
+
+    #[test]
     fn editor_ime_preedit_is_transient_cancelable_and_commits_once() {
         let mut editor = CorrectionTextEditor::new("eX").unwrap();
         editor.select_graphemes(0, 1);
@@ -1185,6 +1536,18 @@ mod tests {
         editor.update_preedit("draft").unwrap();
         assert!(editor.cancel_preedit());
         assert_eq!(editor.text(), "eX");
+    }
+
+    #[test]
+    fn authoritative_ime_commit_replaces_preedit_once_without_normalizing_unicode() {
+        let mut editor = CorrectionTextEditor::new("NFD e\u{301}").unwrap();
+        editor.set_cursor_grapheme(editor.grapheme_count());
+        editor.update_preedit("漢").unwrap();
+        assert_eq!(editor.text(), "NFD e\u{301}");
+        assert_eq!(editor.preview_text().unwrap(), "NFD e\u{301}漢");
+        assert!(editor.commit_ime_text("漢").unwrap());
+        assert_eq!(editor.text(), "NFD e\u{301}漢");
+        assert!(!editor.has_preedit());
     }
 
     #[test]
