@@ -10,6 +10,7 @@
 //! failed final write may have reached disk completely or as a truncated tail.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Display, Formatter},
@@ -34,10 +35,23 @@ const MAX_REGION_CORRECTIONS: usize = 16_384;
 const MAX_PROJECTION_CANDIDATES: usize = 128;
 const MAX_PROJECTION_STROKES: usize = 512;
 const MAX_PROJECTION_SAMPLES: usize = 4096;
+const MAX_PROJECTION_INPUT_MODALITIES: usize = 2;
+pub(crate) const LOCAL_SENOCR_RASTER_PROVIDER_ID: &str = "senocr-v1-fp32-local";
 const MAX_PROJECTION_RANGES: usize = 4096;
 const MAX_PROJECTION_ID_BYTES: usize = 128;
 const MAX_PROJECTION_SOURCE_ID_BYTES: usize = 256;
 const SHA256_HEX_BYTES: usize = 64;
+const MAX_PROJECTION_RASTER_DIMENSION: u32 = 2048;
+const MAX_PROJECTION_RASTER_PIXELS: u64 = 262_144;
+const MAX_PROJECTION_RASTER_CROP_DIMENSION: i64 = 1_048_576;
+const MAX_PROJECTION_RASTER_CROP_AREA: i64 = 67_108_864;
+const MAX_PROJECTION_RASTER_PNG_BYTES: u32 = 1024 * 1024;
+const PROJECTION_RASTER_BYTES_PER_PIXEL: u32 = 4;
+const PROJECTION_RASTER_BACKGROUND_RGBA: [u8; 4] = [255, 255, 255, 255];
+const PROJECTION_RASTER_INK_RGBA: [u8; 4] = [32, 32, 32, 255];
+const PROJECTION_RASTER_INK_WIDTH_16_16: u32 = 2 << 16;
+pub(crate) const CANONICAL_RASTER_RENDERER_VERSION_V1: &str =
+    "tiny-skia/0.12.0;canonical-raster-v1";
 pub(crate) const MAX_EDIT_TARGETS: usize = 256;
 const STROKE_VIEW_FRAME_WIDTH: usize = 7;
 const FNV_OFFSET_BASIS: u64 = 14_695_981_039_346_656_037;
@@ -87,8 +101,9 @@ pub(crate) struct StrokeViewFrame {
 }
 
 /// The exact journal prefix and selected ink/view that an external recognizer
-/// result describes. The opaque input-view ID and SHA-256 are provenance
-/// bindings; this journal cannot independently authenticate provider pixels.
+/// result describes. `input_view_id` remains the M4 per-request identity;
+/// `ink_binding_sha256` is the shared canonical-ink fingerprint used across
+/// modalities. Neither authenticates provider pixels or proves raster parity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProjectionInkBindingV1 {
@@ -143,6 +158,13 @@ pub(crate) struct RecognitionCandidateV1 {
     pub stroke_ranges: Vec<ProjectionStrokeRangeV1>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionInputModalityV1 {
+    OnlineStrokes,
+    Raster,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecognitionProjectionV1 {
@@ -150,6 +172,288 @@ pub(crate) struct RecognitionProjectionV1 {
     pub ink: ProjectionInkBindingV1,
     pub provider: ProjectionProviderProvenanceV1,
     pub candidates: Vec<RecognitionCandidateV1>,
+    /// Exact M4 modalities acknowledged by the provider. Missing is retained
+    /// for earlier v4 projections and is never inferred from the opaque view ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_modalities: Option<Vec<ProjectionInputModalityV1>>,
+    /// Optional metadata-only origin for an app-generated canonical Raster
+    /// request. Missing remains valid for older schema-v4 rows and online-only
+    /// requests; this never stores the image bytes or authenticates a model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_raster: Option<GeneratedRasterProvenanceV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionRasterAspectRatioPolicyV1 {
+    FitContainCentered,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionRasterPixelLayoutV1 {
+    Rgba8PremultipliedSrgbTopDown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionRasterCoveragePolicyV1 {
+    Antialiased,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionRasterStrokeCapV1 {
+    Round,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionRasterStrokeJoinV1 {
+    Round,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionRasterRoundingPolicyV1 {
+    NearestTiesAwayQ16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionRasterClippingPolicyV1 {
+    RejectPointsOutsideSourceCropClipCoverageAtOutputBounds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionRasterSinglePointPolicyV1 {
+    OpaqueDiscAtObservedPoint,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionRasterStrokeOrderPolicyV1 {
+    JournalFirstOccurrence,
+}
+
+/// The exact bounded transform/style parameters used by the canonical raster
+/// producer. The persisted identity is enough to review the transform without
+/// storing raw geometry points, pixel bytes, or PNG payloads.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectionRasterSpecV1 {
+    pub schema_version: u32,
+    pub output_width_px: u32,
+    pub output_height_px: u32,
+    pub source_crop_left_px: i32,
+    pub source_crop_top_px: i32,
+    pub source_crop_right_px_exclusive: i32,
+    pub source_crop_bottom_px_exclusive: i32,
+    pub aspect_ratio_policy: ProjectionRasterAspectRatioPolicyV1,
+    pub pixel_layout: ProjectionRasterPixelLayoutV1,
+    pub coverage_policy: ProjectionRasterCoveragePolicyV1,
+    pub background_rgba: [u8; 4],
+    pub committed_ink_rgba: [u8; 4],
+    pub stroke_width_16_16: u32,
+    pub stroke_cap: ProjectionRasterStrokeCapV1,
+    pub stroke_join: ProjectionRasterStrokeJoinV1,
+    pub rounding_policy: ProjectionRasterRoundingPolicyV1,
+    pub clipping_policy: ProjectionRasterClippingPolicyV1,
+    pub single_point_policy: ProjectionRasterSinglePointPolicyV1,
+    pub stroke_order_policy: ProjectionRasterStrokeOrderPolicyV1,
+    pub row_stride_bytes: u32,
+    pub output_buffer_bytes: u32,
+}
+
+impl ProjectionRasterSpecV1 {
+    pub(crate) fn canonical_sha256(&self) -> [u8; 32] {
+        let mut hash = RasterMetadataHashWriter::new(b"LassoInk/canonical-raster-spec/v1\0");
+        hash.u32(self.schema_version);
+        hash.u32(self.output_width_px);
+        hash.u32(self.output_height_px);
+        hash.i32(self.source_crop_left_px);
+        hash.i32(self.source_crop_top_px);
+        hash.i32(self.source_crop_right_px_exclusive);
+        hash.i32(self.source_crop_bottom_px_exclusive);
+        hash.u8(match self.aspect_ratio_policy {
+            ProjectionRasterAspectRatioPolicyV1::FitContainCentered => 1,
+        });
+        hash.u8(match self.pixel_layout {
+            ProjectionRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown => 1,
+        });
+        hash.u8(match self.coverage_policy {
+            ProjectionRasterCoveragePolicyV1::Antialiased => 1,
+        });
+        hash.bytes(&self.background_rgba);
+        hash.bytes(&self.committed_ink_rgba);
+        hash.u32(self.stroke_width_16_16);
+        hash.u8(match self.stroke_cap {
+            ProjectionRasterStrokeCapV1::Round => 1,
+        });
+        hash.u8(match self.stroke_join {
+            ProjectionRasterStrokeJoinV1::Round => 1,
+        });
+        hash.u8(match self.rounding_policy {
+            ProjectionRasterRoundingPolicyV1::NearestTiesAwayQ16 => 1,
+        });
+        hash.u8(match self.clipping_policy {
+            ProjectionRasterClippingPolicyV1::RejectPointsOutsideSourceCropClipCoverageAtOutputBounds => 1,
+        });
+        hash.u8(match self.single_point_policy {
+            ProjectionRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint => 1,
+        });
+        hash.u8(match self.stroke_order_policy {
+            ProjectionRasterStrokeOrderPolicyV1::JournalFirstOccurrence => 1,
+        });
+        hash.u32(self.row_stride_bytes);
+        hash.u32(self.output_buffer_bytes);
+        hash.finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectionRasterSourceBindingV1 {
+    pub journal_id: String,
+    pub logical_revision: u64,
+    pub last_sequence: u64,
+    pub region_id: String,
+    pub line_id: Option<String>,
+    pub input_view_id: String,
+    pub ink_binding_sha256: String,
+}
+
+/// Metadata-only provenance for the raster bytes generated for one M4 request.
+/// Its checks bind these observations together, but do not authenticate files,
+/// hash omitted image bytes during journal append, or prove external parity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GeneratedRasterProvenanceV1 {
+    pub schema_version: u32,
+    pub source: ProjectionRasterSourceBindingV1,
+    pub source_content_sha256: String,
+    pub projection_spec: ProjectionRasterSpecV1,
+    pub projection_spec_sha256: String,
+    pub geometry_schema_version: u32,
+    pub geometry_sha256: String,
+    pub raster_artifact_schema_version: u32,
+    pub renderer_version: String,
+    pub output_width_px: u32,
+    pub output_height_px: u32,
+    pub row_stride_bytes: u32,
+    pub pixel_layout: ProjectionRasterPixelLayoutV1,
+    pub pixel_bytes_sha256: String,
+    pub png_bytes_len: u32,
+    pub png_bytes_sha256: String,
+    pub raster_artifact_sha256: String,
+}
+
+impl GeneratedRasterProvenanceV1 {
+    fn expected_raster_artifact_sha256(&self) -> Result<[u8; 32], JournalError> {
+        let source_content_sha256 = decode_sha256(&self.source_content_sha256)?;
+        let projection_spec_sha256 = decode_sha256(&self.projection_spec_sha256)?;
+        let geometry_sha256 = decode_sha256(&self.geometry_sha256)?;
+        let pixel_bytes_sha256 = decode_sha256(&self.pixel_bytes_sha256)?;
+        let png_bytes_sha256 = decode_sha256(&self.png_bytes_sha256)?;
+        Ok(canonical_raster_artifact_sha256(
+            CanonicalRasterArtifactHashInputV1 {
+                schema_version: self.raster_artifact_schema_version,
+                renderer_version: &self.renderer_version,
+                source_journal_id: &self.source.journal_id,
+                source_logical_revision: self.source.logical_revision,
+                source_last_sequence: self.source.last_sequence,
+                source_content_sha256: &source_content_sha256,
+                projection_spec_sha256: &projection_spec_sha256,
+                geometry_sha256: &geometry_sha256,
+                output_width_px: self.output_width_px,
+                output_height_px: self.output_height_px,
+                row_stride_bytes: self.row_stride_bytes,
+                pixel_layout: self.pixel_layout,
+                pixel_bytes_sha256: &pixel_bytes_sha256,
+                png_bytes_sha256: &png_bytes_sha256,
+            },
+        ))
+    }
+}
+
+pub(crate) struct CanonicalRasterArtifactHashInputV1<'a> {
+    pub schema_version: u32,
+    pub renderer_version: &'a str,
+    pub source_journal_id: &'a str,
+    pub source_logical_revision: u64,
+    pub source_last_sequence: u64,
+    pub source_content_sha256: &'a [u8; 32],
+    pub projection_spec_sha256: &'a [u8; 32],
+    pub geometry_sha256: &'a [u8; 32],
+    pub output_width_px: u32,
+    pub output_height_px: u32,
+    pub row_stride_bytes: u32,
+    pub pixel_layout: ProjectionRasterPixelLayoutV1,
+    pub pixel_bytes_sha256: &'a [u8; 32],
+    pub png_bytes_sha256: &'a [u8; 32],
+}
+
+pub(crate) fn canonical_raster_artifact_sha256(
+    input: CanonicalRasterArtifactHashInputV1<'_>,
+) -> [u8; 32] {
+    let mut hash = RasterMetadataHashWriter::new(b"LassoInk/canonical-raster-artifact/v1\0");
+    hash.u32(input.schema_version);
+    hash.string(input.renderer_version);
+    hash.string(input.source_journal_id);
+    hash.u64(input.source_logical_revision);
+    hash.u64(input.source_last_sequence);
+    hash.bytes(input.source_content_sha256);
+    hash.bytes(input.projection_spec_sha256);
+    hash.bytes(input.geometry_sha256);
+    hash.u32(input.output_width_px);
+    hash.u32(input.output_height_px);
+    hash.u32(input.row_stride_bytes);
+    hash.u8(match input.pixel_layout {
+        ProjectionRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown => 1,
+    });
+    hash.bytes(input.pixel_bytes_sha256);
+    hash.bytes(input.png_bytes_sha256);
+    hash.finish()
+}
+
+struct RasterMetadataHashWriter(Sha256);
+
+impl RasterMetadataHashWriter {
+    fn new(domain: &[u8]) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(domain);
+        Self(hash)
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.0.update([value]);
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.0.update(value.to_le_bytes());
+    }
+
+    fn i32(&mut self, value: i32) {
+        self.0.update(value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.0.update(value.to_le_bytes());
+    }
+
+    fn bytes(&mut self, value: &[u8]) {
+        self.u64(value.len() as u64);
+        self.0.update(value);
+    }
+
+    fn string(&mut self, value: &str) {
+        self.bytes(value.as_bytes());
+    }
+
+    fn finish(self) -> [u8; 32] {
+        self.0.finalize().into()
+    }
 }
 
 /// A region-level user correction attached to one exact stored projection.
@@ -367,11 +671,11 @@ pub(crate) enum JournalEvent {
     },
     RecognitionProjection {
         app_arrival_elapsed_ns: u128,
-        projection: RecognitionProjectionV1,
+        projection: Box<RecognitionProjectionV1>,
     },
     RegionCorrection {
         app_arrival_elapsed_ns: u128,
-        correction: RegionCorrectionV1,
+        correction: Box<RegionCorrectionV1>,
     },
 }
 
@@ -795,7 +1099,7 @@ impl SessionEpoch {
 }
 
 impl PhysicalSample {
-    fn stroke_ref(&self, journal_id: &str) -> Option<StrokeRef> {
+    pub(crate) fn stroke_ref(&self, journal_id: &str) -> Option<StrokeRef> {
         self.stroke_id.as_ref().map(|stroke_id| StrokeRef {
             journal_id: journal_id.to_owned(),
             session_id: self.session_id.clone(),
@@ -1893,7 +2197,7 @@ impl JournalReplayState {
                         sequence,
                         app_epoch_id: app_epoch_id.clone(),
                         app_arrival_elapsed_ns,
-                        projection,
+                        projection: *projection,
                     });
             }
             JournalEvent::RegionCorrection {
@@ -1907,7 +2211,7 @@ impl JournalReplayState {
                     sequence,
                     app_epoch_id: app_epoch_id.clone(),
                     app_arrival_elapsed_ns,
-                    correction,
+                    correction: *correction,
                 });
             }
         }
@@ -2332,9 +2636,18 @@ impl JournalWriter {
         projection: RecognitionProjectionV1,
         app_arrival_elapsed_ns: u128,
     ) -> Result<u64, JournalError> {
-        self.append_event(JournalEvent::RecognitionProjection {
+        self.append_recognition_projection_record(projection, app_arrival_elapsed_ns)
+            .map(|record| record.sequence)
+    }
+
+    pub(crate) fn append_recognition_projection_record(
+        &mut self,
+        projection: RecognitionProjectionV1,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<JournalRecord, JournalError> {
+        self.append_event_record(JournalEvent::RecognitionProjection {
             app_arrival_elapsed_ns,
-            projection,
+            projection: Box::new(projection),
         })
     }
 
@@ -2345,7 +2658,7 @@ impl JournalWriter {
     ) -> Result<u64, JournalError> {
         self.append_event(JournalEvent::RegionCorrection {
             app_arrival_elapsed_ns,
-            correction,
+            correction: Box::new(correction),
         })
     }
 
@@ -4035,7 +4348,15 @@ fn validate_record_before_encoding(
             validate_optional_text(Some(corrected_text), "corrected text")
         }
         JournalEvent::RecognitionProjection { projection, .. } => {
-            validate_recognition_projection_fields(projection)
+            validate_recognition_projection_fields(projection)?;
+            if projection.provider.provider_id == LOCAL_SENOCR_RASTER_PROVIDER_ID
+                && projection.input_modalities.is_none()
+            {
+                return Err(JournalError::invalid(
+                    "new local SenOCR projections require explicit Raster modality and generated origin",
+                ));
+            }
+            Ok(())
         }
         JournalEvent::RegionCorrection { correction, .. } => {
             validate_region_correction_fields(correction)
@@ -4286,6 +4607,44 @@ fn validate_sha256(value: &str, label: &str) -> Result<(), JournalError> {
     Ok(())
 }
 
+fn decode_sha256(value: &str) -> Result<[u8; 32], JournalError> {
+    if value.len() != SHA256_HEX_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(JournalError::invalid(
+            "canonical raster digest must be lowercase SHA-256 hex",
+        ));
+    }
+    let mut digest = [0_u8; 32];
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(JournalError::invalid(
+            "canonical raster digest must contain complete byte pairs",
+        ));
+    }
+    for (index, pair) in pairs.iter().enumerate() {
+        let high = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| JournalError::invalid("canonical raster digest contains invalid hex"))?;
+        let low = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| JournalError::invalid("canonical raster digest contains invalid hex"))?;
+        digest[index] = ((high << 4) | low) as u8;
+    }
+    Ok(digest)
+}
+
+fn encode_lower_sha256(digest: &[u8; 32]) -> String {
+    let mut output = String::with_capacity(SHA256_HEX_BYTES);
+    for byte in digest {
+        use fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
 fn validate_input_view_id(value: &str) -> Result<(), JournalError> {
     const PREFIX: &str = "input-view-v1-";
     let Some(fingerprint) = value.strip_prefix(PREFIX) else {
@@ -4487,6 +4846,174 @@ fn validate_recognition_projection_fields(
                 ));
             }
         }
+    }
+    if let Some(modalities) = &projection.input_modalities {
+        if modalities.is_empty() || modalities.len() > MAX_PROJECTION_INPUT_MODALITIES {
+            return Err(JournalError::limit(
+                "projection input-modality list is empty or exceeds its fixed cap",
+            ));
+        }
+        for (index, modality) in modalities.iter().enumerate() {
+            if modalities[..index].contains(modality) {
+                return Err(JournalError::invalid(
+                    "projection input modalities must be unique",
+                ));
+            }
+        }
+        if projection.provider.provider_id == LOCAL_SENOCR_RASTER_PROVIDER_ID
+            && (modalities.len() != 1
+                || modalities.first() != Some(&ProjectionInputModalityV1::Raster)
+                || projection.generated_raster.is_none())
+        {
+            return Err(JournalError::invalid(
+                "local SenOCR projections require the exact Raster mode and generated origin",
+            ));
+        }
+    }
+    if let Some(generated_raster) = &projection.generated_raster {
+        if projection
+            .input_modalities
+            .as_ref()
+            .is_none_or(|modalities| !modalities.contains(&ProjectionInputModalityV1::Raster))
+        {
+            return Err(JournalError::invalid(
+                "generated raster origin requires a persisted Raster input modality",
+            ));
+        }
+        validate_generated_raster_provenance(generated_raster, &projection.ink)?;
+    }
+    Ok(())
+}
+
+fn validate_generated_raster_provenance(
+    provenance: &GeneratedRasterProvenanceV1,
+    ink: &ProjectionInkBindingV1,
+) -> Result<(), JournalError> {
+    let source = &provenance.source;
+    for (value, label, maximum) in [
+        (&source.journal_id, "generated raster journal ID", 128usize),
+        (
+            &source.region_id,
+            "generated raster region ID",
+            MAX_PROJECTION_SOURCE_ID_BYTES,
+        ),
+        (
+            &source.input_view_id,
+            "generated raster input-view ID",
+            MAX_PROJECTION_SOURCE_ID_BYTES,
+        ),
+    ] {
+        validate_text(value, label, maximum)?;
+        if value.is_empty() {
+            return Err(JournalError::invalid(format!("{label} must be nonempty")));
+        }
+    }
+    if let Some(line_id) = &source.line_id {
+        validate_text(
+            line_id,
+            "generated raster line ID",
+            MAX_PROJECTION_SOURCE_ID_BYTES,
+        )?;
+        if line_id.is_empty() {
+            return Err(JournalError::invalid(
+                "generated raster line ID must be nonempty when present",
+            ));
+        }
+    }
+    validate_input_view_id(&source.input_view_id)?;
+    validate_sha256(&source.ink_binding_sha256, "generated raster ink binding")?;
+    if provenance.schema_version != 1
+        || source.journal_id != ink.journal_id
+        || source.logical_revision != ink.logical_revision
+        || source.last_sequence != ink.last_sequence
+        || source.region_id != ink.region_id
+        || source.line_id != ink.line_id
+        || source.input_view_id != ink.input_view_id
+        || source.ink_binding_sha256 != ink.ink_binding_sha256
+    {
+        return Err(JournalError::invalid(
+            "generated raster source does not match the exact projection input binding",
+        ));
+    }
+
+    let spec = &provenance.projection_spec;
+    let output_pixels = u64::from(spec.output_width_px)
+        .checked_mul(u64::from(spec.output_height_px))
+        .ok_or_else(|| JournalError::limit("generated raster pixel count overflow"))?;
+    let expected_stride = spec
+        .output_width_px
+        .checked_mul(PROJECTION_RASTER_BYTES_PER_PIXEL)
+        .ok_or_else(|| JournalError::limit("generated raster row stride overflow"))?;
+    let expected_buffer_bytes = expected_stride
+        .checked_mul(spec.output_height_px)
+        .ok_or_else(|| JournalError::limit("generated raster buffer size overflow"))?;
+    let crop_width =
+        i64::from(spec.source_crop_right_px_exclusive) - i64::from(spec.source_crop_left_px);
+    let crop_height =
+        i64::from(spec.source_crop_bottom_px_exclusive) - i64::from(spec.source_crop_top_px);
+    let crop_area = crop_width
+        .checked_mul(crop_height)
+        .ok_or_else(|| JournalError::limit("generated raster crop area overflow"))?;
+    if spec.schema_version != 1
+        || spec.output_width_px == 0
+        || spec.output_height_px == 0
+        || spec.output_width_px > MAX_PROJECTION_RASTER_DIMENSION
+        || spec.output_height_px > MAX_PROJECTION_RASTER_DIMENSION
+        || output_pixels > MAX_PROJECTION_RASTER_PIXELS
+        || crop_width <= 0
+        || crop_height <= 0
+        || crop_width > MAX_PROJECTION_RASTER_CROP_DIMENSION
+        || crop_height > MAX_PROJECTION_RASTER_CROP_DIMENSION
+        || crop_area > MAX_PROJECTION_RASTER_CROP_AREA
+        || spec.background_rgba != PROJECTION_RASTER_BACKGROUND_RGBA
+        || spec.committed_ink_rgba != PROJECTION_RASTER_INK_RGBA
+        || spec.stroke_width_16_16 != PROJECTION_RASTER_INK_WIDTH_16_16
+        || spec.row_stride_bytes != expected_stride
+        || spec.output_buffer_bytes != expected_buffer_bytes
+        || provenance.output_width_px != spec.output_width_px
+        || provenance.output_height_px != spec.output_height_px
+        || provenance.row_stride_bytes != expected_stride
+        || provenance.pixel_layout != spec.pixel_layout
+        || provenance.geometry_schema_version != 1
+        || provenance.raster_artifact_schema_version != 1
+        || provenance.renderer_version != CANONICAL_RASTER_RENDERER_VERSION_V1
+        || provenance.png_bytes_len == 0
+        || provenance.png_bytes_len > MAX_PROJECTION_RASTER_PNG_BYTES
+    {
+        return Err(JournalError::invalid(
+            "generated raster spec, dimensions, renderer, layout, or byte caps are inconsistent",
+        ));
+    }
+
+    for (value, label) in [
+        (
+            &provenance.source_content_sha256,
+            "generated raster source content",
+        ),
+        (&provenance.projection_spec_sha256, "generated raster spec"),
+        (&provenance.geometry_sha256, "generated raster geometry"),
+        (&provenance.pixel_bytes_sha256, "generated raster pixels"),
+        (&provenance.png_bytes_sha256, "generated raster PNG"),
+        (
+            &provenance.raster_artifact_sha256,
+            "generated raster artifact",
+        ),
+    ] {
+        decode_sha256(value).map_err(|_| {
+            JournalError::invalid(format!("{label} digest is not lowercase SHA-256 hex"))
+        })?;
+    }
+    if provenance.projection_spec_sha256 != encode_lower_sha256(&spec.canonical_sha256()) {
+        return Err(JournalError::invalid(
+            "generated raster spec digest does not match its declared transform",
+        ));
+    }
+    if provenance.raster_artifact_sha256
+        != encode_lower_sha256(&provenance.expected_raster_artifact_sha256()?)
+    {
+        return Err(JournalError::invalid(
+            "generated raster artifact digest does not match its metadata",
+        ));
     }
     Ok(())
 }
@@ -5320,14 +5847,14 @@ fn parse_record_fields(
                     fields[2],
                     "recognition projection app arrival",
                 )?,
-                projection: decode_json_payload(fields[3], "recognition projection")?,
+                projection: Box::new(decode_json_payload(fields[3], "recognition projection")?),
             }
         }
         "RCOR" if version >= JOURNAL_SCHEMA_VERSION => {
             require_fields(fields, 4, "RCOR")?;
             JournalEvent::RegionCorrection {
                 app_arrival_elapsed_ns: parse_u128(fields[2], "region correction app arrival")?,
-                correction: decode_json_payload(fields[3], "region correction")?,
+                correction: Box::new(decode_json_payload(fields[3], "region correction")?),
             }
         }
         "REV" => {
@@ -6020,6 +6547,8 @@ mod tests {
                 configuration_id: "config-r1".to_owned(),
                 configuration_fingerprint: "provider-config-v1-fnv64-5d449396c33394f8".to_owned(),
             },
+            generated_raster: None,
+            input_modalities: None,
             candidates: vec![RecognitionCandidateV1 {
                 rank: 0,
                 recognized_text: "recognized text".to_owned(),
@@ -6030,6 +6559,90 @@ mod tests {
                     last_journal_sequence: last_sample_sequence,
                 }],
             }],
+        }
+    }
+
+    fn projection_test_generated_raster(
+        binding: &ProjectionInkBindingV1,
+    ) -> GeneratedRasterProvenanceV1 {
+        let projection_spec = ProjectionRasterSpecV1 {
+            schema_version: 1,
+            output_width_px: 8,
+            output_height_px: 8,
+            source_crop_left_px: 0,
+            source_crop_top_px: 0,
+            source_crop_right_px_exclusive: 16,
+            source_crop_bottom_px_exclusive: 16,
+            aspect_ratio_policy: ProjectionRasterAspectRatioPolicyV1::FitContainCentered,
+            pixel_layout: ProjectionRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown,
+            coverage_policy: ProjectionRasterCoveragePolicyV1::Antialiased,
+            background_rgba: PROJECTION_RASTER_BACKGROUND_RGBA,
+            committed_ink_rgba: PROJECTION_RASTER_INK_RGBA,
+            stroke_width_16_16: PROJECTION_RASTER_INK_WIDTH_16_16,
+            stroke_cap: ProjectionRasterStrokeCapV1::Round,
+            stroke_join: ProjectionRasterStrokeJoinV1::Round,
+            rounding_policy: ProjectionRasterRoundingPolicyV1::NearestTiesAwayQ16,
+            clipping_policy:
+                ProjectionRasterClippingPolicyV1::RejectPointsOutsideSourceCropClipCoverageAtOutputBounds,
+            single_point_policy: ProjectionRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint,
+            stroke_order_policy: ProjectionRasterStrokeOrderPolicyV1::JournalFirstOccurrence,
+            row_stride_bytes: 32,
+            output_buffer_bytes: 256,
+        };
+        let source_content_sha256 = "c".repeat(64);
+        let projection_spec_sha256 = encode_lower_sha256(&projection_spec.canonical_sha256());
+        let geometry_sha256 = "d".repeat(64);
+        let pixel_bytes_sha256 = "e".repeat(64);
+        let png_bytes_sha256 = "f".repeat(64);
+        let source_content_digest = decode_sha256(&source_content_sha256).unwrap();
+        let projection_spec_digest = decode_sha256(&projection_spec_sha256).unwrap();
+        let geometry_digest = decode_sha256(&geometry_sha256).unwrap();
+        let pixel_bytes_digest = decode_sha256(&pixel_bytes_sha256).unwrap();
+        let png_bytes_digest = decode_sha256(&png_bytes_sha256).unwrap();
+        let raster_artifact_sha256 = encode_lower_sha256(&canonical_raster_artifact_sha256(
+            CanonicalRasterArtifactHashInputV1 {
+                schema_version: 1,
+                renderer_version: CANONICAL_RASTER_RENDERER_VERSION_V1,
+                source_journal_id: &binding.journal_id,
+                source_logical_revision: binding.logical_revision,
+                source_last_sequence: binding.last_sequence,
+                source_content_sha256: &source_content_digest,
+                projection_spec_sha256: &projection_spec_digest,
+                geometry_sha256: &geometry_digest,
+                output_width_px: 8,
+                output_height_px: 8,
+                row_stride_bytes: 32,
+                pixel_layout: ProjectionRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown,
+                pixel_bytes_sha256: &pixel_bytes_digest,
+                png_bytes_sha256: &png_bytes_digest,
+            },
+        ));
+        GeneratedRasterProvenanceV1 {
+            schema_version: 1,
+            source: ProjectionRasterSourceBindingV1 {
+                journal_id: binding.journal_id.clone(),
+                logical_revision: binding.logical_revision,
+                last_sequence: binding.last_sequence,
+                region_id: binding.region_id.clone(),
+                line_id: binding.line_id.clone(),
+                input_view_id: binding.input_view_id.clone(),
+                ink_binding_sha256: binding.ink_binding_sha256.clone(),
+            },
+            source_content_sha256,
+            projection_spec,
+            projection_spec_sha256,
+            geometry_schema_version: 1,
+            geometry_sha256,
+            raster_artifact_schema_version: 1,
+            renderer_version: CANONICAL_RASTER_RENDERER_VERSION_V1.to_owned(),
+            output_width_px: 8,
+            output_height_px: 8,
+            row_stride_bytes: 32,
+            pixel_layout: ProjectionRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown,
+            pixel_bytes_sha256,
+            png_bytes_len: 64,
+            png_bytes_sha256,
+            raster_artifact_sha256,
         }
     }
 
@@ -6150,6 +6763,107 @@ mod tests {
     }
 
     #[test]
+    fn stable_region_membership_does_not_transfer_corrections_between_projections() {
+        let path = temp_path("stable-region-no-correction-transfer");
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-stable-region-correction"))
+                .unwrap();
+        let (target, source_sequences, _frame, _first, _second) =
+            append_projection_test_stroke(&mut writer, "stroke-stable-region");
+        let first_binding =
+            projection_test_binding(&writer.state, &target, source_sequences.clone());
+        let first_region_id = first_binding.region_id.clone();
+        writer
+            .append_recognition_projection(
+                projection_test_record(
+                    "projection-first-attempt",
+                    first_binding.clone(),
+                    source_sequences[0],
+                    source_sequences[1],
+                ),
+                30,
+            )
+            .unwrap();
+        writer
+            .append_region_correction(
+                region_correction_test_record(
+                    "correction-first-attempt",
+                    "projection-first-attempt",
+                    first_binding.clone(),
+                    RegionCorrectionActionV1::SetText("first projection only".to_owned()),
+                ),
+                31,
+            )
+            .unwrap();
+
+        writer
+            .apply_edit_action_record(
+                32,
+                EditCommand::Move {
+                    target: target.clone(),
+                    delta_x_raw: 7,
+                    delta_y_raw: -3,
+                    coordinate_space: "device-output".to_owned(),
+                    units: "raw-units".to_owned(),
+                },
+            )
+            .unwrap();
+        let mut moved_binding =
+            projection_test_binding(&writer.state, &target, source_sequences.clone());
+        moved_binding.input_view_id = "input-view-v1-0000000000000002".to_owned();
+        moved_binding.ink_binding_sha256 = "b".repeat(SHA256_HEX_BYTES);
+        assert_eq!(moved_binding.region_id, first_region_id);
+        writer
+            .append_recognition_projection(
+                projection_test_record(
+                    "projection-second-attempt",
+                    moved_binding.clone(),
+                    source_sequences[0],
+                    source_sequences[1],
+                ),
+                33,
+            )
+            .unwrap();
+        assert_eq!(writer.state.recognition_projections.len(), 2);
+        assert_eq!(writer.state.region_corrections.len(), 1);
+        assert_eq!(
+            writer.state.region_corrections[0].correction.projection_id,
+            "projection-first-attempt"
+        );
+        assert_eq!(
+            writer.state.recognition_projections[0]
+                .projection
+                .ink
+                .region_id,
+            writer.state.recognition_projections[1]
+                .projection
+                .ink
+                .region_id
+        );
+        assert_ne!(
+            writer.state.recognition_projections[0]
+                .projection
+                .projection_id,
+            writer.state.recognition_projections[1]
+                .projection
+                .projection_id
+        );
+        writer.flush().unwrap();
+        drop(writer);
+
+        let reopened = read_journal(&path).unwrap();
+        assert_eq!(reopened.state.region_corrections.len(), 1);
+        assert_eq!(
+            reopened.state.region_corrections[0]
+                .correction
+                .projection_id,
+            "projection-first-attempt"
+        );
+        assert_eq!(reopened.state.recognition_projections.len(), 2);
+        cleanup_journal(&path);
+    }
+
+    #[test]
     fn projection_roundtrip_preserves_unavailable_optional_model_and_resource_versions() {
         let path = temp_path("projection-missing-version");
         let mut writer =
@@ -6196,6 +6910,359 @@ mod tests {
                 .as_deref(),
             None
         );
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn projection_generated_raster_origin_roundtrips_without_image_payloads() {
+        let path = temp_path("projection-generated-raster-origin");
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-generated-raster-origin")).unwrap();
+        let (target, source_sequences, _frame, _first, _second) =
+            append_projection_test_stroke(&mut writer, "stroke-generated-raster");
+        let binding = projection_test_binding(&writer.state, &target, source_sequences.clone());
+        let mut projection = projection_test_record(
+            "projection-generated-raster",
+            binding.clone(),
+            source_sequences[0],
+            source_sequences[1],
+        );
+        projection.input_modalities = Some(vec![ProjectionInputModalityV1::Raster]);
+
+        let mut wrong_source = projection_test_generated_raster(&binding);
+        wrong_source.source.input_view_id = "input-view-v1-0000000000000002".to_owned();
+        projection.generated_raster = Some(wrong_source);
+        assert!(
+            writer
+                .append_recognition_projection(projection.clone(), 30)
+                .is_err()
+        );
+
+        let mut wrong_spec = projection_test_generated_raster(&binding);
+        wrong_spec.projection_spec.output_width_px = 9;
+        projection.generated_raster = Some(wrong_spec);
+        assert!(
+            writer
+                .append_recognition_projection(projection.clone(), 31)
+                .is_err()
+        );
+
+        let mut wrong_dimensions = projection_test_generated_raster(&binding);
+        wrong_dimensions.output_width_px = 9;
+        projection.generated_raster = Some(wrong_dimensions);
+        assert!(
+            writer
+                .append_recognition_projection(projection.clone(), 32)
+                .is_err()
+        );
+
+        let mut wrong_hash = projection_test_generated_raster(&binding);
+        wrong_hash.pixel_bytes_sha256 = "0".repeat(64);
+        projection.generated_raster = Some(wrong_hash);
+        assert!(
+            writer
+                .append_recognition_projection(projection.clone(), 33)
+                .is_err()
+        );
+        assert!(writer.state.recognition_projections.is_empty());
+        assert_eq!(writer.state.last_sequence, 3);
+
+        projection.projection_id = "projection-generated-raster-valid".to_owned();
+        projection.generated_raster = Some(projection_test_generated_raster(&binding));
+        writer
+            .append_recognition_projection(projection, 34)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let persisted = read_journal(&path).unwrap();
+        let stored = persisted.state.recognition_projections[0]
+            .projection
+            .generated_raster
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            stored.source,
+            ProjectionRasterSourceBindingV1 {
+                journal_id: binding.journal_id.clone(),
+                logical_revision: binding.logical_revision,
+                last_sequence: binding.last_sequence,
+                region_id: binding.region_id.clone(),
+                line_id: binding.line_id.clone(),
+                input_view_id: binding.input_view_id.clone(),
+                ink_binding_sha256: binding.ink_binding_sha256.clone(),
+            }
+        );
+        let serialized = serde_json::to_string(stored).unwrap();
+        assert!(!serialized.contains("raw_payload_hex"));
+        assert!(!serialized.contains("\"png_bytes\""));
+        assert!(!serialized.contains("\"pixel_bytes\""));
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn projection_modality_validation_keeps_legacy_and_external_raster_origins_distinct() {
+        let path = temp_path("projection-input-modalities");
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-input-modalities")).unwrap();
+        let (target, source_sequences, _frame, _first, _second) =
+            append_projection_test_stroke(&mut writer, "stroke-input-modalities");
+        let binding = projection_test_binding(&writer.state, &target, source_sequences.clone());
+
+        let mut empty_modalities = projection_test_record(
+            "projection-empty-modalities",
+            binding.clone(),
+            source_sequences[0],
+            source_sequences[1],
+        );
+        empty_modalities.input_modalities = Some(Vec::new());
+        assert!(
+            writer
+                .append_recognition_projection(empty_modalities, 30)
+                .is_err()
+        );
+
+        let mut duplicate_modalities = projection_test_record(
+            "projection-duplicate-modalities",
+            binding.clone(),
+            source_sequences[0],
+            source_sequences[1],
+        );
+        duplicate_modalities.input_modalities = Some(vec![
+            ProjectionInputModalityV1::Raster,
+            ProjectionInputModalityV1::Raster,
+        ]);
+        assert!(
+            writer
+                .append_recognition_projection(duplicate_modalities, 31)
+                .is_err()
+        );
+
+        let mut over_cap_modalities = projection_test_record(
+            "projection-over-cap-modalities",
+            binding.clone(),
+            source_sequences[0],
+            source_sequences[1],
+        );
+        over_cap_modalities.input_modalities = Some(vec![
+            ProjectionInputModalityV1::Raster,
+            ProjectionInputModalityV1::Raster,
+            ProjectionInputModalityV1::Raster,
+        ]);
+        assert!(
+            writer
+                .append_recognition_projection(over_cap_modalities, 32)
+                .is_err()
+        );
+
+        let unknown_modality = projection_test_record(
+            "projection-unknown-modality",
+            binding.clone(),
+            source_sequences[0],
+            source_sequences[1],
+        );
+        let mut unknown_json = serde_json::to_value(unknown_modality).unwrap();
+        unknown_json["input_modalities"] = serde_json::json!(["unknown"]);
+        assert!(serde_json::from_value::<RecognitionProjectionV1>(unknown_json).is_err());
+
+        let mut senocr_with_legacy_none = projection_test_record(
+            "projection-senocr-legacy-none-write",
+            binding.clone(),
+            source_sequences[0],
+            source_sequences[1],
+        );
+        senocr_with_legacy_none.provider.provider_id = LOCAL_SENOCR_RASTER_PROVIDER_ID.to_owned();
+        assert!(
+            writer
+                .append_recognition_projection(senocr_with_legacy_none, 32)
+                .is_err()
+        );
+
+        let mut senocr_without_origin = projection_test_record(
+            "projection-senocr-without-origin",
+            binding.clone(),
+            source_sequences[0],
+            source_sequences[1],
+        );
+        senocr_without_origin.provider.provider_id = LOCAL_SENOCR_RASTER_PROVIDER_ID.to_owned();
+        senocr_without_origin.input_modalities = Some(vec![ProjectionInputModalityV1::Raster]);
+        assert!(
+            writer
+                .append_recognition_projection(senocr_without_origin, 33)
+                .is_err()
+        );
+
+        let mut origin_without_raster_mode = projection_test_record(
+            "projection-origin-without-raster-mode",
+            binding.clone(),
+            source_sequences[0],
+            source_sequences[1],
+        );
+        origin_without_raster_mode.generated_raster =
+            Some(projection_test_generated_raster(&binding));
+        assert!(
+            writer
+                .append_recognition_projection(origin_without_raster_mode, 34)
+                .is_err()
+        );
+        assert!(writer.state.recognition_projections.is_empty());
+
+        let mut external_raster_without_origin = projection_test_record(
+            "projection-external-raster-no-origin",
+            binding,
+            source_sequences[0],
+            source_sequences[1],
+        );
+        external_raster_without_origin.provider.provider_id = "external-raster-provider".to_owned();
+        external_raster_without_origin.input_modalities =
+            Some(vec![ProjectionInputModalityV1::Raster]);
+        writer
+            .append_recognition_projection(external_raster_without_origin, 35)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let reopened = read_journal(&path).unwrap();
+        let projection = &reopened.state.recognition_projections[0].projection;
+        assert_eq!(
+            projection.input_modalities,
+            Some(vec![ProjectionInputModalityV1::Raster])
+        );
+        assert!(projection.generated_raster.is_none());
+        assert_eq!(projection.provider.provider_id, "external-raster-provider");
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn legacy_senocr_projection_without_modalities_remains_readable() {
+        let path = temp_path("legacy-senocr-projection-no-modalities");
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-legacy-senocr-projection"))
+                .unwrap();
+        let (target, source_sequences, _frame, _first, _second) =
+            append_projection_test_stroke(&mut writer, "stroke-legacy-senocr");
+        let binding = projection_test_binding(&writer.state, &target, source_sequences.clone());
+        let mut projection = projection_test_record(
+            "projection-legacy-senocr-none",
+            binding,
+            source_sequences[0],
+            source_sequences[1],
+        );
+        projection.provider.provider_id = LOCAL_SENOCR_RASTER_PROVIDER_ID.to_owned();
+        projection.input_modalities = None;
+        projection.generated_raster = None;
+        let sequence = writer.state.last_sequence + 1;
+        let app_epoch_id = writer.state.current_session_id.clone();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let record = JournalRecord {
+            sequence,
+            app_epoch_id,
+            event: JournalEvent::RecognitionProjection {
+                app_arrival_elapsed_ns: 30,
+                projection: Box::new(projection),
+            },
+        };
+        let encoded =
+            encode_row(&encode_record_fields(&record, JOURNAL_SCHEMA_VERSION).unwrap()).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&encoded).unwrap();
+        drop(file);
+
+        let parsed = read_journal(&path).unwrap();
+        let stored = &parsed.state.recognition_projections[0].projection;
+        assert_eq!(stored.provider.provider_id, LOCAL_SENOCR_RASTER_PROVIDER_ID);
+        assert!(stored.input_modalities.is_none());
+        assert!(stored.generated_raster.is_none());
+        cleanup_journal(&path);
+    }
+
+    #[test]
+    fn older_projection_json_defaults_missing_optional_raster_fields() {
+        let binding = ProjectionInkBindingV1 {
+            journal_id: "legacy-raster-projection".to_owned(),
+            logical_revision: 1,
+            last_sequence: 3,
+            region_id: "region-legacy".to_owned(),
+            line_id: Some("line-1".to_owned()),
+            input_view_id: "input-view-v1-0000000000000001".to_owned(),
+            ink_binding_sha256: "a".repeat(64),
+            selected_strokes: vec![StrokeRef {
+                journal_id: "legacy-raster-projection".to_owned(),
+                session_id: "session-1".to_owned(),
+                source_api: "direct-wm-pointer".to_owned(),
+                device_id: Some("device-1".to_owned()),
+                pointer_id: Some(1),
+                stroke_id: "stroke-1".to_owned(),
+            }],
+            source_sample_sequences: vec![2],
+            stroke_views: vec![ProjectionStrokeViewV1 {
+                stroke: StrokeRef {
+                    journal_id: "legacy-raster-projection".to_owned(),
+                    session_id: "session-1".to_owned(),
+                    source_api: "direct-wm-pointer".to_owned(),
+                    device_id: Some("device-1".to_owned()),
+                    pointer_id: Some(1),
+                    stroke_id: "stroke-1".to_owned(),
+                },
+                frame: StrokeViewFrame::default(),
+            }],
+        };
+        let projection = projection_test_record("legacy-projection", binding, 2, 2);
+        let mut value = serde_json::to_value(projection).unwrap();
+        value.as_object_mut().unwrap().remove("generated_raster");
+        value.as_object_mut().unwrap().remove("input_modalities");
+        let parsed: RecognitionProjectionV1 = serde_json::from_value(value).unwrap();
+        assert!(parsed.generated_raster.is_none());
+        assert!(parsed.input_modalities.is_none());
+    }
+
+    #[test]
+    fn legacy_senocr_projection_row_without_modalities_remains_readable() {
+        let path = temp_path("legacy-senocr-projection-row");
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-legacy-senocr-projection-row"))
+                .unwrap();
+        let (target, source_sequences, _frame, _first, _second) =
+            append_projection_test_stroke(&mut writer, "stroke-legacy-senocr-row");
+        let binding = projection_test_binding(&writer.state, &target, source_sequences.clone());
+        let mut projection = projection_test_record(
+            "projection-legacy-senocr-row",
+            binding,
+            source_sequences[0],
+            source_sequences[1],
+        );
+        projection.provider.provider_id = LOCAL_SENOCR_RASTER_PROVIDER_ID.to_owned();
+        projection.input_modalities = None;
+        projection.generated_raster = None;
+        let sequence = writer.state.last_sequence + 1;
+        let app_epoch_id = writer.state.current_session_id.clone();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let record = JournalRecord {
+            sequence,
+            app_epoch_id,
+            event: JournalEvent::RecognitionProjection {
+                app_arrival_elapsed_ns: 30,
+                projection: Box::new(projection),
+            },
+        };
+        let row =
+            encode_row(&encode_record_fields(&record, JOURNAL_SCHEMA_VERSION).unwrap()).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&row).unwrap();
+        drop(file);
+
+        let parsed = read_journal(&path).unwrap();
+        let projection = &parsed.state.recognition_projections[0].projection;
+        assert_eq!(
+            projection.provider.provider_id,
+            LOCAL_SENOCR_RASTER_PROVIDER_ID
+        );
+        assert!(projection.input_modalities.is_none());
+        assert!(projection.generated_raster.is_none());
         cleanup_journal(&path);
     }
 
@@ -6587,7 +7654,7 @@ mod tests {
             app_epoch_id: "session-1".to_owned(),
             event: JournalEvent::RecognitionProjection {
                 app_arrival_elapsed_ns: 50,
-                projection,
+                projection: Box::new(projection),
             },
         };
         let line =
@@ -6599,6 +7666,59 @@ mod tests {
         assert!(recovered.state.recognition_projections.is_empty());
         assert_eq!(recovered.state.last_sequence, 3);
         cleanup_journal(&truncated_path);
+    }
+
+    #[test]
+    fn recognition_projection_sync_failure_poisons_writer_and_reopen_replays_disk_state() {
+        let path = temp_path("projection-sync-failure");
+        let mut writer =
+            JournalWriter::create(path.clone(), header("journal-projection-sync-failure")).unwrap();
+        let (target, source_sequences, _frame, _first, _second) =
+            append_projection_test_stroke(&mut writer, "stroke-sync-failure");
+        let binding = projection_test_binding(&writer.state, &target, source_sequences.clone());
+        let projection = projection_test_record(
+            "projection-sync-failure",
+            binding,
+            source_sequences[0],
+            source_sequences[1],
+        );
+        writer.fail_next_sync_after_write = true;
+        let error = writer
+            .append_recognition_projection(projection, 30)
+            .unwrap_err();
+        assert_eq!(error.kind, JournalErrorKind::Io);
+        assert!(writer.is_poisoned());
+        assert!(writer.state.recognition_projections.is_empty());
+        assert_eq!(
+            writer
+                .append_metadata(JournalMetadata {
+                    scope: MetadataScope::Session,
+                    scope_id: "session-1".to_owned(),
+                    source_api: None,
+                    device_id: None,
+                    key: "after-poison".to_owned(),
+                    value: "must-reopen".to_owned(),
+                    provenance: "test".to_owned(),
+                    app_arrival_elapsed_ns: 31,
+                })
+                .unwrap_err()
+                .kind,
+            JournalErrorKind::Poisoned
+        );
+        drop(writer);
+
+        let replayed = read_journal(&path).unwrap();
+        assert_eq!(replayed.state.recognition_projections.len(), 1);
+        assert_eq!(
+            replayed.state.recognition_projections[0]
+                .projection
+                .projection_id,
+            "projection-sync-failure"
+        );
+        let reopened = JournalWriter::open_append(path.clone()).unwrap();
+        assert_eq!(reopened.state.recognition_projections.len(), 1);
+        drop(reopened);
+        cleanup_journal(&path);
     }
 
     fn rewrite_record_field(path: &Path, tag: &str, field_index: usize, replacement: &str) {

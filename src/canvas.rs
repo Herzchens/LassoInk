@@ -13,8 +13,13 @@ use tiny_skia::{
 };
 
 use crate::journal::{
-    EditCommand, JournalError, JournalMetadata, JournalReplayState, MetadataScope, NativeTimestamp,
-    PhysicalSample, RawPosition, RawPressure, StrokeRef, StrokeViewFrame,
+    CanonicalRasterArtifactHashInputV1, EditCommand, JournalError, JournalMetadata,
+    JournalReplayState, MetadataScope, NativeTimestamp, PhysicalSample,
+    ProjectionRasterAspectRatioPolicyV1, ProjectionRasterClippingPolicyV1,
+    ProjectionRasterCoveragePolicyV1, ProjectionRasterPixelLayoutV1,
+    ProjectionRasterRoundingPolicyV1, ProjectionRasterSinglePointPolicyV1, ProjectionRasterSpecV1,
+    ProjectionRasterStrokeCapV1, ProjectionRasterStrokeJoinV1, ProjectionRasterStrokeOrderPolicyV1,
+    RawPosition, RawPressure, StrokeRef, StrokeViewFrame, canonical_raster_artifact_sha256,
 };
 use crate::win32_pointer::{
     DirectPenHistoryBatch, LifecycleEventKind, OwnedPointerSample, PointerMessageKind,
@@ -45,7 +50,8 @@ const CANONICAL_RASTER_BYTES_PER_PIXEL: u32 = 4;
 const CANONICAL_RASTER_BACKGROUND_RGBA: [u8; 4] = [255, 255, 255, 255];
 const CANONICAL_RASTER_INK_RGBA: [u8; 4] = [32, 32, 32, 255];
 const CANONICAL_RASTER_INK_WIDTH_16_16: u32 = 2 << 16;
-const CANONICAL_RASTER_RENDERER_VERSION: &str = "tiny-skia/0.12.0;canonical-raster-v1";
+const CANONICAL_RASTER_RENDERER_VERSION: &str =
+    crate::journal::CANONICAL_RASTER_RENDERER_VERSION_V1;
 const TOOLBAR_HEIGHT: i32 = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1734,6 +1740,10 @@ impl CanvasScene {
         Ok(targets)
     }
 
+    pub(crate) fn has_preview_strokes(&self) -> bool {
+        !self.preview_strokes.is_empty()
+    }
+
     pub(crate) fn tombstone_selected_command(&self) -> Result<Option<EditCommand>, CanvasError> {
         let targets = self.selected_targets()?;
         if targets.is_empty() {
@@ -1897,6 +1907,57 @@ pub(crate) struct CanonicalRasterProjectionPlanV1 {
     samples_in_journal_order: Vec<CanonicalRasterProjectionSampleV1>,
 }
 
+impl CanonicalRasterProjectionPlanV1 {
+    pub(crate) fn journal_first_occurrence_stroke_order(
+        &self,
+    ) -> Result<Vec<StrokeRef>, CanvasError> {
+        journal_first_occurrence_stroke_order(self)
+    }
+
+    /// Bounds only observed canonical points and adds a fixed caller-declared
+    /// margin. All arithmetic is checked before the projection spec is built.
+    pub(crate) fn source_crop_with_padding(
+        &self,
+        padding_px: i32,
+    ) -> Result<CanonicalRasterProjectionCropV1, CanvasError> {
+        if padding_px < 0 || self.samples_in_journal_order.is_empty() {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "source crop requires observed samples and nonnegative padding",
+            ));
+        }
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        for sample in &self.samples_in_journal_order {
+            min_x = min_x.min(sample.canonical_canvas_position_px.x);
+            min_y = min_y.min(sample.canonical_canvas_position_px.y);
+            max_x = max_x.max(sample.canonical_canvas_position_px.x);
+            max_y = max_y.max(sample.canonical_canvas_position_px.y);
+        }
+        let left_px = min_x
+            .checked_sub(padding_px)
+            .ok_or(CanvasError::InvalidTransform)?;
+        let top_px = min_y
+            .checked_sub(padding_px)
+            .ok_or(CanvasError::InvalidTransform)?;
+        let right_px_exclusive = max_x
+            .checked_add(padding_px)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(CanvasError::InvalidTransform)?;
+        let bottom_px_exclusive = max_y
+            .checked_add(padding_px)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(CanvasError::InvalidTransform)?;
+        Ok(CanonicalRasterProjectionCropV1 {
+            left_px,
+            top_px,
+            right_px_exclusive,
+            bottom_px_exclusive,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterProjectionSampleV1 {
     journal_sequence: u64,
@@ -1991,6 +2052,68 @@ impl CanonicalRasterProjectionSpecV1 {
                 CanonicalRasterClippingPolicyV1::RejectPointsOutsideSourceCropClipCoverageAtOutputBounds,
             single_point_policy: CanonicalRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint,
             stroke_order_policy: CanonicalRasterStrokeOrderPolicyV1::JournalFirstOccurrence,
+        }
+    }
+
+    pub(crate) fn projection_provenance(
+        &self,
+        row_stride_bytes: u32,
+        output_buffer_bytes: u32,
+    ) -> ProjectionRasterSpecV1 {
+        ProjectionRasterSpecV1 {
+            schema_version: self.schema_version,
+            output_width_px: self.output_width_px,
+            output_height_px: self.output_height_px,
+            source_crop_left_px: self.source_crop.left_px,
+            source_crop_top_px: self.source_crop.top_px,
+            source_crop_right_px_exclusive: self.source_crop.right_px_exclusive,
+            source_crop_bottom_px_exclusive: self.source_crop.bottom_px_exclusive,
+            aspect_ratio_policy: match self.aspect_ratio_policy {
+                CanonicalRasterAspectRatioPolicyV1::FitContainCentered => {
+                    ProjectionRasterAspectRatioPolicyV1::FitContainCentered
+                }
+            },
+            pixel_layout: match self.pixel_layout {
+                CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown => {
+                    ProjectionRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown
+                }
+            },
+            coverage_policy: match self.coverage_policy {
+                CanonicalRasterCoveragePolicyV1::Antialiased => {
+                    ProjectionRasterCoveragePolicyV1::Antialiased
+                }
+            },
+            background_rgba: self.background_rgba,
+            committed_ink_rgba: self.committed_ink_rgba,
+            stroke_width_16_16: self.stroke_width_16_16,
+            stroke_cap: match self.stroke_cap {
+                CanonicalRasterStrokeCapV1::Round => ProjectionRasterStrokeCapV1::Round,
+            },
+            stroke_join: match self.stroke_join {
+                CanonicalRasterStrokeJoinV1::Round => ProjectionRasterStrokeJoinV1::Round,
+            },
+            rounding_policy: match self.rounding_policy {
+                CanonicalRasterRoundingPolicyV1::NearestTiesAwayQ16 => {
+                    ProjectionRasterRoundingPolicyV1::NearestTiesAwayQ16
+                }
+            },
+            clipping_policy: match self.clipping_policy {
+                CanonicalRasterClippingPolicyV1::RejectPointsOutsideSourceCropClipCoverageAtOutputBounds => {
+                    ProjectionRasterClippingPolicyV1::RejectPointsOutsideSourceCropClipCoverageAtOutputBounds
+                }
+            },
+            single_point_policy: match self.single_point_policy {
+                CanonicalRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint => {
+                    ProjectionRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint
+                }
+            },
+            stroke_order_policy: match self.stroke_order_policy {
+                CanonicalRasterStrokeOrderPolicyV1::JournalFirstOccurrence => {
+                    ProjectionRasterStrokeOrderPolicyV1::JournalFirstOccurrence
+                }
+            },
+            row_stride_bytes,
+            output_buffer_bytes,
         }
     }
 
@@ -2144,6 +2267,11 @@ impl CanonicalRasterOutputGeometryV1 {
         self.spec.schema_version
     }
 
+    pub(crate) fn projection_spec_metadata(&self) -> ProjectionRasterSpecV1 {
+        self.spec
+            .projection_provenance(self.row_stride_bytes, self.output_buffer_bytes)
+    }
+
     pub(crate) fn canonical_stroke_draw_order(&self) -> &[StrokeRef] {
         &self.stroke_draw_order
     }
@@ -2166,6 +2294,10 @@ impl CanonicalRasterOutputGeometryV1 {
 }
 
 impl CanonicalRasterImageV1 {
+    pub(crate) fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
     pub(crate) fn source_revision_parts(&self) -> (&str, u64, u64) {
         (
             &self.source_journal_id,
@@ -3249,10 +3381,12 @@ fn hash_canonical_raster_source(
     plan: &CanonicalRasterProjectionPlanV1,
     stroke_draw_order: &[StrokeRef],
 ) -> [u8; 32] {
-    let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-source/v1\0");
+    // This is content identity, not the exact submitted prefix. The prefix is
+    // stored separately and included by the raster artifact hash; excluding it
+    // here keeps source/geometry identity stable across unrelated journal tails.
+    let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-source/v2\0");
     hash.string(&plan.journal_id);
     hash.u64(plan.logical_revision);
-    hash.u64(plan.last_sequence);
     hash.u64(stroke_draw_order.len() as u64);
     for stroke in stroke_draw_order {
         hash.stroke_ref(stroke);
@@ -3276,48 +3410,8 @@ fn hash_canonical_raster_spec(
     row_stride_bytes: u32,
     output_buffer_bytes: u32,
 ) -> [u8; 32] {
-    let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-spec/v1\0");
-    hash.u32(spec.schema_version);
-    hash.u32(spec.output_width_px);
-    hash.u32(spec.output_height_px);
-    hash.i32(spec.source_crop.left_px);
-    hash.i32(spec.source_crop.top_px);
-    hash.i32(spec.source_crop.right_px_exclusive);
-    hash.i32(spec.source_crop.bottom_px_exclusive);
-    hash.u8(match spec.aspect_ratio_policy {
-        CanonicalRasterAspectRatioPolicyV1::FitContainCentered => 1,
-    });
-    hash.u8(match spec.pixel_layout {
-        CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown => 1,
-    });
-    hash.u8(match spec.coverage_policy {
-        CanonicalRasterCoveragePolicyV1::Antialiased => 1,
-    });
-    hash.bytes(&spec.background_rgba);
-    hash.bytes(&spec.committed_ink_rgba);
-    hash.u32(spec.stroke_width_16_16);
-    hash.u8(match spec.stroke_cap {
-        CanonicalRasterStrokeCapV1::Round => 1,
-    });
-    hash.u8(match spec.stroke_join {
-        CanonicalRasterStrokeJoinV1::Round => 1,
-    });
-    hash.u8(match spec.rounding_policy {
-        CanonicalRasterRoundingPolicyV1::NearestTiesAwayQ16 => 1,
-    });
-    hash.u8(match spec.clipping_policy {
-        CanonicalRasterClippingPolicyV1::RejectPointsOutsideSourceCropClipCoverageAtOutputBounds =>
-            1,
-    });
-    hash.u8(match spec.single_point_policy {
-        CanonicalRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint => 1,
-    });
-    hash.u8(match spec.stroke_order_policy {
-        CanonicalRasterStrokeOrderPolicyV1::JournalFirstOccurrence => 1,
-    });
-    hash.u32(row_stride_bytes);
-    hash.u32(output_buffer_bytes);
-    hash.finish()
+    spec.projection_provenance(row_stride_bytes, output_buffer_bytes)
+        .canonical_sha256()
 }
 
 fn hash_canonical_raster_geometry(geometry: &CanonicalRasterOutputGeometryV1) -> [u8; 32] {
@@ -3345,24 +3439,22 @@ fn hash_canonical_raster_geometry(geometry: &CanonicalRasterOutputGeometryV1) ->
 }
 
 fn hash_canonical_raster_artifact(image: &CanonicalRasterImageV1) -> [u8; 32] {
-    let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-artifact/v1\0");
-    hash.u32(image.schema_version);
-    hash.string(image.renderer_version);
-    hash.string(&image.source_journal_id);
-    hash.u64(image.source_logical_revision);
-    hash.u64(image.source_last_sequence);
-    hash.bytes(&image.source_content_sha256);
-    hash.bytes(&image.projection_spec_sha256);
-    hash.bytes(&image.geometry_sha256);
-    hash.u32(image.output_width_px);
-    hash.u32(image.output_height_px);
-    hash.u32(image.row_stride_bytes);
-    hash.u8(match image.pixel_layout {
-        CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown => 1,
-    });
-    hash.bytes(&image.pixel_bytes_sha256);
-    hash.bytes(&image.png_bytes_sha256);
-    hash.finish()
+    canonical_raster_artifact_sha256(CanonicalRasterArtifactHashInputV1 {
+        schema_version: image.schema_version,
+        renderer_version: image.renderer_version,
+        source_journal_id: &image.source_journal_id,
+        source_logical_revision: image.source_logical_revision,
+        source_last_sequence: image.source_last_sequence,
+        source_content_sha256: &image.source_content_sha256,
+        projection_spec_sha256: &image.projection_spec_sha256,
+        geometry_sha256: &image.geometry_sha256,
+        output_width_px: image.output_width_px,
+        output_height_px: image.output_height_px,
+        row_stride_bytes: image.row_stride_bytes,
+        pixel_layout: ProjectionRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown,
+        pixel_bytes_sha256: &image.pixel_bytes_sha256,
+        png_bytes_sha256: &image.png_bytes_sha256,
+    })
 }
 
 fn polyline_distance_squared(points: &[CanvasPointPx], x: f64, y: f64) -> f64 {

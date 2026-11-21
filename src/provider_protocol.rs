@@ -3320,7 +3320,7 @@ impl Drop for ChildGuard {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::benchmark::{
         self, ApprovedBenchmarkProviderV1, BenchmarkAnnotationCaseV1, BenchmarkCaseManifestV1,
@@ -4332,7 +4332,7 @@ mod tests {
         assert!(truncated);
     }
 
-    fn require_provider_mock_test_opt_in() {
+    pub(crate) fn require_provider_mock_test_opt_in() {
         fn env_is(key: &str, expected: &str) -> bool {
             std::env::var(key).is_ok_and(|actual| actual == expected)
         }
@@ -4390,9 +4390,9 @@ mod tests {
         assert!(std::env::var("RUNNER_ARCH").is_ok_and(|actual| actual == "X64"));
     }
 
-    struct MockWorkerBinary {
-        directory: PathBuf,
-        executable: PathBuf,
+    pub(crate) struct MockWorkerBinary {
+        pub(crate) directory: PathBuf,
+        pub(crate) executable: PathBuf,
     }
 
     impl Drop for MockWorkerBinary {
@@ -4401,7 +4401,7 @@ mod tests {
         }
     }
 
-    fn compile_mock_worker() -> MockWorkerBinary {
+    pub(crate) fn compile_mock_worker() -> MockWorkerBinary {
         require_provider_mock_test_opt_in();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

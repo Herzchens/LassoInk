@@ -3,6 +3,7 @@ compile_error!("The LassoInk Gate 0 probe is Windows-only.");
 
 mod benchmark;
 mod canvas;
+mod convert;
 #[allow(dead_code)]
 mod journal;
 mod process_cpu;
@@ -18,15 +19,26 @@ use canvas::{
     CanvasToolCaptureContext, CanvasToolGestureTracker, CanvasToolIntent, CanvasViewport,
     DirectCaptureEvent, paint_gdi,
 };
+use convert::{
+    ConvertPreparationError, ConvertPreparationTask, LocalConvertProviderV1, PreparedConversionV1,
+    projection_from_execution, same_generated_raster_output,
+};
 use journal::{
-    EditCommand, JournalEvent, JournalHeader, JournalMetadata, JournalRecord, JournalWriter,
-    MetadataScope, StrokeInterruptionReason, StrokeViewFrame, migrate_schema_one_to_four,
-    migrate_schema_three_to_four, migrate_schema_two_to_four, read_journal,
+    EditCommand, JournalEvent, JournalHeader, JournalMetadata, JournalRecord, JournalReplayState,
+    JournalWriter, MetadataScope, StrokeInterruptionReason, StrokeViewFrame,
+    migrate_schema_one_to_four, migrate_schema_three_to_four, migrate_schema_two_to_four,
+    read_journal,
 };
 use process_cpu::{
     PROCESS_CPU_SCOPE, measure as measure_process_cpu, snapshot as process_cpu_snapshot,
 };
-use project_runtime::{ProjectQueueError, ProjectWriterAck, ProjectWriterHandle};
+use project_runtime::{
+    ProjectQueueError, ProjectWriterAck, ProjectWriterHandle, ProjectionQueueError,
+};
+use provider_protocol::{
+    ProviderErrorKind, ProviderExecution, ProviderSubmitError, ProviderWorkerHandle,
+    ProviderWorkerPoll, RecognitionRequestV1, validate_result_for_current_view,
+};
 use session::{SessionWriter, default_session_path, read_report};
 use std::{
     cell::RefCell,
@@ -57,7 +69,7 @@ use winit::{
 use wintab::{WT_DEFBASE, WintabCapture, WintabControlObserver};
 
 const STATUS: &str = "LassoInk M3: canonical capture lock is Direct WM_POINTER/GetPointerPenInfoHistory + Windows Ink ON; diagnostics elsewhere do not requalify it";
-const NOT_IMPLEMENTED: &str = "Convert is not implemented/configured in this build. Gate 0 is PROVISIONAL PASS; criterion-8 capture CPU cost and physical pen-to-display latency remain partial and nonblocking.";
+const CONVERT_POLICY: &str = "F4 Convert requires an explicit local --provider-config; no provider is selected by default. Gate 0 remains PROVISIONAL PASS with criterion-8 capture CPU and physical pen-to-display latency debt partial and nonblocking.";
 const STORAGE_POLICY: &str = "Bounded local session output under the selected session directory; 4,096 retained events, 131,072 native samples, 65,536 direct samples per history, 4,096 Wintab packets per message, and bounded parser/metrics partitions.";
 const TITLE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_LOOP_WAKE_MARKER_THRESHOLD_NS: u128 = 50_000_000;
@@ -102,6 +114,12 @@ struct ProbeApp {
     project_writer: Option<ProjectWriterHandle>,
     project_path: PathBuf,
     project_journal_id: String,
+    local_convert_provider: Option<LocalConvertProviderV1>,
+    provider_worker: Option<ProviderWorkerHandle>,
+    pending_convert: Option<PendingConvert>,
+    next_convert_generation: u64,
+    project_generation: u64,
+    convert_view_generation: u64,
     active_session_id: String,
     active_config_id: String,
     direct_input_tracker: CanvasInputTracker,
@@ -134,6 +152,74 @@ struct RunOptions {
     open_project: bool,
     metadata: BTreeMap<String, String>,
     controlled_stall_ms: Option<u64>,
+    provider_config_path: Option<PathBuf>,
+    provider_selection_id: Option<String>,
+}
+
+struct PendingConvert {
+    generation: u64,
+    project_generation: u64,
+    view_generation: u64,
+    cancelled: bool,
+    selected_strokes_in_ui_order: Vec<journal::StrokeRef>,
+    line_id: String,
+    request: Option<RecognitionRequestV1>,
+    ink_binding: Option<journal::ProjectionInkBindingV1>,
+    generated_raster: Option<journal::GeneratedRasterProvenanceV1>,
+    phase: PendingConvertPhase,
+}
+
+enum PendingConvertPhase {
+    Transitioning,
+    SnapshotForPreparation {
+        batch_id: u64,
+    },
+    Preparing {
+        task: Box<ConvertPreparationTask>,
+        revalidate: Option<Box<ProviderExecution>>,
+    },
+    ProviderRunning,
+    SnapshotForValidation {
+        batch_id: u64,
+        execution: Box<ProviderExecution>,
+    },
+    QueueSnapshotForValidation {
+        batch_id: u64,
+        execution: Box<ProviderExecution>,
+    },
+    QueueProjectionCommit {
+        batch_id: u64,
+        app_arrival_elapsed_ns: u128,
+        projection: Box<journal::RecognitionProjectionV1>,
+    },
+    Persisting {
+        batch_id: u64,
+    },
+}
+
+fn convert_context_matches(
+    pending: &PendingConvert,
+    project_generation: u64,
+    view_generation: u64,
+    selected_strokes: Option<&[journal::StrokeRef]>,
+    capture_pending_or_preview: bool,
+) -> bool {
+    pending.project_generation == project_generation
+        && pending.view_generation == view_generation
+        && !capture_pending_or_preview
+        && selected_strokes == Some(pending.selected_strokes_in_ui_order.as_slice())
+}
+
+fn convert_phase_is_persisting(phase: &PendingConvertPhase) -> bool {
+    matches!(phase, PendingConvertPhase::Persisting { .. })
+}
+
+fn convert_provider_failure_message(error: &ProviderErrorKind) -> &'static str {
+    if matches!(error, ProviderErrorKind::TimedOut(_)) {
+        "Convert provider timed out; no fallback was attempted"
+    } else {
+        "Convert provider failed; no fallback was attempted"
+    }
 }
 
 #[derive(Debug, Default)]
@@ -326,6 +412,162 @@ impl ProbeApp {
         Some(batch_id)
     }
 
+    fn start_or_cancel_convert(&mut self) {
+        if self.pending_convert.is_some() {
+            self.cancel_convert("Convert canceled by the user".to_owned());
+            return;
+        }
+        if self.local_convert_provider.is_none() {
+            self.canvas_status =
+                "Convert unavailable: supply an explicit --provider-config PATH; no provider is selected by default"
+                    .to_owned();
+            self.request_redraw();
+            return;
+        }
+        if self.project_incomplete_reason.is_some()
+            || self.deferred_capture_batch.is_some()
+            || self.canvas_scene.has_preview_strokes()
+            || self.canvas_selection_drag_start.is_some()
+            || self.canvas_move_drag_start.is_some()
+            || self.canvas_pan_drag_last.is_some()
+        {
+            self.canvas_status =
+                "Convert unavailable while the project has pending or incomplete ink changes"
+                    .to_owned();
+            self.request_redraw();
+            return;
+        }
+        let selected_strokes = match self.canvas_scene.selected_targets() {
+            Ok(selected) if !selected.is_empty() => selected,
+            Ok(_) => {
+                self.canvas_status = "Select one region before Convert".to_owned();
+                self.request_redraw();
+                return;
+            }
+            Err(_) => {
+                self.canvas_status = "Convert selection exceeds its fixed limits".to_owned();
+                self.request_redraw();
+                return;
+            }
+        };
+        if self
+            .project_writer
+            .as_ref()
+            .is_none_or(|writer| !writer.is_idle())
+        {
+            self.canvas_status =
+                "Convert waits for all accepted project writes to be acknowledged".to_owned();
+            self.request_redraw();
+            return;
+        }
+        let generation = self.next_convert_generation;
+        let Some(next_generation) = generation.checked_add(1) else {
+            self.canvas_status = "Convert request identifier exhausted".to_owned();
+            self.request_redraw();
+            return;
+        };
+        self.next_convert_generation = next_generation;
+        let Some(batch_id) = self.allocate_project_batch_id() else {
+            self.canvas_status = "Convert queue identifier exhausted".to_owned();
+            self.request_redraw();
+            return;
+        };
+        let line_id = "line-1".to_owned();
+        let result = self
+            .project_writer
+            .as_mut()
+            .expect("project writer checked above")
+            .try_snapshot_for_convert(batch_id);
+        match result {
+            Ok(()) => {
+                self.pending_convert = Some(PendingConvert {
+                    generation,
+                    project_generation: self.project_generation,
+                    view_generation: self.convert_view_generation,
+                    cancelled: false,
+                    selected_strokes_in_ui_order: selected_strokes,
+                    line_id,
+                    request: None,
+                    ink_binding: None,
+                    generated_raster: None,
+                    phase: PendingConvertPhase::SnapshotForPreparation { batch_id },
+                });
+                self.canvas_status =
+                    "Convert queued: freezing the durable selected region".to_owned();
+            }
+            Err(ProjectQueueError::QueueFull | ProjectQueueError::Backpressure { .. }) => {
+                self.canvas_status = "Convert was not queued: project writer is busy".to_owned();
+            }
+            Err(ProjectQueueError::WorkerStopped | ProjectQueueError::Stopped { .. }) => {
+                self.canvas_status = "Convert unavailable: project writer stopped".to_owned();
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn cancel_convert(&mut self, message: String) {
+        let Some(mut pending) = self.pending_convert.take() else {
+            return;
+        };
+        if convert_phase_is_persisting(&pending.phase) {
+            self.pending_convert = Some(pending);
+            self.canvas_status =
+                "Convert save is already queued; waiting for its durable result".to_owned();
+            self.request_redraw();
+            return;
+        }
+        if let PendingConvertPhase::Preparing { task, .. } = &mut pending.phase {
+            task.cancel();
+            pending.cancelled = true;
+            self.pending_convert = Some(pending);
+        } else {
+            if let Some(worker) = self.provider_worker.take() {
+                worker.cancel();
+            }
+        }
+        self.canvas_status = message;
+        self.request_redraw();
+    }
+
+    fn note_convert_view_change(&mut self) {
+        self.convert_view_generation = self.convert_view_generation.saturating_add(1);
+        if self.pending_convert.as_ref().is_some_and(|pending| {
+            !matches!(&pending.phase, PendingConvertPhase::Persisting { .. })
+        }) {
+            self.cancel_convert(
+                "Convert canceled because the selection or view changed".to_owned(),
+            );
+        }
+    }
+
+    fn convert_context_is_current(&self, pending: &PendingConvert) -> bool {
+        let capture_pending_or_preview =
+            self.deferred_capture_batch.is_some() || self.canvas_scene.has_preview_strokes();
+        if capture_pending_or_preview {
+            return convert_context_matches(
+                pending,
+                self.project_generation,
+                self.convert_view_generation,
+                None,
+                true,
+            );
+        }
+        let selected_strokes = self.canvas_scene.selected_targets().ok();
+        convert_context_matches(
+            pending,
+            self.project_generation,
+            self.convert_view_generation,
+            selected_strokes.as_deref(),
+            false,
+        )
+    }
+
+    fn request_redraw(&self) {
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
     fn submit_project_edit(&mut self, command: EditCommand, label: &str) {
         let Some(batch_id) = self.allocate_project_batch_id() else {
             self.mark_project_incomplete("project command identifier exhausted".to_owned());
@@ -395,6 +637,7 @@ impl ProbeApp {
                     if let Err(error) = self.canvas_scene.select_target(target) {
                         self.canvas_status = format!("Pen selection failed: {error:?}");
                     } else {
+                        self.note_convert_view_change();
                         self.canvas_status = format!(
                             "Selected {} stroke(s)",
                             self.canvas_scene
@@ -408,6 +651,7 @@ impl ProbeApp {
                     {
                         self.canvas_status = format!("Pen region selection failed: {error:?}");
                     } else {
+                        self.note_convert_view_change();
                         self.canvas_status = format!(
                             "Selected {} stroke(s)",
                             self.canvas_scene
@@ -492,11 +736,10 @@ impl ProbeApp {
             PhysicalKey::Code(KeyCode::ArrowUp) => self.queue_selected_move_from_view(0.0, -10.0),
             PhysicalKey::Code(KeyCode::ArrowDown) => self.queue_selected_move_from_view(0.0, 10.0),
             PhysicalKey::Code(KeyCode::F4) | PhysicalKey::Code(KeyCode::Enter) => {
-                self.canvas_status =
-                    "Convert is not implemented/configured in this build".to_owned();
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
-                }
+                self.start_or_cancel_convert();
+            }
+            PhysicalKey::Code(KeyCode::Escape) => {
+                self.cancel_convert("Convert canceled by the user".to_owned());
             }
             PhysicalKey::Code(KeyCode::Delete | KeyCode::Backspace) => {
                 match self.canvas_scene.tombstone_selected_command() {
@@ -540,15 +783,17 @@ impl ProbeApp {
                             .canvas_scene
                             .selected_targets()
                             .is_ok_and(|targets| targets.len() == 1 && targets[0] == target);
-                        if !was_selected {
-                            let _ = self.canvas_scene.select_target(Some(target));
+                        if !was_selected && self.canvas_scene.select_target(Some(target)).is_ok() {
+                            self.note_convert_view_change();
                         }
                         self.canvas_move_drag_start = Some(cursor);
                         self.canvas_selection_drag_start = None;
                         self.canvas_scene.set_selection_rect(None);
                     }
                     Ok(None) => {
-                        let _ = self.canvas_scene.select_target(None);
+                        if self.canvas_scene.select_target(None).is_ok() {
+                            self.note_convert_view_change();
+                        }
                         self.canvas_move_drag_start = None;
                         self.canvas_selection_drag_start = Some(cursor);
                         self.canvas_scene
@@ -573,6 +818,7 @@ impl ProbeApp {
                             .map(|()| rect)
                     }) {
                         Ok(_) => {
+                            self.note_convert_view_change();
                             self.canvas_status = format!(
                                 "Selected {} stroke(s)",
                                 self.canvas_scene
@@ -595,6 +841,7 @@ impl ProbeApp {
                         if let Err(error) = self.canvas_scene.select_target(target) {
                             self.canvas_status = format!("Eraser selection failed: {error:?}");
                         } else {
+                            self.note_convert_view_change();
                             self.canvas_status = if count == 1 {
                                 "Stroke selected; press Delete to append an erase action".to_owned()
                             } else {
@@ -974,6 +1221,8 @@ impl ProbeApp {
                         self.mark_project_incomplete(format!(
                             "canvas projection refresh failed: {error:?}"
                         ));
+                    } else {
+                        self.note_convert_view_change();
                     }
                     if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
@@ -989,6 +1238,64 @@ impl ProbeApp {
                 ProjectWriterAck::MetadataFailed(error) => {
                     self.mark_project_incomplete(format!("project metadata write failed: {error}"));
                 }
+                ProjectWriterAck::ConvertSnapshot { batch_id, state } => {
+                    self.handle_convert_snapshot(batch_id, *state);
+                }
+                ProjectWriterAck::RecognitionProjectionCommitted { batch_id, .. } => {
+                    let matches_pending = self.pending_convert.as_ref().is_some_and(|pending| {
+                        matches!(
+                            &pending.phase,
+                            PendingConvertPhase::Persisting { batch_id: expected }
+                                if *expected == batch_id
+                        )
+                    });
+                    let is_current = matches_pending
+                        && self.pending_convert.as_ref().is_some_and(|pending| {
+                            pending.project_generation == self.project_generation
+                        });
+                    if matches_pending {
+                        self.pending_convert = None;
+                        if is_current {
+                            self.canvas_status =
+                                "Convert result was durably saved as a projection".to_owned();
+                            self.request_redraw();
+                        }
+                    }
+                }
+                ProjectWriterAck::RecognitionProjectionFailed {
+                    batch_id,
+                    error: _,
+                    writer_poisoned,
+                } => {
+                    let matches_pending = self.pending_convert.as_ref().is_some_and(|pending| {
+                        matches!(
+                            &pending.phase,
+                            PendingConvertPhase::Persisting { batch_id: expected }
+                                if *expected == batch_id
+                        )
+                    });
+                    let is_current = matches_pending
+                        && self.pending_convert.as_ref().is_some_and(|pending| {
+                            pending.project_generation == self.project_generation
+                        });
+                    if matches_pending {
+                        self.pending_convert = None;
+                        if writer_poisoned {
+                            self.mark_project_incomplete(
+                                "project journal synchronization failed while saving the Convert result".to_owned(),
+                            );
+                        } else if is_current {
+                            self.canvas_status =
+                                "Convert result was rejected as stale or invalid; no projection was saved".to_owned();
+                            self.request_redraw();
+                        }
+                    } else if writer_poisoned {
+                        self.mark_project_incomplete(
+                            "project journal synchronization failed while saving a Convert result"
+                                .to_owned(),
+                        );
+                    }
+                }
                 ProjectWriterAck::Finished(result) => {
                     if let Err(error) = result {
                         self.startup_error = Some(format!("project finalization failed: {error}"));
@@ -998,7 +1305,565 @@ impl ProbeApp {
         }
     }
 
+    fn handle_convert_snapshot(&mut self, batch_id: u64, state: JournalReplayState) {
+        let Some(mut pending) = self.pending_convert.take() else {
+            return;
+        };
+        let phase = std::mem::replace(&mut pending.phase, PendingConvertPhase::Transitioning);
+        match phase {
+            PendingConvertPhase::SnapshotForPreparation {
+                batch_id: expected_batch,
+            } if expected_batch == batch_id => {
+                if !self.convert_context_is_current(&pending) {
+                    self.canvas_status =
+                        "Convert canceled because the selected view changed before snapshot"
+                            .to_owned();
+                    self.request_redraw();
+                    return;
+                }
+                if state.journal_id != self.project_journal_id {
+                    self.canvas_status =
+                        "Convert snapshot belongs to a different project".to_owned();
+                    self.request_redraw();
+                    return;
+                }
+                let Some(provider) = self.local_convert_provider.clone() else {
+                    self.canvas_status =
+                        "Convert unavailable: no explicit local provider configuration is loaded"
+                            .to_owned();
+                    self.request_redraw();
+                    return;
+                };
+                let request_id =
+                    format!("convert-{}-{}", self.active_session_id, pending.generation);
+                match ConvertPreparationTask::start(
+                    state,
+                    pending.selected_strokes_in_ui_order.clone(),
+                    request_id,
+                    pending.line_id.clone(),
+                    provider,
+                ) {
+                    Ok(task) => {
+                        pending.phase = PendingConvertPhase::Preparing {
+                            task: Box::new(task),
+                            revalidate: None,
+                        };
+                        self.pending_convert = Some(pending);
+                        self.canvas_status =
+                            "Convert is preparing a bounded canonical request".to_owned();
+                    }
+                    Err(_) => {
+                        self.canvas_status =
+                            "Convert could not start its bounded preparation worker".to_owned();
+                    }
+                }
+                self.request_redraw();
+            }
+            PendingConvertPhase::SnapshotForValidation {
+                batch_id: expected_batch,
+                execution,
+            } if expected_batch == batch_id => {
+                if !self.convert_context_is_current(&pending) {
+                    self.canvas_status =
+                        "Convert result was discarded because its selected view changed".to_owned();
+                    self.request_redraw();
+                    return;
+                }
+                if state.journal_id != self.project_journal_id {
+                    self.canvas_status = "Convert result belongs to a different project".to_owned();
+                    self.request_redraw();
+                    return;
+                }
+                let (Some(request), Some(provider)) = (
+                    pending.request.as_ref(),
+                    self.local_convert_provider.clone(),
+                ) else {
+                    self.canvas_status =
+                        "Convert lost its explicit provider or frozen request".to_owned();
+                    self.request_redraw();
+                    return;
+                };
+                match ConvertPreparationTask::start(
+                    state,
+                    pending.selected_strokes_in_ui_order.clone(),
+                    request.request_id.clone(),
+                    pending.line_id.clone(),
+                    provider,
+                ) {
+                    Ok(task) => {
+                        pending.phase = PendingConvertPhase::Preparing {
+                            task: Box::new(task),
+                            revalidate: Some(execution),
+                        };
+                        self.pending_convert = Some(pending);
+                        self.canvas_status =
+                            "Convert is recomputing the current input identity before saving"
+                                .to_owned();
+                    }
+                    Err(_) => {
+                        self.canvas_status =
+                            "Convert could not start its bounded revalidation worker".to_owned();
+                    }
+                }
+                self.request_redraw();
+            }
+            other => {
+                pending.phase = other;
+                self.pending_convert = Some(pending);
+            }
+        }
+    }
+
+    fn poll_convert(&mut self) {
+        if self.pending_convert.as_ref().is_some_and(|pending| {
+            !matches!(&pending.phase, PendingConvertPhase::Persisting { .. })
+                && !self.convert_context_is_current(pending)
+        }) {
+            self.cancel_convert(
+                "Convert canceled because the project or selected view changed".to_owned(),
+            );
+            if self.pending_convert.is_none() {
+                return;
+            }
+        }
+
+        if self.retry_pending_convert_writer_command() {
+            return;
+        }
+
+        let preparation_result =
+            self.pending_convert
+                .as_mut()
+                .and_then(|pending| match &mut pending.phase {
+                    PendingConvertPhase::Preparing { task, .. } => task.try_receive(),
+                    _ => None,
+                });
+        if let Some(result) = preparation_result {
+            self.handle_prepared_conversion(result);
+        }
+
+        let provider_poll =
+            if self.pending_convert.as_ref().is_some_and(|pending| {
+                matches!(&pending.phase, PendingConvertPhase::ProviderRunning)
+            }) {
+                self.provider_worker
+                    .as_ref()
+                    .map(ProviderWorkerHandle::try_receive)
+            } else {
+                None
+            };
+        if let Some(provider_poll) = provider_poll {
+            self.handle_provider_poll(provider_poll);
+        }
+    }
+
+    fn retry_pending_convert_writer_command(&mut self) -> bool {
+        let Some(mut pending) = self.pending_convert.take() else {
+            return false;
+        };
+        let phase = std::mem::replace(&mut pending.phase, PendingConvertPhase::Transitioning);
+        match phase {
+            PendingConvertPhase::QueueSnapshotForValidation {
+                batch_id,
+                execution,
+            } => {
+                if pending.cancelled || !self.convert_context_is_current(&pending) {
+                    self.canvas_status =
+                        "Convert result was discarded because its selected view changed".to_owned();
+                    self.request_redraw();
+                    return true;
+                }
+                let result = self
+                    .project_writer
+                    .as_mut()
+                    .map(|writer| writer.try_snapshot_for_convert(batch_id));
+                match result {
+                    Some(Ok(())) => {
+                        pending.phase = PendingConvertPhase::SnapshotForValidation {
+                            batch_id,
+                            execution,
+                        };
+                        self.canvas_status =
+                            "Convert is revalidating its result against the latest durable view"
+                                .to_owned();
+                    }
+                    Some(Err(
+                        ProjectQueueError::QueueFull | ProjectQueueError::Backpressure { .. },
+                    )) => {
+                        pending.phase = PendingConvertPhase::QueueSnapshotForValidation {
+                            batch_id,
+                            execution,
+                        };
+                        self.canvas_status =
+                            "Convert is waiting for project writer capacity before revalidation"
+                                .to_owned();
+                    }
+                    Some(Err(
+                        ProjectQueueError::WorkerStopped | ProjectQueueError::Stopped { .. },
+                    ))
+                    | None => {
+                        self.canvas_status =
+                            "Convert result was discarded: project writer stopped".to_owned();
+                        self.request_redraw();
+                        return true;
+                    }
+                }
+                self.pending_convert = Some(pending);
+                self.request_redraw();
+                true
+            }
+            PendingConvertPhase::QueueProjectionCommit {
+                batch_id,
+                app_arrival_elapsed_ns,
+                projection,
+            } => {
+                if pending.cancelled || !self.convert_context_is_current(&pending) {
+                    self.canvas_status =
+                        "Convert result was discarded because its selected view changed".to_owned();
+                    self.request_redraw();
+                    return true;
+                }
+                let result = self.project_writer.as_mut().map(|writer| {
+                    writer.try_append_recognition_projection(
+                        batch_id,
+                        *projection,
+                        app_arrival_elapsed_ns,
+                    )
+                });
+                match result {
+                    Some(Ok(())) => {
+                        pending.phase = PendingConvertPhase::Persisting { batch_id };
+                        self.canvas_status =
+                            "Convert projection queued for atomic journal validation and save"
+                                .to_owned();
+                    }
+                    Some(Err(ProjectionQueueError::QueueFull(projection))) => {
+                        pending.phase = PendingConvertPhase::QueueProjectionCommit {
+                            batch_id,
+                            app_arrival_elapsed_ns,
+                            projection,
+                        };
+                        self.canvas_status =
+                            "Convert is waiting for project writer capacity before saving"
+                                .to_owned();
+                    }
+                    Some(Err(ProjectionQueueError::WorkerStopped)) | None => {
+                        self.canvas_status =
+                            "Convert result was not saved: project writer stopped".to_owned();
+                        self.request_redraw();
+                        return true;
+                    }
+                }
+                self.pending_convert = Some(pending);
+                self.request_redraw();
+                true
+            }
+            other => {
+                pending.phase = other;
+                self.pending_convert = Some(pending);
+                false
+            }
+        }
+    }
+
+    fn handle_prepared_conversion(
+        &mut self,
+        result: Result<PreparedConversionV1, ConvertPreparationError>,
+    ) {
+        let Some(mut pending) = self.pending_convert.take() else {
+            return;
+        };
+        let phase = std::mem::replace(&mut pending.phase, PendingConvertPhase::Transitioning);
+        let revalidate = match phase {
+            PendingConvertPhase::Preparing { revalidate, .. } => revalidate,
+            other => {
+                pending.phase = other;
+                self.pending_convert = Some(pending);
+                return;
+            }
+        };
+        if pending.cancelled {
+            self.request_redraw();
+            return;
+        }
+        if !self.convert_context_is_current(&pending) {
+            return;
+        }
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.canvas_status = convert_preparation_message(error).to_owned();
+                self.request_redraw();
+                return;
+            }
+        };
+        if let Some(execution) = revalidate {
+            self.finish_convert_revalidation(pending, prepared, *execution);
+            return;
+        }
+
+        let Some(provider) = self.local_convert_provider.as_ref() else {
+            self.canvas_status =
+                "Convert unavailable: explicit provider configuration is no longer available"
+                    .to_owned();
+            self.request_redraw();
+            return;
+        };
+        let worker = match provider.start_worker() {
+            Ok(worker) => worker,
+            Err(_) => {
+                self.canvas_status = "Convert provider worker could not be started".to_owned();
+                self.request_redraw();
+                return;
+            }
+        };
+        match worker.try_submit(prepared.request.clone()) {
+            Ok(()) => {
+                pending.request = Some(prepared.request);
+                pending.ink_binding = Some(prepared.ink_binding);
+                pending.generated_raster = prepared.generated_raster;
+                pending.phase = PendingConvertPhase::ProviderRunning;
+                self.provider_worker = Some(worker);
+                self.pending_convert = Some(pending);
+                self.canvas_status =
+                    "Convert is waiting for the explicit local provider".to_owned();
+            }
+            Err(ProviderSubmitError::Backpressure(_)) => {
+                self.canvas_status =
+                    "Convert provider is busy; no fallback was attempted".to_owned();
+            }
+            Err(ProviderSubmitError::Stopped(_)) => {
+                self.canvas_status =
+                    "Convert provider stopped before accepting the request".to_owned();
+            }
+            Err(ProviderSubmitError::Invalid(_)) => {
+                self.canvas_status = "Convert request was rejected by M4 validation".to_owned();
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn finish_convert_revalidation(
+        &mut self,
+        mut pending: PendingConvert,
+        prepared: PreparedConversionV1,
+        execution: ProviderExecution,
+    ) {
+        if !self.convert_context_is_current(&pending) {
+            self.canvas_status = "Convert result was discarded because its view changed".to_owned();
+            self.request_redraw();
+            return;
+        }
+        let (Some(request), Some(binding)) = (pending.request.as_ref(), pending.ink_binding.take())
+        else {
+            self.canvas_status = "Convert result lost its frozen source binding".to_owned();
+            self.request_redraw();
+            return;
+        };
+        if prepared.request.input_view_id != request.input_view_id
+            || prepared.request.region_id != request.region_id
+            || prepared.request.line_id != request.line_id
+            || prepared.request.requested_input_modalities != request.requested_input_modalities
+            || prepared.request.provider_configuration != request.provider_configuration
+            || prepared.request.provider_configuration_fingerprint
+                != request.provider_configuration_fingerprint
+            || prepared.ink_binding.ink_binding_sha256 != binding.ink_binding_sha256
+            || prepared.ink_binding.selected_strokes != binding.selected_strokes
+            || prepared.ink_binding.source_sample_sequences != binding.source_sample_sequences
+            || prepared.ink_binding.stroke_views != binding.stroke_views
+            || !same_generated_raster_output(
+                pending.generated_raster.as_ref(),
+                prepared.generated_raster.as_ref(),
+            )
+        {
+            self.canvas_status =
+                "Convert result is stale: current selected ink/view differs from its request"
+                    .to_owned();
+            self.request_redraw();
+            return;
+        }
+        if validate_result_for_current_view(
+            request,
+            &execution.result,
+            &prepared.request.source_revision,
+            &prepared.request.input_view_id,
+        )
+        .is_err()
+        {
+            self.canvas_status =
+                "Convert result is stale or does not match its exact M4 request".to_owned();
+            self.request_redraw();
+            return;
+        }
+        let projection = match projection_from_execution(
+            request,
+            binding,
+            pending.generated_raster.take(),
+            &execution,
+        ) {
+            Ok(projection) => projection,
+            Err(_) => {
+                self.canvas_status =
+                    "Convert result exceeded the bounded projection format".to_owned();
+                self.request_redraw();
+                return;
+            }
+        };
+        let Some(batch_id) = self.allocate_project_batch_id() else {
+            self.canvas_status = "Convert save identifier exhausted".to_owned();
+            self.request_redraw();
+            return;
+        };
+        let Some(writer) = self.project_writer.as_mut() else {
+            self.canvas_status = "Convert could not save: project writer is unavailable".to_owned();
+            self.request_redraw();
+            return;
+        };
+        let app_arrival_elapsed_ns = self.app_clock_origin.elapsed().as_nanos();
+        match writer.try_append_recognition_projection(batch_id, projection, app_arrival_elapsed_ns)
+        {
+            Ok(()) => {
+                pending.phase = PendingConvertPhase::Persisting { batch_id };
+                self.pending_convert = Some(pending);
+                self.canvas_status =
+                    "Convert projection queued for atomic journal validation and save".to_owned();
+            }
+            Err(ProjectionQueueError::QueueFull(projection)) => {
+                pending.phase = PendingConvertPhase::QueueProjectionCommit {
+                    batch_id,
+                    app_arrival_elapsed_ns,
+                    projection,
+                };
+                self.pending_convert = Some(pending);
+                self.canvas_status =
+                    "Convert is waiting for project writer capacity before saving".to_owned();
+            }
+            Err(ProjectionQueueError::WorkerStopped) => {
+                self.canvas_status =
+                    "Convert result was not saved: project writer stopped".to_owned();
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn handle_provider_poll(&mut self, poll: ProviderWorkerPoll) {
+        match poll {
+            ProviderWorkerPoll::Pending => {}
+            ProviderWorkerPoll::Stopped => {
+                self.provider_worker = None;
+                self.pending_convert = None;
+                self.canvas_status = "Convert provider worker stopped".to_owned();
+                self.request_redraw();
+            }
+            ProviderWorkerPoll::Outcome(outcome) => {
+                let Some(mut pending) = self.pending_convert.take() else {
+                    self.provider_worker = None;
+                    return;
+                };
+                let Some(request) = pending.request.as_ref() else {
+                    self.provider_worker = None;
+                    self.canvas_status = "Convert result had no matching frozen request".to_owned();
+                    self.request_redraw();
+                    return;
+                };
+                if !matches!(&pending.phase, PendingConvertPhase::ProviderRunning)
+                    || outcome.request_id != request.request_id
+                    || !self.convert_context_is_current(&pending)
+                {
+                    self.provider_worker = None;
+                    self.canvas_status = "Convert result was discarded as stale".to_owned();
+                    self.request_redraw();
+                    return;
+                }
+                let execution = match outcome.outcome {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        self.provider_worker = None;
+                        self.canvas_status =
+                            convert_provider_failure_message(&error.kind).to_owned();
+                        self.request_redraw();
+                        return;
+                    }
+                };
+                if self
+                    .local_convert_provider
+                    .as_ref()
+                    .is_none_or(|provider| execution.provider.provider_id != provider.provider_id)
+                {
+                    self.provider_worker = None;
+                    self.canvas_status =
+                        "Convert provider identity differs from the explicit local selection"
+                            .to_owned();
+                    self.request_redraw();
+                    return;
+                }
+                if validate_result_for_current_view(
+                    request,
+                    &execution.result,
+                    &request.source_revision,
+                    &request.input_view_id,
+                )
+                .is_err()
+                {
+                    self.provider_worker = None;
+                    self.canvas_status =
+                        "Convert result did not match its exact frozen M4 request".to_owned();
+                    self.request_redraw();
+                    return;
+                }
+                self.provider_worker = None;
+                let Some(batch_id) = self.allocate_project_batch_id() else {
+                    self.canvas_status = "Convert validation identifier exhausted".to_owned();
+                    self.request_redraw();
+                    return;
+                };
+                let Some(writer) = self.project_writer.as_mut() else {
+                    self.canvas_status =
+                        "Convert could not revalidate: project writer is unavailable".to_owned();
+                    self.request_redraw();
+                    return;
+                };
+                let execution = Box::new(execution);
+                match writer.try_snapshot_for_convert(batch_id) {
+                    Ok(()) => {
+                        pending.phase = PendingConvertPhase::SnapshotForValidation {
+                            batch_id,
+                            execution,
+                        };
+                        self.pending_convert = Some(pending);
+                        self.canvas_status =
+                            "Convert is revalidating its result against the latest durable view"
+                                .to_owned();
+                    }
+                    Err(ProjectQueueError::QueueFull | ProjectQueueError::Backpressure { .. }) => {
+                        pending.phase = PendingConvertPhase::QueueSnapshotForValidation {
+                            batch_id,
+                            execution,
+                        };
+                        self.pending_convert = Some(pending);
+                        self.canvas_status =
+                            "Convert is waiting for project writer capacity before revalidation"
+                                .to_owned();
+                    }
+                    Err(ProjectQueueError::WorkerStopped | ProjectQueueError::Stopped { .. }) => {
+                        self.canvas_status =
+                            "Convert result was discarded: project writer stopped".to_owned();
+                    }
+                }
+                self.request_redraw();
+            }
+        }
+    }
+
     fn mark_project_incomplete(&mut self, reason: String) {
+        self.project_generation = self.project_generation.saturating_add(1);
+        if self.pending_convert.as_ref().is_some_and(|pending| {
+            !matches!(&pending.phase, PendingConvertPhase::Persisting { .. })
+        }) {
+            self.cancel_convert(
+                "Convert canceled because the project stopped accepting writes".to_owned(),
+            );
+        }
         self.project_incomplete_reason
             .get_or_insert_with(|| reason.clone());
         self.canvas_status = format!("CAPTURE INCOMPLETE: {reason}");
@@ -1423,6 +2288,9 @@ impl ProbeApp {
     }
 
     fn finish_project_writer(&mut self) -> Result<(), String> {
+        self.project_generation = self.project_generation.saturating_add(1);
+        self.cancel_convert("Convert canceled when the project closed".to_owned());
+        self.cancel_and_join_preparation_for_shutdown();
         self.process_pending_project_capture();
         let unfinished_direct_strokes = self.direct_input_tracker.active_stroke_count();
         if unfinished_direct_strokes > 0 {
@@ -1465,6 +2333,19 @@ impl ProbeApp {
             self.app_clock_origin.elapsed().as_nanos(),
             finalization_reason,
         )
+    }
+
+    fn cancel_and_join_preparation_for_shutdown(&mut self) {
+        let Some(mut pending) = self.pending_convert.take() else {
+            return;
+        };
+        if let PendingConvertPhase::Preparing { task, .. } = &mut pending.phase {
+            // Shutdown runs after Winit has exited; retain and join the single
+            // bounded CPU-preparation worker rather than detaching its handle.
+            task.cancel_and_join();
+        } else if convert_phase_is_persisting(&pending.phase) {
+            self.pending_convert = Some(pending);
+        }
     }
 
     fn stop_wintab_after_output_failure(&mut self) {
@@ -1519,6 +2400,26 @@ fn direct_capture_sample_count(events: &[DirectCaptureEvent]) -> usize {
         .iter()
         .filter(|event| matches!(event, DirectCaptureEvent::PhysicalSample(_)))
         .count()
+}
+
+fn convert_preparation_message(error: ConvertPreparationError) -> &'static str {
+    match error {
+        ConvertPreparationError::Cancelled => "Convert preparation was canceled",
+        ConvertPreparationError::InvalidSelection => "Select one valid region before Convert",
+        ConvertPreparationError::UnsupportedSource => {
+            "Convert requires committed Direct strokes with valid captured frames"
+        }
+        ConvertPreparationError::OversizedInput => {
+            "Convert input exceeds the fixed raster or provider request cap"
+        }
+        ConvertPreparationError::RequestRejected => "Convert request was rejected by M4 validation",
+        ConvertPreparationError::RasterRejected => {
+            "Convert could not produce a valid canonical raster for this region"
+        }
+        ConvertPreparationError::AllocationFailed => {
+            "Convert could not allocate its bounded preparation buffers"
+        }
+    }
 }
 
 fn capture_state(summary: ProbeSummary) -> String {
@@ -1767,7 +2668,7 @@ impl ApplicationHandler for ProbeApp {
                     }
                 }
                 println!("{STATUS}");
-                println!("{NOT_IMPLEMENTED}");
+                println!("{CONVERT_POLICY}");
                 println!("{STORAGE_POLICY}");
                 if !self.write_runtime_metadata() || !self.flush_pending_records() {
                     self.stop_wintab_after_output_failure();
@@ -1935,6 +2836,8 @@ impl ApplicationHandler for ProbeApp {
                         .pan_by(cursor.0 - last.0, cursor.1 - last.1)
                     {
                         self.canvas_status = format!("Pan failed: {error:?}");
+                    } else if cursor != last {
+                        self.note_convert_view_change();
                     }
                     self.canvas_pan_drag_last = Some(cursor);
                     if let Some(window) = self.window.as_ref() {
@@ -1983,6 +2886,8 @@ impl ApplicationHandler for ProbeApp {
                             .zoom_about(anchor_x, anchor_y, 1.1_f64.powf(steps))
                     {
                         self.canvas_status = format!("Zoom failed: {error:?}");
+                    } else {
+                        self.note_convert_view_change();
                     }
                     if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
@@ -2023,6 +2928,7 @@ impl ApplicationHandler for ProbeApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.process_pending_project_capture();
+        self.poll_convert();
         {
             let mut state = self.probe_state.borrow_mut();
             state.expire_public_dispatch_candidate();
@@ -2055,6 +2961,11 @@ impl ApplicationHandler for ProbeApp {
 }
 
 fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
+    let local_convert_provider = options
+        .provider_config_path
+        .as_deref()
+        .map(|path| LocalConvertProviderV1::load(path, options.provider_selection_id.as_deref()))
+        .transpose()?;
     let capture_mode = options.capture_mode;
     let app_clock_origin = Instant::now();
     let session_started_unix_ns = SystemTime::now()
@@ -2066,7 +2977,10 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
     let mut project_path = options.project_path.clone();
     let mut metadata = options.metadata;
     metadata.insert("session_id".to_owned(), active_session_id.clone());
-    metadata.insert("schema_version".to_owned(), "3".to_owned());
+    metadata.insert(
+        "schema_version".to_owned(),
+        journal::JOURNAL_SCHEMA_VERSION.to_string(),
+    );
     metadata.insert(
         "project_path".to_owned(),
         project_path.display().to_string(),
@@ -2315,6 +3229,12 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
         project_writer: Some(project_writer),
         project_path: project_path.clone(),
         project_journal_id,
+        local_convert_provider,
+        provider_worker: None,
+        pending_convert: None,
+        next_convert_generation: 1,
+        project_generation: 1,
+        convert_view_generation: 0,
         active_session_id,
         active_config_id,
         direct_input_tracker: CanvasInputTracker::default(),
@@ -2475,6 +3395,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!("  Wintab is an explicit diagnostic mode, not a fallback for Direct capture");
         println!("  --session-dir PATH | --session-path PATH");
         println!("  --project-path PATH | --open-project PATH");
+        println!("  --provider-config PATH [--provider-id ID] (explicit local Convert provider)");
         println!("  --trial-id ID --windows-ink on|off|unknown");
         println!("  --tablet-profile default|osu|unknown");
         println!("  --driver-version TEXT --active-area TEXT --mapped-display TEXT");
@@ -2486,7 +3407,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             "Benchmark artifacts are local-only; never include credentials or private corpus data in Git."
         );
         println!("{STATUS}");
-        println!("{NOT_IMPLEMENTED}");
+        println!("{CONVERT_POLICY}");
         println!("{STORAGE_POLICY}");
         return Ok(());
     }
@@ -2505,7 +3426,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if arguments.len() == 1 && arguments[0] == "--status" {
         println!("{STATUS}");
-        println!("{NOT_IMPLEMENTED}");
+        println!("{CONVERT_POLICY}");
         println!("{STORAGE_POLICY}");
         println!("Default session directory: local_capture (ignored local data)");
         println!(
@@ -2530,6 +3451,8 @@ fn parse_run_options(arguments: &[String]) -> Result<RunOptions, io::Error> {
     let mut open_project = false;
     let mut metadata = BTreeMap::new();
     let mut controlled_stall_ms = None;
+    let mut provider_config_path = None;
+    let mut provider_selection_id = None;
     let mut index = 0usize;
     while index < arguments.len() {
         let flag = arguments[index].as_str();
@@ -2566,6 +3489,12 @@ fn parse_run_options(arguments: &[String]) -> Result<RunOptions, io::Error> {
             "--open-project" => {
                 explicit_project_path = Some(PathBuf::from(value(&mut index)?));
                 open_project = true;
+            }
+            "--provider-config" => {
+                provider_config_path = Some(PathBuf::from(value(&mut index)?));
+            }
+            "--provider-id" => {
+                provider_selection_id = Some(value(&mut index)?);
             }
             "--trial-id" => {
                 metadata.insert("trial_id".to_owned(), value(&mut index)?);
@@ -2633,6 +3562,13 @@ fn parse_run_options(arguments: &[String]) -> Result<RunOptions, io::Error> {
         }
     }
 
+    if provider_selection_id.is_some() && provider_config_path.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--provider-id requires --provider-config",
+        ));
+    }
+
     let session_path =
         explicit_session_path.unwrap_or_else(|| default_session_path(&session_directory));
     let project_path =
@@ -2644,6 +3580,8 @@ fn parse_run_options(arguments: &[String]) -> Result<RunOptions, io::Error> {
         open_project,
         metadata,
         controlled_stall_ms,
+        provider_config_path,
+        provider_selection_id,
     })
 }
 
@@ -2714,7 +3652,9 @@ fn startup_canvas_status(recovery_note: Option<&str>, incomplete_strokes: usize)
         (None, count) if count > 0 => format!(
             "{count} interrupted/in-progress stroke(s) remain as raw history and are not rendered complete; lift before restarting"
         ),
-        (None, _) => "F1 pen | F2 eraser | F3 select | F4 Convert (not configured)".to_owned(),
+        (None, _) => {
+            "F1 pen | F2 eraser | F3 select | F4 Convert (explicit local provider)".to_owned()
+        }
     }
 }
 
@@ -2954,5 +3894,1081 @@ mod canvas_focus_cancel_tests {
         // A later mouse release has no remembered move origin and therefore
         // cannot enqueue a stale Move action or jump after focus returns.
         assert!(move_drag_start.take().is_none());
+    }
+}
+
+#[cfg(test)]
+mod convert_controller_tests {
+    use super::{
+        CaptureMode, ControlledStallTrigger, ModifiersState, PendingConvert, PendingConvertPhase,
+        PendingRecordCursor, ProbeApp, ProbeState, WintabCapture, convert_context_matches,
+        convert_phase_is_persisting, convert_provider_failure_message,
+    };
+    use crate::{
+        canvas::{
+            CanvasInputTracker, CanvasScene, CanvasToolGestureTracker, CanvasViewport,
+            DirectCaptureEvent, PROVISIONAL_DIRECT_SOURCE_API,
+        },
+        journal::{
+            JournalHeader, JournalWriter, PhysicalSample, ProjectionInkBindingV1,
+            ProjectionProviderProvenanceV1, ProjectionStrokeRangeV1, ProjectionStrokeViewV1,
+            RawPosition, RecognitionCandidateV1, RecognitionProjectionV1, StrokeRef,
+            StrokeViewFrame, read_journal,
+        },
+        project_runtime::ProjectWriterHandle,
+        provider_protocol::{ProviderErrorKind, ProviderPhase},
+    };
+    use std::{
+        cell::RefCell,
+        fs, process,
+        rc::Rc,
+        sync::{Arc, atomic::AtomicBool},
+        time::{Duration, Instant},
+    };
+
+    fn selected_stroke(stroke_id: &str) -> StrokeRef {
+        StrokeRef {
+            journal_id: "convert-controller-project".to_owned(),
+            session_id: "convert-controller-session".to_owned(),
+            source_api: "direct-wm-pointer-pen-history".to_owned(),
+            device_id: Some("session-scoped-device-1".to_owned()),
+            pointer_id: Some(1),
+            stroke_id: stroke_id.to_owned(),
+        }
+    }
+
+    fn pending(stroke: StrokeRef, phase: PendingConvertPhase) -> PendingConvert {
+        PendingConvert {
+            generation: 3,
+            project_generation: 7,
+            view_generation: 11,
+            cancelled: false,
+            selected_strokes_in_ui_order: vec![stroke],
+            line_id: "line-1".to_owned(),
+            request: None,
+            ink_binding: None,
+            generated_raster: None,
+            phase,
+        }
+    }
+
+    #[test]
+    fn convert_context_requires_same_project_view_selection_and_committed_capture() {
+        let stroke = selected_stroke("selected");
+        let ticket = pending(stroke.clone(), PendingConvertPhase::Transitioning);
+        assert!(convert_context_matches(
+            &ticket,
+            7,
+            11,
+            Some(std::slice::from_ref(&stroke)),
+            false,
+        ));
+
+        // Project close/reopen advances the project generation and invalidates
+        // a result even when the same StrokeRef still appears selected.
+        assert!(!convert_context_matches(
+            &ticket,
+            8,
+            11,
+            Some(std::slice::from_ref(&stroke)),
+            false,
+        ));
+        assert!(!convert_context_matches(
+            &ticket,
+            7,
+            12,
+            Some(std::slice::from_ref(&stroke)),
+            false,
+        ));
+
+        let changed_selection = selected_stroke("other");
+        assert!(!convert_context_matches(
+            &ticket,
+            7,
+            11,
+            Some(std::slice::from_ref(&changed_selection)),
+            false,
+        ));
+        assert!(!convert_context_matches(&ticket, 7, 11, None, false));
+        assert!(!convert_context_matches(
+            &ticket,
+            7,
+            11,
+            Some(std::slice::from_ref(&stroke)),
+            true,
+        ));
+    }
+
+    #[test]
+    fn queued_durable_projection_is_not_cancelled_with_provider_work() {
+        assert!(!convert_phase_is_persisting(
+            &PendingConvertPhase::Transitioning
+        ));
+        assert!(!convert_phase_is_persisting(
+            &PendingConvertPhase::SnapshotForPreparation { batch_id: 1 }
+        ));
+        assert!(convert_phase_is_persisting(
+            &PendingConvertPhase::Persisting { batch_id: 2 }
+        ));
+    }
+
+    #[test]
+    fn provider_timeout_remains_visible_without_a_fallback() {
+        assert_eq!(
+            convert_provider_failure_message(&ProviderErrorKind::TimedOut(
+                ProviderPhase::Recognition
+            )),
+            "Convert provider timed out; no fallback was attempted"
+        );
+    }
+
+    #[test]
+    fn saturated_convert_projection_retries_once_after_drain_then_capture_continues() {
+        let path = std::env::temp_dir().join(format!(
+            "lassoink-controller-queue-retry-{}.inkj",
+            process::id()
+        ));
+        let journal_id = "convert-controller-project";
+        let session_id = "convert-controller-session";
+        let mut journal_writer = JournalWriter::create(
+            path.clone(),
+            JournalHeader {
+                journal_id: journal_id.to_owned(),
+                session_id: session_id.to_owned(),
+                config_id: Some("config-a".to_owned()),
+                device_model_declared: None,
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        let target = selected_stroke("queue-selected");
+        let frame = StrokeViewFrame::default();
+        let source_sample = PhysicalSample {
+            session_id: target.session_id.clone(),
+            source_api: target.source_api.clone(),
+            source_device_id: target.device_id.clone(),
+            pointer_id: target.pointer_id,
+            stroke_id: Some(target.stroke_id.clone()),
+            source_sequence: 1,
+            config_id: Some("config-a".to_owned()),
+            app_arrival_elapsed_ns: 2,
+            position: Some(RawPosition {
+                coordinate_space: "windows-screen-coordinates".to_owned(),
+                units: "screen-pixel".to_owned(),
+                x_raw: 50,
+                y_raw: 60,
+            }),
+            pressure: None,
+            native_timestamp: None,
+            contact_range_state: Some("contact".to_owned()),
+            button_state_raw: None,
+            tilt_x_raw: None,
+            tilt_y_raw: None,
+            rotation_raw: None,
+            raw_payload: vec![0xC1],
+        };
+        journal_writer
+            .start_stroke(target.clone(), frame, 1)
+            .unwrap();
+        let sample_sequence = journal_writer.append_sample(source_sample.clone()).unwrap();
+        journal_writer.commit_stroke(target.clone(), 3).unwrap();
+        let state = journal_writer.replay_state().clone();
+        let mut scene = CanvasScene::from_journal(&state, PROVISIONAL_DIRECT_SOURCE_API).unwrap();
+        scene.select_target(Some(target.clone())).unwrap();
+        let project_writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+
+        let probe = Rc::new(RefCell::new(ProbeState::default()));
+        let wintab_capture = {
+            let mut probe_state = probe.borrow_mut();
+            WintabCapture::new(
+                CaptureMode::DirectWmPointer,
+                Instant::now(),
+                &mut probe_state,
+            )
+        };
+        let mut app = ProbeApp {
+            window: None,
+            focused: None,
+            client_size: None,
+            last_title: None,
+            last_title_update: None,
+            startup_error: None,
+            capture_mode: CaptureMode::DirectWmPointer,
+            app_clock_origin: Instant::now(),
+            probe_state: probe,
+            wintab: Rc::new(RefCell::new(wintab_capture)),
+            wintab_control_observer: None,
+            wintab_control_pending: Arc::new(AtomicBool::new(false)),
+            session_writer: None,
+            session_path: path.with_extension("session.tsv"),
+            session_writer_failed: false,
+            project_writer: Some(project_writer),
+            project_path: path.clone(),
+            project_journal_id: journal_id.to_owned(),
+            local_convert_provider: None,
+            provider_worker: None,
+            pending_convert: None,
+            next_convert_generation: 1,
+            project_generation: 1,
+            convert_view_generation: 0,
+            active_session_id: session_id.to_owned(),
+            active_config_id: "config-a".to_owned(),
+            direct_input_tracker: CanvasInputTracker::default(),
+            canvas_tool_gesture_tracker: CanvasToolGestureTracker::default(),
+            deferred_canvas_intents: Vec::new(),
+            last_project_message_sequence: 0,
+            pending_record_cursor: PendingRecordCursor::default(),
+            next_project_batch_id: 10,
+            deferred_capture_batch: None,
+            project_incomplete_reason: None,
+            project_recovery_note: None,
+            historical_interrupted_strokes_at_start: 0,
+            controlled_stall: ControlledStallTrigger::default(),
+            canvas_scene: scene,
+            canvas_viewport: CanvasViewport::default(),
+            canvas_origin: None,
+            canvas_dpi_scale_factor: 1.0,
+            canvas_cursor_client: None,
+            canvas_modifiers: ModifiersState::empty(),
+            canvas_selection_drag_start: None,
+            canvas_move_drag_start: None,
+            canvas_pan_drag_last: None,
+            canvas_status: "queue retry fixture".to_owned(),
+        };
+        let binding = ProjectionInkBindingV1 {
+            journal_id: state.journal_id.clone(),
+            logical_revision: state.logical_revision,
+            last_sequence: state.last_sequence,
+            region_id: "stable-queue-region".to_owned(),
+            line_id: Some("line-1".to_owned()),
+            input_view_id: "input-view-v1-0000000000000001".to_owned(),
+            ink_binding_sha256: "a".repeat(64),
+            selected_strokes: vec![target.clone()],
+            source_sample_sequences: vec![sample_sequence],
+            stroke_views: vec![ProjectionStrokeViewV1 {
+                stroke: target.clone(),
+                frame,
+            }],
+        };
+        let projection = RecognitionProjectionV1 {
+            projection_id: "completed-queue-projection".to_owned(),
+            ink: binding,
+            provider: ProjectionProviderProvenanceV1 {
+                provider_id: "external-raster-provider".to_owned(),
+                provider_version: "synthetic-test".to_owned(),
+                model_version: None,
+                resource_version: None,
+                configuration_id: "operator-test-config".to_owned(),
+                configuration_fingerprint: "provider-config-v1-fnv64-0000000000000001".to_owned(),
+            },
+            candidates: vec![RecognitionCandidateV1 {
+                rank: 0,
+                recognized_text: "synthetic completed result".to_owned(),
+                native_score_raw: None,
+                stroke_ranges: vec![ProjectionStrokeRangeV1 {
+                    stroke: target.clone(),
+                    first_journal_sequence: sample_sequence,
+                    last_journal_sequence: sample_sequence,
+                }],
+            }],
+            input_modalities: None,
+            generated_raster: None,
+        };
+        for batch_id in 1..=8 {
+            app.project_writer
+                .as_mut()
+                .unwrap()
+                .try_snapshot_for_convert(batch_id)
+                .unwrap();
+        }
+        app.pending_convert = Some(PendingConvert {
+            generation: 1,
+            project_generation: app.project_generation,
+            view_generation: app.convert_view_generation,
+            cancelled: false,
+            selected_strokes_in_ui_order: vec![target.clone()],
+            line_id: "line-1".to_owned(),
+            request: None,
+            ink_binding: None,
+            generated_raster: None,
+            phase: PendingConvertPhase::QueueProjectionCommit {
+                batch_id: 9,
+                app_arrival_elapsed_ns: 20,
+                projection: Box::new(projection),
+            },
+        });
+
+        app.poll_convert();
+        assert!(matches!(
+            app.pending_convert.as_ref().map(|pending| &pending.phase),
+            Some(PendingConvertPhase::QueueProjectionCommit {
+                projection,
+                batch_id: 9,
+                ..
+            }) if projection.projection_id == "completed-queue-projection"
+        ));
+
+        let drain_deadline = Instant::now() + Duration::from_secs(10);
+        while !app.project_writer.as_ref().unwrap().is_idle() {
+            app.drain_project_writer_acks();
+            assert!(
+                Instant::now() < drain_deadline,
+                "writer queue did not drain"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        app.poll_convert();
+        assert!(matches!(
+            app.pending_convert.as_ref().map(|pending| &pending.phase),
+            Some(PendingConvertPhase::Persisting { batch_id: 9 })
+        ));
+
+        let continued_target = selected_stroke("queue-capture-continues");
+        let continued_sample = PhysicalSample {
+            session_id: continued_target.session_id.clone(),
+            source_api: continued_target.source_api.clone(),
+            source_device_id: continued_target.device_id.clone(),
+            pointer_id: continued_target.pointer_id,
+            stroke_id: Some(continued_target.stroke_id.clone()),
+            source_sequence: 1,
+            config_id: Some("config-a".to_owned()),
+            app_arrival_elapsed_ns: 21,
+            position: Some(RawPosition {
+                coordinate_space: "windows-screen-coordinates".to_owned(),
+                units: "screen-pixel".to_owned(),
+                x_raw: 70,
+                y_raw: 80,
+            }),
+            pressure: None,
+            native_timestamp: None,
+            contact_range_state: Some("contact".to_owned()),
+            button_state_raw: None,
+            tilt_x_raw: None,
+            tilt_y_raw: None,
+            rotation_raw: None,
+            raw_payload: vec![0xC2],
+        };
+        let capture_events = vec![
+            DirectCaptureEvent::StrokeStarted {
+                target: continued_target.clone(),
+                view_frame: frame,
+                app_arrival_elapsed_ns: 20,
+            },
+            DirectCaptureEvent::PhysicalSample(Box::new(continued_sample.clone())),
+            DirectCaptureEvent::StrokeCommitRequested {
+                target: continued_target,
+                app_arrival_elapsed_ns: 22,
+            },
+        ];
+        app.apply_capture_preview_events(&capture_events).unwrap();
+        app.project_writer
+            .as_mut()
+            .unwrap()
+            .try_capture_batch(10, capture_events)
+            .unwrap();
+
+        let finish_deadline = Instant::now() + Duration::from_secs(10);
+        while app.pending_convert.is_some() || !app.project_writer.as_ref().unwrap().is_idle() {
+            app.drain_project_writer_acks();
+            assert!(
+                Instant::now() < finish_deadline,
+                "retry/capture ACKs did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        app.drain_project_writer_acks();
+        assert!(app.canvas_status.contains("durably saved as a projection"));
+        app.finish_project_writer().unwrap();
+        let persisted = read_journal(&path).unwrap();
+        assert_eq!(persisted.state.recognition_projections.len(), 1);
+        assert_eq!(
+            persisted.state.recognition_projections[0]
+                .projection
+                .projection_id,
+            "completed-queue-projection"
+        );
+        assert_eq!(persisted.state.physical_samples.len(), 2);
+        assert_eq!(persisted.state.physical_samples[0].sample, source_sample);
+        assert_eq!(persisted.state.physical_samples[1].sample, continued_sample);
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod f4_convert_mock_pipeline_tests {
+    use super::*;
+    use crate::{
+        canvas::PROVISIONAL_DIRECT_SOURCE_API,
+        convert::{LocalConvertProviderV1, prepare_conversion},
+        journal::{PhysicalSample, ProjectionInputModalityV1, RawPosition, StrokeRef},
+        project_runtime::ProjectWriterAck,
+        provider_protocol::{
+            PROVIDER_PROTOCOL_VERSION, ProviderCandidateV1, ProviderCapabilitiesV1,
+            ProviderIdentityV1, ProviderInputCapabilityV1, ProviderOutputCapabilityV1,
+            RecognitionRequestV1, RecognitionResultV1, WorkerResponseFrameV1,
+        },
+    };
+    use std::{fs, path::PathBuf, time::Duration};
+
+    struct ReleaseWorkerOnDrop(PathBuf);
+
+    impl Drop for ReleaseWorkerOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, b"release");
+        }
+    }
+
+    fn provider_config_path(
+        directory: &std::path::Path,
+        executable: &std::path::Path,
+        arguments: &[String],
+    ) -> PathBuf {
+        let path = directory.join("f4-convert-provider.json");
+        let contents = serde_json::json!({
+            "schema_version": 1,
+            "providers": [{
+                "provider_id": "senocr-v1-fp32-local",
+                "executable_path": executable.to_string_lossy(),
+                "arguments": arguments,
+                "protocol_configuration": {
+                    "configuration_id": "f4-convert-synthetic-config",
+                    "values": { "fixture": "owned-synthetic-input" }
+                },
+                "requested_input_modalities": ["raster"],
+                "language_hints": ["vi-VN"]
+            }]
+        });
+        fs::write(&path, serde_json::to_vec(&contents).unwrap()).unwrap();
+        path
+    }
+
+    fn response_frames(request: &RecognitionRequestV1) -> (String, String) {
+        let provider = ProviderIdentityV1 {
+            provider_id: "senocr-v1-fp32-local".to_owned(),
+            provider_version: "synthetic-hosted-mock-v1".to_owned(),
+            model_version: None,
+            resource_version: None,
+        };
+        let capabilities = ProviderCapabilitiesV1 {
+            inputs: vec![ProviderInputCapabilityV1::Raster],
+            outputs: vec![ProviderOutputCapabilityV1::Text],
+            languages: request.language_hints.clone(),
+        };
+        let handshake = WorkerResponseFrameV1::Handshake {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            provider: provider.clone(),
+            configuration_id: request.provider_configuration.configuration_id.clone(),
+            configuration_fingerprint: request.provider_configuration_fingerprint.clone(),
+            capabilities,
+        };
+        let recognition = WorkerResponseFrameV1::Recognition {
+            protocol_version: PROVIDER_PROTOCOL_VERSION,
+            result: RecognitionResultV1 {
+                request_id: request.request_id.clone(),
+                input_view_id: request.input_view_id.clone(),
+                source_revision: request.source_revision.clone(),
+                region_id: request.region_id.clone(),
+                line_id: request.line_id.clone(),
+                provider_configuration_id: request.provider_configuration.configuration_id.clone(),
+                provider_configuration_fingerprint: request
+                    .provider_configuration_fingerprint
+                    .clone(),
+                provider,
+                provider_provenance: "guarded synthetic Convert fixture; no recognition evidence"
+                    .to_owned(),
+                consumed_input_modalities: request.requested_input_modalities.clone(),
+                candidates: vec![ProviderCandidateV1 {
+                    recognized_text: "F4 synthetic conversion result".to_owned(),
+                    native_score_raw: None,
+                    stroke_ranges: Vec::new(),
+                    raw_candidate: serde_json::json!({"fixture":"synthetic-only"}),
+                }],
+            },
+        };
+        (
+            serde_json::to_string(&handshake).unwrap(),
+            serde_json::to_string(&recognition).unwrap(),
+        )
+    }
+
+    fn execution_for_request(request: &RecognitionRequestV1) -> ProviderExecution {
+        let (_, response) = response_frames(request);
+        let frame: WorkerResponseFrameV1 = serde_json::from_str(&response).unwrap();
+        let WorkerResponseFrameV1::Recognition { result, .. } = frame else {
+            panic!("synthetic response fixture must be a recognition frame");
+        };
+        ProviderExecution {
+            provider: result.provider.clone(),
+            capabilities: ProviderCapabilitiesV1 {
+                inputs: vec![ProviderInputCapabilityV1::Raster],
+                outputs: vec![ProviderOutputCapabilityV1::Text],
+                languages: request.language_hints.clone(),
+            },
+            result,
+            stderr_bytes: Vec::new(),
+            stderr_truncated: false,
+            raw_response_transcript: Default::default(),
+            process_resources: None,
+            timing: crate::provider_protocol::ProviderExecutionTimingV1 {
+                process_create_call_to_handshake_ns: 0,
+                process_create_call_to_recognition_ns: 0,
+                process_create_call_to_parent_exit_ns: 0,
+                process_create_call_to_tree_drain_ns: 0,
+                model_cold_start_ns: None,
+                model_cold_start_unavailable_reason: None,
+            },
+        }
+    }
+
+    fn direct_target(journal_id: &str, session_id: &str, stroke_id: &str) -> StrokeRef {
+        StrokeRef {
+            journal_id: journal_id.to_owned(),
+            session_id: session_id.to_owned(),
+            source_api: canvas::PROVISIONAL_DIRECT_SOURCE_API.to_owned(),
+            device_id: Some("session-scoped-device-f4".to_owned()),
+            pointer_id: Some(17),
+            stroke_id: stroke_id.to_owned(),
+        }
+    }
+
+    fn direct_sample(target: &StrokeRef, source_sequence: u64, x_raw: i64) -> PhysicalSample {
+        PhysicalSample {
+            session_id: target.session_id.clone(),
+            source_api: target.source_api.clone(),
+            source_device_id: target.device_id.clone(),
+            pointer_id: target.pointer_id,
+            stroke_id: Some(target.stroke_id.clone()),
+            source_sequence,
+            config_id: Some("f4-synthetic-config".to_owned()),
+            app_arrival_elapsed_ns: u128::from(source_sequence),
+            position: Some(RawPosition {
+                coordinate_space: "windows-screen-coordinates".to_owned(),
+                units: "screen-pixel".to_owned(),
+                x_raw,
+                y_raw: 160,
+            }),
+            pressure: None,
+            native_timestamp: None,
+            contact_range_state: Some("contact".to_owned()),
+            button_state_raw: None,
+            tilt_x_raw: None,
+            tilt_y_raw: None,
+            rotation_raw: None,
+            raw_payload: vec![0xFA, u8::try_from(source_sequence).unwrap_or_default()],
+        }
+    }
+
+    fn provider_for_expected_request(
+        directory: &std::path::Path,
+        executable: &std::path::Path,
+        state: &journal::JournalReplayState,
+        target: &StrokeRef,
+        active_session_id: &str,
+        generation: u64,
+    ) -> (
+        PathBuf,
+        LocalConvertProviderV1,
+        convert::PreparedConversionV1,
+    ) {
+        let config_path = provider_config_path(directory, executable, &[]);
+        let provider = LocalConvertProviderV1::load(&config_path, None).unwrap();
+        let request_id = format!("convert-{active_session_id}-{generation}");
+        let cancellation = AtomicBool::new(false);
+        let prepared = prepare_conversion(
+            state,
+            std::slice::from_ref(target),
+            &request_id,
+            "line-1",
+            &provider,
+            &cancellation,
+        )
+        .unwrap();
+        (config_path, provider, prepared)
+    }
+
+    fn make_test_app(
+        project_path: PathBuf,
+        project_journal_id: String,
+        active_session_id: String,
+        writer: ProjectWriterHandle,
+        provider: LocalConvertProviderV1,
+        scene: CanvasScene,
+        app_clock_origin: Instant,
+    ) -> ProbeApp {
+        let mut probe = ProbeState::default();
+        probe.set_capture_mode(CaptureMode::DirectWmPointer);
+        let probe_state = Rc::new(RefCell::new(probe));
+        let wintab_capture = {
+            let mut state = probe_state.borrow_mut();
+            WintabCapture::new(CaptureMode::DirectWmPointer, app_clock_origin, &mut state)
+        };
+        ProbeApp {
+            window: None,
+            focused: None,
+            client_size: None,
+            last_title: None,
+            last_title_update: None,
+            startup_error: None,
+            capture_mode: CaptureMode::DirectWmPointer,
+            app_clock_origin,
+            probe_state,
+            wintab: Rc::new(RefCell::new(wintab_capture)),
+            wintab_control_observer: None,
+            wintab_control_pending: Arc::new(AtomicBool::new(false)),
+            session_writer: None,
+            session_path: project_path.with_extension("session.tsv"),
+            session_writer_failed: false,
+            project_writer: Some(writer),
+            project_path,
+            project_journal_id,
+            local_convert_provider: Some(provider),
+            provider_worker: None,
+            pending_convert: None,
+            next_convert_generation: 1,
+            project_generation: 1,
+            convert_view_generation: 0,
+            active_session_id,
+            active_config_id: "f4-synthetic-config".to_owned(),
+            direct_input_tracker: CanvasInputTracker::default(),
+            canvas_tool_gesture_tracker: CanvasToolGestureTracker::default(),
+            deferred_canvas_intents: Vec::new(),
+            last_project_message_sequence: 0,
+            pending_record_cursor: PendingRecordCursor::default(),
+            next_project_batch_id: 1,
+            deferred_capture_batch: None,
+            project_incomplete_reason: None,
+            project_recovery_note: None,
+            historical_interrupted_strokes_at_start: 0,
+            controlled_stall: ControlledStallTrigger::default(),
+            canvas_scene: scene,
+            canvas_viewport: CanvasViewport::default(),
+            canvas_origin: None,
+            canvas_dpi_scale_factor: 1.0,
+            canvas_cursor_client: None,
+            canvas_modifiers: ModifiersState::empty(),
+            canvas_selection_drag_start: None,
+            canvas_move_drag_start: None,
+            canvas_pan_drag_last: None,
+            canvas_status: "synthetic F4 controller test".to_owned(),
+        }
+    }
+
+    fn wait_for_app(app: &mut ProbeApp, timeout: Duration, finished: impl Fn(&ProbeApp) -> bool) {
+        let deadline = Instant::now() + timeout;
+        while !finished(app) {
+            app.drain_project_writer_acks();
+            app.poll_convert();
+            assert!(
+                Instant::now() < deadline,
+                "F4 mock pipeline did not reach its checkpoint"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[ignore = "guarded hosted Windows production Convert/M4 mock path; synthetic only"]
+    // This exercises the F4 controller and durable path, not the real pinned SenOCR model.
+    fn f4_convert_mock_pipeline_persists_then_rejects_stale_view_and_capture_continues() {
+        require_native_ui_test_opt_in();
+        crate::provider_protocol::tests::require_provider_mock_test_opt_in();
+        let mock = crate::provider_protocol::tests::compile_mock_worker();
+        let project_path = mock.directory.join("f4-convert-project.inkj");
+        let journal_id = "f4-convert-mock-project";
+        let active_session_id = "f4-convert-mock-session";
+        let target = direct_target(journal_id, active_session_id, "f4-selected-stroke");
+        let initial_sample = direct_sample(&target, 1, 120);
+        let frame = StrokeViewFrame::default();
+        let mut journal_writer = JournalWriter::create(
+            project_path.clone(),
+            JournalHeader {
+                journal_id: journal_id.to_owned(),
+                session_id: active_session_id.to_owned(),
+                config_id: Some("f4-synthetic-config".to_owned()),
+                device_model_declared: None,
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        journal_writer
+            .start_stroke(target.clone(), frame, 1)
+            .unwrap();
+        journal_writer
+            .append_sample(initial_sample.clone())
+            .unwrap();
+        journal_writer.commit_stroke(target.clone(), 2).unwrap();
+        let initial_state = journal_writer.replay_state().clone();
+        let mut scene =
+            CanvasScene::from_journal(&initial_state, canvas::PROVISIONAL_DIRECT_SOURCE_API)
+                .unwrap();
+        scene.select_target(Some(target.clone())).unwrap();
+        let writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        let (provider_path, _provider_before_first, expected_first) = provider_for_expected_request(
+            &mock.directory,
+            &mock.executable,
+            &initial_state,
+            &target,
+            active_session_id,
+            1,
+        );
+        let (first_handshake, first_response) = response_frames(&expected_first.request);
+        let first_arguments = vec!["ok".to_owned(), first_handshake, first_response];
+        provider_config_path(&mock.directory, &mock.executable, &first_arguments);
+        let first_provider = LocalConvertProviderV1::load(&provider_path, None).unwrap();
+        let app_clock_origin = Instant::now();
+        let mut app = make_test_app(
+            project_path.clone(),
+            journal_id.to_owned(),
+            active_session_id.to_owned(),
+            writer,
+            first_provider,
+            scene,
+            app_clock_origin,
+        );
+
+        // This is the same controller method reached by F4 in the real window.
+        app.start_or_cancel_convert();
+        wait_for_app(&mut app, Duration::from_secs(25), |app| {
+            app.pending_convert.is_none()
+                && app.canvas_status == "Convert result was durably saved as a projection"
+        });
+        assert!(app.project_writer.as_ref().unwrap().is_idle());
+
+        let snapshot_batch_id = app.allocate_project_batch_id().unwrap();
+        app.project_writer
+            .as_mut()
+            .unwrap()
+            .try_snapshot_for_convert(snapshot_batch_id)
+            .unwrap();
+        let current_state = loop {
+            let mut found = None;
+            for ack in app.project_writer.as_mut().unwrap().drain_acks() {
+                match ack {
+                    ProjectWriterAck::ConvertSnapshot { batch_id, state }
+                        if batch_id == snapshot_batch_id =>
+                    {
+                        found = Some(*state)
+                    }
+                    other => {
+                        panic!("unexpected snapshot ACK in guarded Convert fixture: {other:?}")
+                    }
+                }
+            }
+            if let Some(state) = found {
+                break state;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(current_state.recognition_projections.len(), 1);
+        assert_eq!(current_state.physical_samples.len(), 1);
+
+        let (second_config_path, _provider_before_second, expected_second) =
+            provider_for_expected_request(
+                &mock.directory,
+                &mock.executable,
+                &current_state,
+                &target,
+                active_session_id,
+                2,
+            );
+        assert_eq!(
+            expected_first.request.region_id,
+            expected_second.request.region_id
+        );
+        assert_ne!(
+            expected_first.request.request_id,
+            expected_second.request.request_id
+        );
+        assert_eq!(
+            expected_first.request.input_view_id,
+            expected_second.request.input_view_id
+        );
+        let (second_handshake, second_response) = response_frames(&expected_second.request);
+        let ready_marker = mock.directory.join("f4-worker-ready.marker");
+        let release_marker = mock.directory.join("f4-worker-release.marker");
+        let _release_on_drop = ReleaseWorkerOnDrop(release_marker.clone());
+        let second_arguments = vec![
+            "ok-wait-release".to_owned(),
+            second_handshake,
+            second_response,
+            ready_marker.to_string_lossy().into_owned(),
+            release_marker.to_string_lossy().into_owned(),
+        ];
+        provider_config_path(&mock.directory, &mock.executable, &second_arguments);
+        let second_provider = LocalConvertProviderV1::load(&second_config_path, None).unwrap();
+        app.local_convert_provider = Some(second_provider);
+        app.start_or_cancel_convert();
+        let deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            app.drain_project_writer_acks();
+            app.poll_convert();
+            let provider_running = app.pending_convert.as_ref().is_some_and(|pending| {
+                matches!(&pending.phase, PendingConvertPhase::ProviderRunning)
+            });
+            if provider_running && ready_marker.exists() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mock did not consume the second M4 request"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Inject a durable logical edit after M4 submission but before the
+        // ordered revalidation snapshot. Hold its ACK so the production
+        // controller exercises its source/view revalidation rather than the
+        // earlier UI gesture-cancellation branch.
+        let move_batch_id = app.allocate_project_batch_id().unwrap();
+        app.project_writer
+            .as_mut()
+            .unwrap()
+            .try_edit_action(
+                move_batch_id,
+                app.app_clock_origin.elapsed().as_nanos(),
+                EditCommand::Move {
+                    target: target.clone(),
+                    delta_x_raw: 9,
+                    delta_y_raw: 0,
+                    coordinate_space: "windows-screen-coordinates".to_owned(),
+                    units: "screen-pixel".to_owned(),
+                },
+            )
+            .unwrap();
+        let mut moved_projection = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while moved_projection.is_none() {
+            for ack in app.project_writer.as_mut().unwrap().drain_acks() {
+                match ack {
+                    ProjectWriterAck::EditCommitted {
+                        batch_id,
+                        projection,
+                        ..
+                    } if batch_id == move_batch_id => moved_projection = Some(*projection),
+                    other => panic!("unexpected ACK before releasing mock: {other:?}"),
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "logical edit did not durably acknowledge"
+            );
+            if moved_projection.is_none() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        release_marker_guarded_write(&release_marker);
+
+        wait_for_app(&mut app, Duration::from_secs(25), |app| {
+            app.pending_convert.is_none()
+                && app.canvas_status
+                    == "Convert result is stale: current selected ink/view differs from its request"
+        });
+        app.canvas_scene
+            .refresh_from_journal(moved_projection.as_ref().unwrap())
+            .unwrap();
+        app.note_convert_view_change();
+
+        let continued_target = direct_target(journal_id, active_session_id, "after-stale-capture");
+        let continued_sample = direct_sample(&continued_target, 1, 240);
+        let capture_events = vec![
+            DirectCaptureEvent::StrokeStarted {
+                target: continued_target.clone(),
+                view_frame: frame,
+                app_arrival_elapsed_ns: 40,
+            },
+            DirectCaptureEvent::PhysicalSample(Box::new(continued_sample.clone())),
+            DirectCaptureEvent::StrokeCommitRequested {
+                target: continued_target,
+                app_arrival_elapsed_ns: 41,
+            },
+        ];
+        app.apply_capture_preview_events(&capture_events).unwrap();
+        let capture_batch_id = app.allocate_project_batch_id().unwrap();
+        app.project_writer
+            .as_mut()
+            .unwrap()
+            .try_capture_batch(capture_batch_id, capture_events)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.project_writer.as_ref().unwrap().is_idle() {
+            app.drain_project_writer_acks();
+            assert!(
+                Instant::now() < deadline,
+                "physical capture did not ACK after stale Convert"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        app.drain_project_writer_acks();
+        app.finish_project_writer().unwrap();
+
+        let persisted = read_journal(&project_path).unwrap();
+        assert_eq!(persisted.state.recognition_projections.len(), 1);
+        let projection = &persisted.state.recognition_projections[0].projection;
+        assert_eq!(
+            projection.candidates[0].recognized_text,
+            "F4 synthetic conversion result"
+        );
+        assert_eq!(
+            projection.input_modalities,
+            Some(vec![ProjectionInputModalityV1::Raster])
+        );
+        assert!(projection.generated_raster.is_some());
+        assert_eq!(persisted.state.physical_samples.len(), 2);
+        assert_eq!(persisted.state.physical_samples[0].sample, initial_sample);
+        assert_eq!(persisted.state.physical_samples[1].sample, continued_sample);
+        assert!(persisted.state.edit_actions.iter().any(|action| {
+            matches!(
+                &action.command,
+                EditCommand::Move { target: moved, .. } if moved == &target
+            )
+        }));
+        assert!(persisted.state.region_corrections.is_empty());
+    }
+
+    #[test]
+    fn full_writer_queue_retains_completed_execution_until_snapshot_retry() {
+        let test_directory = std::env::temp_dir().join(format!(
+            "lassoink-f4-queue-validation-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir(&test_directory).unwrap();
+        let project_path = test_directory.join("queue-validation.inkj");
+        let journal_id = "f4-queue-validation-project";
+        let session_id = "f4-queue-validation-session";
+        let target = direct_target(journal_id, session_id, "queue-validation-stroke");
+        let frame = StrokeViewFrame::default();
+        let mut journal_writer = JournalWriter::create(
+            project_path.clone(),
+            JournalHeader {
+                journal_id: journal_id.to_owned(),
+                session_id: session_id.to_owned(),
+                config_id: Some("f4-synthetic-config".to_owned()),
+                device_model_declared: None,
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        journal_writer
+            .start_stroke(target.clone(), frame, 1)
+            .unwrap();
+        journal_writer
+            .append_sample(direct_sample(&target, 1, 120))
+            .unwrap();
+        journal_writer.commit_stroke(target.clone(), 2).unwrap();
+        let state = journal_writer.replay_state().clone();
+        let config_path =
+            provider_config_path(&test_directory, &std::env::current_exe().unwrap(), &[]);
+        let provider = LocalConvertProviderV1::load(&config_path, None).unwrap();
+        let request_id = "convert-f4-queue-validation-session-1";
+        let cancellation = AtomicBool::new(false);
+        let prepared = prepare_conversion(
+            &state,
+            std::slice::from_ref(&target),
+            request_id,
+            "line-1",
+            &provider,
+            &cancellation,
+        )
+        .unwrap();
+        let execution = execution_for_request(&prepared.request);
+        let mut scene = CanvasScene::from_journal(&state, PROVISIONAL_DIRECT_SOURCE_API).unwrap();
+        scene.select_target(Some(target.clone())).unwrap();
+        let mut writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        for batch_id in 1..=8 {
+            writer.try_snapshot_for_convert(batch_id).unwrap();
+        }
+        let mut app = make_test_app(
+            project_path.clone(),
+            journal_id.to_owned(),
+            session_id.to_owned(),
+            writer,
+            provider,
+            scene,
+            Instant::now(),
+        );
+        app.next_project_batch_id = 9;
+        app.pending_convert = Some(PendingConvert {
+            generation: 1,
+            project_generation: app.project_generation,
+            view_generation: app.convert_view_generation,
+            cancelled: false,
+            selected_strokes_in_ui_order: vec![target.clone()],
+            line_id: "line-1".to_owned(),
+            request: Some(prepared.request.clone()),
+            ink_binding: Some(prepared.ink_binding.clone()),
+            generated_raster: prepared.generated_raster.clone(),
+            phase: PendingConvertPhase::ProviderRunning,
+        });
+        app.handle_provider_poll(ProviderWorkerPoll::Outcome(Box::new(
+            crate::provider_protocol::ProviderJobOutcome {
+                request_id: request_id.to_owned(),
+                outcome: Ok(execution),
+            },
+        )));
+        assert!(matches!(
+            app.pending_convert.as_ref().map(|pending| &pending.phase),
+            Some(PendingConvertPhase::QueueSnapshotForValidation {
+                batch_id: 9,
+                execution,
+            }) if execution.result.request_id == request_id
+                && execution.result.candidates[0].recognized_text == "F4 synthetic conversion result"
+        ));
+
+        let drain_deadline = Instant::now() + Duration::from_secs(10);
+        while !app.project_writer.as_ref().unwrap().is_idle() {
+            app.drain_project_writer_acks();
+            assert!(
+                Instant::now() < drain_deadline,
+                "snapshot ACK capacity did not drain"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(matches!(
+            app.pending_convert.as_ref().map(|pending| &pending.phase),
+            Some(PendingConvertPhase::QueueSnapshotForValidation {
+                batch_id: 9,
+                execution,
+            }) if execution.result.request_id == request_id
+                && execution.result.candidates[0].recognized_text == "F4 synthetic conversion result"
+        ));
+        app.poll_convert();
+        assert!(matches!(
+            app.pending_convert.as_ref().map(|pending| &pending.phase),
+            Some(PendingConvertPhase::SnapshotForValidation {
+                batch_id: 9,
+                execution,
+            }) if execution.result.request_id == request_id
+                && execution.result.candidates[0].recognized_text == "F4 synthetic conversion result"
+        ));
+
+        wait_for_app(&mut app, Duration::from_secs(10), |app| {
+            app.pending_convert.is_none()
+                && app.canvas_status == "Convert result was durably saved as a projection"
+        });
+        assert!(app.project_writer.as_ref().unwrap().is_idle());
+        app.finish_project_writer().unwrap();
+        let persisted = read_journal(&project_path).unwrap();
+        assert_eq!(persisted.state.recognition_projections.len(), 1);
+        assert_eq!(
+            persisted.state.recognition_projections[0]
+                .projection
+                .projection_id,
+            request_id
+        );
+        assert!(
+            persisted.state.recognition_projections[0]
+                .projection
+                .generated_raster
+                .is_some()
+        );
+        let _ = fs::remove_dir_all(test_directory);
+    }
+
+    fn release_marker_guarded_write(path: &std::path::Path) {
+        fs::write(path, b"release").unwrap();
     }
 }
