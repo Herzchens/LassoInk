@@ -160,6 +160,33 @@ fn main() {
             }
             process::exit(0);
         }
+        "ok-wait-release" => {
+            let Some(ready_marker) = ready_marker.as_deref() else {
+                process::exit(53);
+            };
+            let Some(release_marker) = args.next() else {
+                process::exit(54);
+            };
+            if std::fs::write(ready_marker, b"ready").is_err() {
+                process::exit(55);
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !std::path::Path::new(&release_marker).exists() {
+                if std::time::Instant::now() >= deadline {
+                    process::exit(56);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let Some(response_for_request) =
+                response_bound_to_request(&response, &recognition_request)
+            else {
+                process::exit(57);
+            };
+            if write_frame(&mut output, response_for_request.as_bytes()).is_err() {
+                process::exit(34);
+            }
+            process::exit(0);
+        }
         "vary-repeat" => {
             let Some(response_for_request) =
                 response_bound_to_request(&response, &recognition_request)

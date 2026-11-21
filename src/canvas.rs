@@ -4,17 +4,23 @@
 //! in this milestone is an explicitly provisional direct WM_POINTER stream;
 //! public Winit and Wintab records are not blended into it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use sha2::{Digest, Sha256};
 use tiny_skia::{
     Color, ColorSpace, FillRule, IntSize, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke,
     Transform as RasterTransform,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::journal::{
-    EditCommand, JournalError, JournalMetadata, JournalReplayState, MetadataScope, NativeTimestamp,
-    PhysicalSample, RawPosition, RawPressure, StrokeRef, StrokeViewFrame,
+    CanonicalRasterArtifactHashInputV1, EditCommand, JournalError, JournalMetadata,
+    JournalReplayState, MetadataScope, NativeTimestamp, PhysicalSample,
+    ProjectionRasterAspectRatioPolicyV1, ProjectionRasterClippingPolicyV1,
+    ProjectionRasterCoveragePolicyV1, ProjectionRasterPixelLayoutV1,
+    ProjectionRasterRoundingPolicyV1, ProjectionRasterSinglePointPolicyV1, ProjectionRasterSpecV1,
+    ProjectionRasterStrokeCapV1, ProjectionRasterStrokeJoinV1, ProjectionRasterStrokeOrderPolicyV1,
+    RawPosition, RawPressure, StrokeRef, StrokeViewFrame, canonical_raster_artifact_sha256,
 };
 use crate::win32_pointer::{
     DirectPenHistoryBatch, LifecycleEventKind, OwnedPointerSample, PointerMessageKind,
@@ -45,8 +51,182 @@ const CANONICAL_RASTER_BYTES_PER_PIXEL: u32 = 4;
 const CANONICAL_RASTER_BACKGROUND_RGBA: [u8; 4] = [255, 255, 255, 255];
 const CANONICAL_RASTER_INK_RGBA: [u8; 4] = [32, 32, 32, 255];
 const CANONICAL_RASTER_INK_WIDTH_16_16: u32 = 2 << 16;
-const CANONICAL_RASTER_RENDERER_VERSION: &str = "tiny-skia/0.12.0;canonical-raster-v1";
+const CANONICAL_RASTER_RENDERER_VERSION: &str =
+    crate::journal::CANONICAL_RASTER_RENDERER_VERSION_V1;
 const TOOLBAR_HEIGHT: i32 = 40;
+pub(crate) const CORRECTION_PANE_WIDTH_PX: i32 = 360;
+pub(crate) const CORRECTION_PANE_PADDING_PX: i32 = 12;
+pub(crate) const CORRECTION_PANE_ROW_HEIGHT_PX: i32 = 18;
+
+const MAX_GDI_TEXT_ADVANCE_CACHE_ENTRIES: usize = 128;
+const MAX_GDI_TEXT_ADVANCE_CACHE_UNITS: usize = 131_072;
+// Allows several bounded projection metadata fields to be measured as one pane block.
+const MAX_GDI_TEXT_MEASURE_UNITS: usize = crate::journal::MAX_JOURNAL_TEXT_BYTES * 16 + 1_024;
+
+#[derive(Default)]
+pub(crate) struct GdiTextAdvanceCache {
+    hwnd: Option<isize>,
+    entries: HashMap<String, Vec<i32>>,
+    order: VecDeque<String>,
+    cached_utf16_units: usize,
+}
+
+impl GdiTextAdvanceCache {
+    pub(crate) fn set_hwnd(&mut self, hwnd: Option<isize>) {
+        if self.hwnd != hwnd {
+            self.clear();
+            self.hwnd = hwnd;
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.cached_utf16_units = 0;
+    }
+
+    /// Returns cumulative UTF-16 text extents measured using the same default
+    /// GDI font as the canvas renderer. The cache is bounded by entry and unit
+    /// counts; approximate advances are used only when no render HWND is set
+    /// for non-rendering unit contexts. Live-window measurement errors propagate.
+    pub(crate) fn advances(
+        &mut self,
+        text: &str,
+    ) -> std::io::Result<Vec<i32>> {
+        if let Some(advances) = self.entries.get(text) {
+            return Ok(advances.clone());
+        }
+        let utf16_units = text.encode_utf16().count();
+        let advances = match self.hwnd {
+            Some(hwnd) => measure_gdi_text_advances(hwnd, text)?,
+            None => fallback_gdi_text_advances(text),
+        };
+        if (24..=MAX_GDI_TEXT_ADVANCE_CACHE_UNITS).contains(&utf16_units) {
+            while self.entries.len() >= MAX_GDI_TEXT_ADVANCE_CACHE_ENTRIES
+                || self.cached_utf16_units.saturating_add(utf16_units)
+                    > MAX_GDI_TEXT_ADVANCE_CACHE_UNITS
+            {
+                let Some(oldest) = self.order.pop_front() else {
+                    break;
+                };
+                if self.entries.remove(&oldest).is_some() {
+                    self.cached_utf16_units = self
+                        .cached_utf16_units
+                        .saturating_sub(oldest.encode_utf16().count());
+                }
+            }
+            if !self.entries.contains_key(text) {
+                self.cached_utf16_units = self.cached_utf16_units.saturating_add(utf16_units);
+                self.order.push_back(text.to_owned());
+                self.entries.insert(text.to_owned(), advances.clone());
+            }
+        }
+        Ok(advances)
+    }
+}
+
+fn measure_gdi_text_advances(
+    hwnd: isize,
+    text: &str,
+) -> std::io::Result<Vec<i32>> {
+    use windows_sys::Win32::Graphics::Gdi::{GetDC, GetTextExtentExPointW, ReleaseDC};
+
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (wide, unit_count, cch_string) = gdi_text_buffer(text)?;
+    let mut advances = Vec::new();
+    advances
+        .try_reserve_exact(unit_count)
+        .map_err(|_| std::io::Error::other("GDI text extent buffer allocation failed"))?;
+    advances.resize(unit_count, 0i32);
+    let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+    if hwnd == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "text measurement rejects a null HWND",
+        ));
+    }
+    // SAFETY: this HWND is refreshed from the live Winit window on its owner
+    // thread; the acquired client HDC is paired with ReleaseDC below.
+    let hdc = unsafe { GetDC(hwnd) };
+    if hdc == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut fit = 0i32;
+    // SAFETY: SIZE contains only integer dimensions, so its all-zero value is valid.
+    let mut extent: windows_sys::Win32::Foundation::SIZE = unsafe { std::mem::zeroed() };
+    // SAFETY: wide has exactly `unit_count + 1` initialized units with a
+    // trailing NUL; `cch_string == unit_count` excludes it, and advances has
+    // exactly `unit_count` output slots. fit and extent are valid; hdc is live.
+    let measured = unsafe {
+        GetTextExtentExPointW(
+            hdc,
+            wide.as_ptr(),
+            cch_string,
+            i32::MAX,
+            &mut fit,
+            advances.as_mut_ptr(),
+            &mut extent,
+        )
+    };
+    let measure_error = if measured == 0 || usize::try_from(fit).ok() != Some(unit_count) {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    // SAFETY: hdc was acquired from this exact live hwnd above.
+    let released = unsafe { ReleaseDC(hwnd, hdc) };
+    if let Some(error) = measure_error {
+        return Err(error);
+    }
+    if released == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(advances)
+}
+
+fn gdi_text_buffer(text: &str) -> std::io::Result<(Vec<u16>, usize, i32)> {
+    let unit_count = text.encode_utf16().count();
+    if unit_count > MAX_GDI_TEXT_MEASURE_UNITS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "text exceeds the bounded GDI measurement length",
+        ));
+    }
+    let cch_string = i32::try_from(unit_count).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "UTF-16 text length exceeds the Win32 count range",
+        )
+    })?;
+    let capacity = unit_count.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "UTF-16 terminator length overflowed",
+        )
+    })?;
+    let mut wide = Vec::new();
+    wide.try_reserve_exact(capacity)
+        .map_err(|_| std::io::Error::other("UTF-16 GDI text allocation failed"))?;
+    wide.extend(text.encode_utf16());
+    wide.push(0);
+    Ok((wide, unit_count, cch_string))
+}
+
+fn fallback_gdi_text_advances(text: &str) -> Vec<i32> {
+    let mut advances = Vec::new();
+    let mut width = 0i32;
+    for grapheme in text.graphemes(true) {
+        let unit_count = grapheme.encode_utf16().count();
+        advances.extend(std::iter::repeat(width).take(unit_count.saturating_sub(1)));
+        width = width.saturating_add(8);
+        if unit_count > 0 {
+            advances.push(width);
+        }
+    }
+    advances
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CanvasTool {
@@ -682,7 +862,7 @@ impl CanvasInputTracker {
         Ok(events)
     }
 
-    fn interrupt_pointer_id(
+    pub(crate) fn interrupt_pointer_id(
         &mut self,
         pointer_id_requested: u32,
         reason: crate::journal::StrokeInterruptionReason,
@@ -760,6 +940,31 @@ impl CanvasInputTracker {
             },
             app_arrival_elapsed_ns,
         });
+        Ok(events)
+    }
+
+    /// Retain a Direct history batch as raw non-stroke samples for a UI-owned
+    /// pointer gesture. This path intentionally emits no visible stroke start,
+    /// commit, or preview operation.
+    pub(crate) fn direct_batch_to_unowned_events(
+        batch: &DirectPenHistoryBatch,
+        session_id: &str,
+        config_id: Option<&str>,
+    ) -> Result<Vec<DirectCaptureEvent>, CanvasError> {
+        let mut events = Vec::new();
+        events
+            .try_reserve_exact(batch.samples.len())
+            .map_err(|_| CanvasError::PointCapacityReached)?;
+        for native in &batch.samples {
+            let sample = owned_direct_sample_to_physical(
+                batch,
+                native,
+                session_id,
+                config_id,
+                None,
+            )?;
+            events.push(DirectCaptureEvent::PhysicalSample(Box::new(sample)));
+        }
         Ok(events)
     }
 
@@ -1734,6 +1939,10 @@ impl CanvasScene {
         Ok(targets)
     }
 
+    pub(crate) fn has_preview_strokes(&self) -> bool {
+        !self.preview_strokes.is_empty()
+    }
+
     pub(crate) fn tombstone_selected_command(&self) -> Result<Option<EditCommand>, CanvasError> {
         let targets = self.selected_targets()?;
         if targets.is_empty() {
@@ -1897,6 +2106,57 @@ pub(crate) struct CanonicalRasterProjectionPlanV1 {
     samples_in_journal_order: Vec<CanonicalRasterProjectionSampleV1>,
 }
 
+impl CanonicalRasterProjectionPlanV1 {
+    pub(crate) fn journal_first_occurrence_stroke_order(
+        &self,
+    ) -> Result<Vec<StrokeRef>, CanvasError> {
+        journal_first_occurrence_stroke_order(self)
+    }
+
+    /// Bounds only observed canonical points and adds a fixed caller-declared
+    /// margin. All arithmetic is checked before the projection spec is built.
+    pub(crate) fn source_crop_with_padding(
+        &self,
+        padding_px: i32,
+    ) -> Result<CanonicalRasterProjectionCropV1, CanvasError> {
+        if padding_px < 0 || self.samples_in_journal_order.is_empty() {
+            return Err(CanvasError::InvalidCanonicalRasterProjection(
+                "source crop requires observed samples and nonnegative padding",
+            ));
+        }
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        for sample in &self.samples_in_journal_order {
+            min_x = min_x.min(sample.canonical_canvas_position_px.x);
+            min_y = min_y.min(sample.canonical_canvas_position_px.y);
+            max_x = max_x.max(sample.canonical_canvas_position_px.x);
+            max_y = max_y.max(sample.canonical_canvas_position_px.y);
+        }
+        let left_px = min_x
+            .checked_sub(padding_px)
+            .ok_or(CanvasError::InvalidTransform)?;
+        let top_px = min_y
+            .checked_sub(padding_px)
+            .ok_or(CanvasError::InvalidTransform)?;
+        let right_px_exclusive = max_x
+            .checked_add(padding_px)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(CanvasError::InvalidTransform)?;
+        let bottom_px_exclusive = max_y
+            .checked_add(padding_px)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(CanvasError::InvalidTransform)?;
+        Ok(CanonicalRasterProjectionCropV1 {
+            left_px,
+            top_px,
+            right_px_exclusive,
+            bottom_px_exclusive,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalRasterProjectionSampleV1 {
     journal_sequence: u64,
@@ -1991,6 +2251,68 @@ impl CanonicalRasterProjectionSpecV1 {
                 CanonicalRasterClippingPolicyV1::RejectPointsOutsideSourceCropClipCoverageAtOutputBounds,
             single_point_policy: CanonicalRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint,
             stroke_order_policy: CanonicalRasterStrokeOrderPolicyV1::JournalFirstOccurrence,
+        }
+    }
+
+    pub(crate) fn projection_provenance(
+        &self,
+        row_stride_bytes: u32,
+        output_buffer_bytes: u32,
+    ) -> ProjectionRasterSpecV1 {
+        ProjectionRasterSpecV1 {
+            schema_version: self.schema_version,
+            output_width_px: self.output_width_px,
+            output_height_px: self.output_height_px,
+            source_crop_left_px: self.source_crop.left_px,
+            source_crop_top_px: self.source_crop.top_px,
+            source_crop_right_px_exclusive: self.source_crop.right_px_exclusive,
+            source_crop_bottom_px_exclusive: self.source_crop.bottom_px_exclusive,
+            aspect_ratio_policy: match self.aspect_ratio_policy {
+                CanonicalRasterAspectRatioPolicyV1::FitContainCentered => {
+                    ProjectionRasterAspectRatioPolicyV1::FitContainCentered
+                }
+            },
+            pixel_layout: match self.pixel_layout {
+                CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown => {
+                    ProjectionRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown
+                }
+            },
+            coverage_policy: match self.coverage_policy {
+                CanonicalRasterCoveragePolicyV1::Antialiased => {
+                    ProjectionRasterCoveragePolicyV1::Antialiased
+                }
+            },
+            background_rgba: self.background_rgba,
+            committed_ink_rgba: self.committed_ink_rgba,
+            stroke_width_16_16: self.stroke_width_16_16,
+            stroke_cap: match self.stroke_cap {
+                CanonicalRasterStrokeCapV1::Round => ProjectionRasterStrokeCapV1::Round,
+            },
+            stroke_join: match self.stroke_join {
+                CanonicalRasterStrokeJoinV1::Round => ProjectionRasterStrokeJoinV1::Round,
+            },
+            rounding_policy: match self.rounding_policy {
+                CanonicalRasterRoundingPolicyV1::NearestTiesAwayQ16 => {
+                    ProjectionRasterRoundingPolicyV1::NearestTiesAwayQ16
+                }
+            },
+            clipping_policy: match self.clipping_policy {
+                CanonicalRasterClippingPolicyV1::RejectPointsOutsideSourceCropClipCoverageAtOutputBounds => {
+                    ProjectionRasterClippingPolicyV1::RejectPointsOutsideSourceCropClipCoverageAtOutputBounds
+                }
+            },
+            single_point_policy: match self.single_point_policy {
+                CanonicalRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint => {
+                    ProjectionRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint
+                }
+            },
+            stroke_order_policy: match self.stroke_order_policy {
+                CanonicalRasterStrokeOrderPolicyV1::JournalFirstOccurrence => {
+                    ProjectionRasterStrokeOrderPolicyV1::JournalFirstOccurrence
+                }
+            },
+            row_stride_bytes,
+            output_buffer_bytes,
         }
     }
 
@@ -2144,6 +2466,11 @@ impl CanonicalRasterOutputGeometryV1 {
         self.spec.schema_version
     }
 
+    pub(crate) fn projection_spec_metadata(&self) -> ProjectionRasterSpecV1 {
+        self.spec
+            .projection_provenance(self.row_stride_bytes, self.output_buffer_bytes)
+    }
+
     pub(crate) fn canonical_stroke_draw_order(&self) -> &[StrokeRef] {
         &self.stroke_draw_order
     }
@@ -2166,6 +2493,10 @@ impl CanonicalRasterOutputGeometryV1 {
 }
 
 impl CanonicalRasterImageV1 {
+    pub(crate) fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
     pub(crate) fn source_revision_parts(&self) -> (&str, u64, u64) {
         (
             &self.source_journal_id,
@@ -3249,10 +3580,12 @@ fn hash_canonical_raster_source(
     plan: &CanonicalRasterProjectionPlanV1,
     stroke_draw_order: &[StrokeRef],
 ) -> [u8; 32] {
-    let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-source/v1\0");
+    // This is content identity, not the exact submitted prefix. The prefix is
+    // stored separately and included by the raster artifact hash; excluding it
+    // here keeps source/geometry identity stable across unrelated journal tails.
+    let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-source/v2\0");
     hash.string(&plan.journal_id);
     hash.u64(plan.logical_revision);
-    hash.u64(plan.last_sequence);
     hash.u64(stroke_draw_order.len() as u64);
     for stroke in stroke_draw_order {
         hash.stroke_ref(stroke);
@@ -3276,48 +3609,8 @@ fn hash_canonical_raster_spec(
     row_stride_bytes: u32,
     output_buffer_bytes: u32,
 ) -> [u8; 32] {
-    let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-spec/v1\0");
-    hash.u32(spec.schema_version);
-    hash.u32(spec.output_width_px);
-    hash.u32(spec.output_height_px);
-    hash.i32(spec.source_crop.left_px);
-    hash.i32(spec.source_crop.top_px);
-    hash.i32(spec.source_crop.right_px_exclusive);
-    hash.i32(spec.source_crop.bottom_px_exclusive);
-    hash.u8(match spec.aspect_ratio_policy {
-        CanonicalRasterAspectRatioPolicyV1::FitContainCentered => 1,
-    });
-    hash.u8(match spec.pixel_layout {
-        CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown => 1,
-    });
-    hash.u8(match spec.coverage_policy {
-        CanonicalRasterCoveragePolicyV1::Antialiased => 1,
-    });
-    hash.bytes(&spec.background_rgba);
-    hash.bytes(&spec.committed_ink_rgba);
-    hash.u32(spec.stroke_width_16_16);
-    hash.u8(match spec.stroke_cap {
-        CanonicalRasterStrokeCapV1::Round => 1,
-    });
-    hash.u8(match spec.stroke_join {
-        CanonicalRasterStrokeJoinV1::Round => 1,
-    });
-    hash.u8(match spec.rounding_policy {
-        CanonicalRasterRoundingPolicyV1::NearestTiesAwayQ16 => 1,
-    });
-    hash.u8(match spec.clipping_policy {
-        CanonicalRasterClippingPolicyV1::RejectPointsOutsideSourceCropClipCoverageAtOutputBounds =>
-            1,
-    });
-    hash.u8(match spec.single_point_policy {
-        CanonicalRasterSinglePointPolicyV1::OpaqueDiscAtObservedPoint => 1,
-    });
-    hash.u8(match spec.stroke_order_policy {
-        CanonicalRasterStrokeOrderPolicyV1::JournalFirstOccurrence => 1,
-    });
-    hash.u32(row_stride_bytes);
-    hash.u32(output_buffer_bytes);
-    hash.finish()
+    spec.projection_provenance(row_stride_bytes, output_buffer_bytes)
+        .canonical_sha256()
 }
 
 fn hash_canonical_raster_geometry(geometry: &CanonicalRasterOutputGeometryV1) -> [u8; 32] {
@@ -3345,24 +3638,22 @@ fn hash_canonical_raster_geometry(geometry: &CanonicalRasterOutputGeometryV1) ->
 }
 
 fn hash_canonical_raster_artifact(image: &CanonicalRasterImageV1) -> [u8; 32] {
-    let mut hash = CanonicalRasterHashWriter::new(b"LassoInk/canonical-raster-artifact/v1\0");
-    hash.u32(image.schema_version);
-    hash.string(image.renderer_version);
-    hash.string(&image.source_journal_id);
-    hash.u64(image.source_logical_revision);
-    hash.u64(image.source_last_sequence);
-    hash.bytes(&image.source_content_sha256);
-    hash.bytes(&image.projection_spec_sha256);
-    hash.bytes(&image.geometry_sha256);
-    hash.u32(image.output_width_px);
-    hash.u32(image.output_height_px);
-    hash.u32(image.row_stride_bytes);
-    hash.u8(match image.pixel_layout {
-        CanonicalRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown => 1,
-    });
-    hash.bytes(&image.pixel_bytes_sha256);
-    hash.bytes(&image.png_bytes_sha256);
-    hash.finish()
+    canonical_raster_artifact_sha256(CanonicalRasterArtifactHashInputV1 {
+        schema_version: image.schema_version,
+        renderer_version: image.renderer_version,
+        source_journal_id: &image.source_journal_id,
+        source_logical_revision: image.source_logical_revision,
+        source_last_sequence: image.source_last_sequence,
+        source_content_sha256: &image.source_content_sha256,
+        projection_spec_sha256: &image.projection_spec_sha256,
+        geometry_sha256: &image.geometry_sha256,
+        output_width_px: image.output_width_px,
+        output_height_px: image.output_height_px,
+        row_stride_bytes: image.row_stride_bytes,
+        pixel_layout: ProjectionRasterPixelLayoutV1::Rgba8PremultipliedSrgbTopDown,
+        pixel_bytes_sha256: &image.pixel_bytes_sha256,
+        png_bytes_sha256: &image.png_bytes_sha256,
+    })
 }
 
 fn polyline_distance_squared(points: &[CanvasPointPx], x: f64, y: f64) -> f64 {
@@ -3403,6 +3694,26 @@ pub(crate) fn paint_gdi(
     viewport: CanvasViewport,
     status: &str,
 ) -> std::io::Result<()> {
+    paint_gdi_internal(window, scene, viewport, status, None)
+}
+
+pub(crate) fn paint_gdi_with_side_pane(
+    window: &winit::window::Window,
+    scene: &CanvasScene,
+    viewport: CanvasViewport,
+    status: &str,
+    side_pane_lines: &[String],
+) -> std::io::Result<()> {
+    paint_gdi_internal(window, scene, viewport, status, Some(side_pane_lines))
+}
+
+fn paint_gdi_internal(
+    window: &winit::window::Window,
+    scene: &CanvasScene,
+    viewport: CanvasViewport,
+    status: &str,
+    side_pane_lines: Option<&[String]>,
+) -> std::io::Result<()> {
     use windows_sys::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
 
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -3432,7 +3743,8 @@ pub(crate) fn paint_gdi(
     if hdc == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let draw_result = paint_scene_gdi(hwnd, hdc, scene, viewport, status);
+    let draw_result =
+        paint_scene_gdi_with_side_pane(hwnd, hdc, scene, viewport, status, side_pane_lines);
     // SAFETY: hdc was acquired from this exact live hwnd above and this call
     // runs synchronously on the same Winit owner thread.
     let release_result = unsafe { ReleaseDC(hwnd, hdc) };
@@ -3455,11 +3767,23 @@ fn paint_scene_gdi(
     viewport: CanvasViewport,
     status: &str,
 ) -> std::io::Result<()> {
+    paint_scene_gdi_with_side_pane(hwnd, hdc, scene, viewport, status, None)
+}
+
+fn paint_scene_gdi_with_side_pane(
+    hwnd: isize,
+    hdc: isize,
+    scene: &CanvasScene,
+    viewport: CanvasViewport,
+    status: &str,
+    side_pane_lines: Option<&[String]>,
+) -> std::io::Result<()> {
     use windows_sys::Win32::{
         Foundation::RECT,
         Graphics::Gdi::{
-            COLOR_WINDOW, CreatePen, DeleteObject, FillRect, GetSysColorBrush, HGDIOBJ, LineTo,
-            MoveToEx, PS_DOT, PS_SOLID, SelectObject, TextOutW,
+            COLOR_WINDOW, CreatePen, DeleteObject, FillRect, GetSysColorBrush, HGDIOBJ,
+            IntersectClipRect, LineTo, MoveToEx, PS_DOT, PS_SOLID, RestoreDC, SaveDC,
+            SelectObject, TextOutW,
         },
         UI::WindowsAndMessaging::GetClientRect,
     };
@@ -3567,6 +3891,73 @@ fn paint_scene_gdi(
         }
     }
 
+    if let Some(lines) = side_pane_lines {
+        let pane_width = CORRECTION_PANE_WIDTH_PX.min(bounds.right - bounds.left).max(0);
+        if pane_width > 0 {
+            let pane = RECT {
+                left: bounds.right - pane_width,
+                top: bounds.top,
+                right: bounds.right,
+                bottom: bounds.bottom,
+            };
+            // SAFETY: hdc is the same live client DC acquired by paint_gdi_internal. SaveDC
+            // snapshots its selected objects, mapping state, and clip before the pane changes it.
+            let saved_state = unsafe { SaveDC(hdc) };
+            if saved_state == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: pane is a bounded client rectangle from GetClientRect, and the saved HDC
+            // remains live for this synchronous draw. ERROR is zero; region-type return codes
+            // are otherwise valid, including an empty clipping region.
+            let pane_result = if unsafe {
+                IntersectClipRect(hdc, pane.left, pane.top, pane.right, pane.bottom)
+            } == 0
+            {
+                Err(std::io::Error::last_os_error())
+            } else {
+                (|| {
+                    // SAFETY: pane is inside the live client area and the clipping region above
+                    // prevents the fill and all pane strings from drawing outside its rectangle.
+                    if unsafe { FillRect(hdc, &pane, background) } == 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let line_height = CORRECTION_PANE_ROW_HEIGHT_PX;
+                    let max_lines = ((bounds.bottom - bounds.top
+                        - 2 * CORRECTION_PANE_PADDING_PX)
+                        .max(0)
+                        / line_height) as usize;
+                    for (row, line) in lines.iter().take(max_lines).enumerate() {
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let wide = line.encode_utf16().collect::<Vec<_>>();
+                        let x = pane.left + CORRECTION_PANE_PADDING_PX;
+                        let y = bounds.top + CORRECTION_PANE_PADDING_PX + row as i32 * line_height;
+                        // SAFETY: `wide` is initialized UTF-16 storage with a source-bounded
+                        // length; IntersectClipRect keeps any variable-width glyphs inside pane.
+                        if unsafe { TextOutW(hdc, x, y, wide.as_ptr(), wide.len() as i32) } == 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                })()
+            };
+            // SAFETY: saved_state belongs to this exact hdc and is consumed once, on every
+            // success or failure path after SaveDC succeeded.
+            let restored = unsafe { RestoreDC(hdc, saved_state) };
+            let restore_error = if restored == 0 {
+                Some(std::io::Error::last_os_error())
+            } else {
+                None
+            };
+            match (pane_result, restore_error) {
+                (Err(primary), _) => return Err(primary),
+                (Ok(()), Some(error)) => return Err(error),
+                (Ok(()), None) => {}
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -3586,6 +3977,18 @@ mod tests {
     };
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn gdi_utf16_buffer_terminates_storage_but_excludes_nul_from_count() {
+        let text = "Vietnamese e\u{301}; emoji 👩‍💻";
+        let (wide, unit_count, cch_string) = gdi_text_buffer(text).unwrap();
+        assert_eq!(unit_count, text.encode_utf16().count());
+        assert_eq!(usize::try_from(cch_string).unwrap(), unit_count);
+        assert_eq!(wide.len(), unit_count + 1);
+        assert_eq!(wide.last().copied(), Some(0));
+        assert_eq!(String::from_utf16(&wide[..unit_count]).unwrap(), text);
+        assert!(gdi_text_buffer(&"x".repeat(MAX_GDI_TEXT_MEASURE_UNITS + 1)).is_err());
+    }
 
     fn temp_path() -> PathBuf {
         let id = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
@@ -4933,7 +5336,7 @@ mod tests {
         struct RedrawApp {
             window: Option<Window>,
             scenes: Vec<CanvasScene>,
-            pixels: Vec<(u32, u32)>,
+            pixels: Vec<(u32, u32, u32)>,
             deadline: Instant,
             failure: Option<String>,
         }
@@ -4946,7 +5349,7 @@ mod tests {
                 let attributes = Window::default_attributes()
                     .with_title("LassoInk Winit redraw fixture")
                     .with_visible(true)
-                    .with_inner_size(PhysicalSize::new(80, 120));
+                    .with_inner_size(PhysicalSize::new(480, 120));
                 match event_loop.create_window(attributes) {
                     Ok(window) => {
                         window.request_redraw();
@@ -4986,13 +5389,16 @@ mod tests {
                         return;
                     }
                 };
-                if let Err(error) = paint_gdi(
+                if let Err(error) = paint_gdi_with_side_pane(
                     window,
                     scene,
                     CanvasViewport::default(),
                     "Winit redraw fixture",
+                    &["Correction pane fixture".to_owned()],
                 ) {
-                    self.failure = Some(format!("paint_gdi failed in Winit callback: {error}"));
+                    self.failure = Some(format!(
+                        "paint_gdi_with_side_pane failed in Winit callback: {error}"
+                    ));
                     event_loop.exit();
                     return;
                 }
@@ -5012,7 +5418,16 @@ mod tests {
                         return;
                     }
                 };
-                self.pixels.push((stroke_pixel, background_pixel));
+                let pane_overlay_pixel = match read_window_pixel(hwnd, 180, 60) {
+                    Ok(pixel) => pixel,
+                    Err(error) => {
+                        self.failure = Some(format!("pane overlay pixel read failed: {error}"));
+                        event_loop.exit();
+                        return;
+                    }
+                };
+                self.pixels
+                    .push((stroke_pixel, background_pixel, pane_overlay_pixel));
                 if self.pixels.len() < self.scenes.len() {
                     window.request_redraw();
                 } else {
@@ -5057,6 +5472,11 @@ mod tests {
         };
         writer.start_stroke(target, frame, 1).unwrap();
         writer.append_sample(physical).unwrap();
+        let mut panel_crossing_sample = sample(2, 200, 60);
+        panel_crossing_sample.session_id = "session-winit-redraw".to_owned();
+        panel_crossing_sample.config_id = Some("config-winit-redraw".to_owned());
+        panel_crossing_sample.stroke_id = Some("winit-redraw-stroke".to_owned());
+        writer.append_sample(panel_crossing_sample).unwrap();
         let commit_action = writer
             .commit_stroke(
                 StrokeRef {
@@ -5103,18 +5523,22 @@ mod tests {
         assert!(app.failure.is_none(), "{:?}", app.failure);
         assert_eq!(app.pixels.len(), 4);
         let [
-            (empty_before, background_before),
-            (committed, committed_background),
-            (undone, undone_background),
-            (redone, redone_background),
+            (empty_before, background_before, empty_pane_overlay),
+            (committed, committed_background, committed_pane_overlay),
+            (undone, undone_background, undone_pane_overlay),
+            (redone, redone_background, redone_pane_overlay),
         ] = app.pixels.as_slice()
         else {
             panic!("four Winit redraw states were observed");
         };
         assert_eq!(empty_before, background_before);
+        assert_eq!(empty_pane_overlay, background_before);
         assert_ne!(committed, committed_background);
+        assert_eq!(committed_pane_overlay, committed_background);
         assert_eq!(undone, undone_background);
+        assert_eq!(undone_pane_overlay, undone_background);
         assert_ne!(redone, redone_background);
+        assert_eq!(redone_pane_overlay, redone_background);
         assert_eq!(committed, redone);
         assert_eq!(committed_background, redone_background);
         fs::remove_file(path).unwrap();
@@ -5258,6 +5682,41 @@ mod tests {
             native_history_count: 1,
             samples: vec![sample],
         }
+    }
+
+    #[test]
+    fn ui_routed_direct_batch_retains_raw_rows_without_stroke_lifecycle() {
+        let sample = direct_sample(POINTER_FLAG_INCONTACT, 94);
+        let expected_position = sample.position;
+        let expected_pressure = sample.pressure_raw;
+        let batch = direct_batch(PointerMessageKind::Down, sample);
+        let events = CanvasInputTracker::direct_batch_to_unowned_events(
+            &batch,
+            "canvas-project",
+            "session-a",
+            Some("config-a"),
+        )
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            DirectCaptureEvent::PhysicalSample(sample)
+                if sample.stroke_id.is_none()
+                    && sample.position.as_ref().is_some_and(|position| {
+                        position.x_raw == i64::from(expected_position.pt_pixel_location_raw.x)
+                            && position.y_raw == i64::from(expected_position.pt_pixel_location_raw.y)
+                    })
+                    && sample.pressure.as_ref().is_some_and(|pressure| {
+                        pressure.value_raw == u64::from(expected_pressure)
+                    })
+        ));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            DirectCaptureEvent::StrokeStarted { .. }
+                | DirectCaptureEvent::StrokeCommitRequested { .. }
+                | DirectCaptureEvent::StrokeInterrupted { .. }
+        )));
     }
 
     fn tool_sample(flags: u32, frame_id: u32, x: i32, y: i32) -> OwnedPointerSample {

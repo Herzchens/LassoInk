@@ -14,7 +14,8 @@ use crate::{
     canvas::DirectCaptureEvent,
     journal::{
         EditCommand, JournalEvent, JournalMetadata, JournalRecord, JournalReplayState,
-        JournalWriter, MetadataScope, StrokeInterruptionReason,
+        JournalWriter, MetadataScope, RecognitionProjectionV1, RegionCorrectionV1,
+        StrokeInterruptionReason,
     },
 };
 
@@ -41,6 +42,21 @@ enum Command {
         app_arrival_elapsed_ns: u128,
     },
     Metadata(JournalMetadata),
+    SnapshotForConvert {
+        batch_id: u64,
+    },
+    RecognitionProjection {
+        batch_id: u64,
+        projection: Box<RecognitionProjectionV1>,
+        app_arrival_elapsed_ns: u128,
+    },
+    /// Staged writer plumbing for the next correction-editor UI unit.
+    #[allow(dead_code)]
+    RegionCorrection {
+        batch_id: u64,
+        correction: Box<RegionCorrectionV1>,
+        app_arrival_elapsed_ns: u128,
+    },
     Finish {
         app_arrival_elapsed_ns: u128,
         incomplete_reason: Option<String>,
@@ -69,6 +85,28 @@ pub(crate) enum ProjectWriterAck {
     },
     MetadataCommitted(JournalRecord),
     MetadataFailed(String),
+    ConvertSnapshot {
+        batch_id: u64,
+        state: Box<JournalReplayState>,
+    },
+    RecognitionProjectionCommitted {
+        batch_id: u64,
+        record: JournalRecord,
+    },
+    RecognitionProjectionFailed {
+        batch_id: u64,
+        error: String,
+        writer_poisoned: bool,
+    },
+    RegionCorrectionCommitted {
+        batch_id: u64,
+        record: JournalRecord,
+    },
+    RegionCorrectionFailed {
+        batch_id: u64,
+        error: String,
+        writer_poisoned: bool,
+    },
     Finished(Result<(), String>),
 }
 
@@ -84,6 +122,21 @@ pub(crate) enum ProjectQueueError {
         events: Vec<DirectCaptureEvent>,
     },
     QueueFull,
+    WorkerStopped,
+}
+
+#[derive(Debug)]
+pub(crate) enum ProjectionQueueError {
+    QueueFull(Box<RecognitionProjectionV1>),
+    WorkerStopped,
+}
+
+/// Queue result for the staged correction-editor writer API. The current
+/// source unit exercises the API in tests before the UI caller is added.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum CorrectionQueueError {
+    QueueFull(Box<RegionCorrectionV1>),
     WorkerStopped,
 }
 
@@ -289,6 +342,93 @@ impl ProjectWriterHandle {
                                 break;
                             }
                         }
+                        Command::SnapshotForConvert { batch_id } => {
+                            if ack_sender
+                                .send(ProjectWriterAck::ConvertSnapshot {
+                                    batch_id,
+                                    state: Box::new(writer.replay_state().clone()),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Command::RecognitionProjection {
+                            batch_id,
+                            projection,
+                            app_arrival_elapsed_ns,
+                        } => {
+                            let result = writer.append_recognition_projection_record(
+                                *projection,
+                                app_arrival_elapsed_ns,
+                            );
+                            match result {
+                                Ok(record) => {
+                                    if ack_sender
+                                        .send(ProjectWriterAck::RecognitionProjectionCommitted {
+                                            batch_id,
+                                            record,
+                                        })
+                                        .is_err()
+                                        || writer.is_poisoned()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(error) => {
+                                    let writer_poisoned = writer.is_poisoned();
+                                    if ack_sender
+                                        .send(ProjectWriterAck::RecognitionProjectionFailed {
+                                            batch_id,
+                                            error: error.to_string(),
+                                            writer_poisoned,
+                                        })
+                                        .is_err()
+                                        || writer_poisoned
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Command::RegionCorrection {
+                            batch_id,
+                            correction,
+                            app_arrival_elapsed_ns,
+                        } => {
+                            let result = writer.append_region_correction_record(
+                                *correction,
+                                app_arrival_elapsed_ns,
+                            );
+                            match result {
+                                Ok(record) => {
+                                    if ack_sender
+                                        .send(ProjectWriterAck::RegionCorrectionCommitted {
+                                            batch_id,
+                                            record,
+                                        })
+                                        .is_err()
+                                        || writer.is_poisoned()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(error) => {
+                                    let writer_poisoned = writer.is_poisoned();
+                                    if ack_sender
+                                        .send(ProjectWriterAck::RegionCorrectionFailed {
+                                            batch_id,
+                                            error: error.to_string(),
+                                            writer_poisoned,
+                                        })
+                                        .is_err()
+                                        || writer_poisoned
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         Command::Finish {
                             app_arrival_elapsed_ns,
                             incomplete_reason,
@@ -399,6 +539,95 @@ impl ProjectWriterHandle {
         metadata: JournalMetadata,
     ) -> Result<(), ProjectQueueError> {
         self.try_send(Command::Metadata(metadata))
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        !self.worker_stopped && self.pending_commands == 0 && self.pending_samples == 0
+    }
+
+    /// Enqueues an ordered view snapshot. Its acknowledgement observes all
+    /// commands accepted before this one after their journal syncs completed.
+    pub(crate) fn try_snapshot_for_convert(
+        &mut self,
+        batch_id: u64,
+    ) -> Result<(), ProjectQueueError> {
+        self.try_send(Command::SnapshotForConvert { batch_id })
+    }
+
+    /// Enqueues a derived projection after the exact frozen journal snapshot.
+    /// Journal validation runs atomically in the writer immediately before
+    /// append, so stale conversion failure does not poison a healthy writer.
+    pub(crate) fn try_append_recognition_projection(
+        &mut self,
+        batch_id: u64,
+        projection: RecognitionProjectionV1,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<(), ProjectionQueueError> {
+        if self.worker_stopped {
+            return Err(ProjectionQueueError::WorkerStopped);
+        }
+        if self.pending_commands >= COMMAND_CAPACITY {
+            return Err(ProjectionQueueError::QueueFull(Box::new(projection)));
+        }
+        match self.sender.try_send(Command::RecognitionProjection {
+            batch_id,
+            projection: Box::new(projection),
+            app_arrival_elapsed_ns,
+        }) {
+            Ok(()) => {
+                self.pending_commands += 1;
+                Ok(())
+            }
+            Err(TrySendError::Full(Command::RecognitionProjection { projection, .. })) => {
+                Err(ProjectionQueueError::QueueFull(projection))
+            }
+            Err(TrySendError::Disconnected(Command::RecognitionProjection { .. })) => {
+                self.worker_stopped = true;
+                Err(ProjectionQueueError::WorkerStopped)
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                unreachable!("projection command is preserved by try_append_recognition_projection")
+            }
+        }
+    }
+
+    /// Enqueues one immutable region correction. Queue saturation returns the
+    /// owned correction so the caller can retry exactly once after capacity
+    /// returns; journal validation and sync still happen in sequence on the
+    /// writer thread before the committed acknowledgement.
+    #[allow(dead_code)]
+    pub(crate) fn try_append_region_correction(
+        &mut self,
+        batch_id: u64,
+        correction: RegionCorrectionV1,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<(), CorrectionQueueError> {
+        if self.worker_stopped {
+            return Err(CorrectionQueueError::WorkerStopped);
+        }
+        if self.pending_commands >= COMMAND_CAPACITY {
+            return Err(CorrectionQueueError::QueueFull(Box::new(correction)));
+        }
+        match self.sender.try_send(Command::RegionCorrection {
+            batch_id,
+            correction: Box::new(correction),
+            app_arrival_elapsed_ns,
+        }) {
+            Ok(()) => {
+                self.pending_commands += 1;
+                Ok(())
+            }
+            Err(TrySendError::Full(Command::RegionCorrection { correction, .. })) => {
+                Err(CorrectionQueueError::QueueFull(correction))
+            }
+            Err(TrySendError::Disconnected(Command::RegionCorrection { .. })) => {
+                self.worker_stopped = true;
+                Err(CorrectionQueueError::WorkerStopped)
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                unreachable!("correction command is preserved by try_append_region_correction")
+            }
+        }
     }
 
     fn try_send(&mut self, command: Command) -> Result<(), ProjectQueueError> {
@@ -523,9 +752,13 @@ fn project_finalization_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::correction::CorrectionSession;
     use crate::journal::{
-        JournalHeader, NativeTimestamp, PhysicalSample, RawPosition, RawPressure, StrokeRef,
-        StrokeViewFrame, read_journal,
+        JournalHeader, NativeTimestamp, PhysicalSample, ProjectionInkBindingV1,
+        ProjectionInputModalityV1, ProjectionProviderProvenanceV1, ProjectionStrokeRangeV1,
+        ProjectionStrokeViewV1, RawPosition, RawPressure, RecognitionCandidateV1,
+        RecognitionProjectionV1, RegionCorrectionActionV1, StrokeRef, StrokeViewFrame,
+        read_journal,
     };
     use std::{
         fs,
@@ -607,6 +840,325 @@ mod tests {
         }
     }
 
+    fn correction_test_target(stroke_id: &str) -> StrokeRef {
+        StrokeRef {
+            journal_id: "project-runtime-test".to_owned(),
+            session_id: "capture-session".to_owned(),
+            source_api: "direct-wm-pointer-pen-history".to_owned(),
+            device_id: Some("session-scoped-device-17".to_owned()),
+            pointer_id: Some(17),
+            stroke_id: stroke_id.to_owned(),
+        }
+    }
+
+    fn append_correction_test_projection(
+        writer: &mut JournalWriter,
+        target: &StrokeRef,
+        projection_id: &str,
+    ) -> RecognitionProjectionV1 {
+        let frame = StrokeViewFrame::default();
+        writer
+            .start_stroke_record(target.clone(), frame, 9)
+            .unwrap();
+        writer.append_sample_record(started_sample(target)).unwrap();
+        writer.commit_stroke_record(target.clone(), 11).unwrap();
+
+        let state = writer.replay_state().clone();
+        let sample_sequence = state
+            .physical_samples
+            .iter()
+            .find(|sample| sample.sample.stroke_ref(&state.journal_id).as_ref() == Some(target))
+            .unwrap()
+            .sequence;
+        let projection = RecognitionProjectionV1 {
+            projection_id: projection_id.to_owned(),
+            ink: ProjectionInkBindingV1 {
+                journal_id: state.journal_id.clone(),
+                logical_revision: state.logical_revision,
+                last_sequence: state.last_sequence,
+                region_id: "region-correction-test".to_owned(),
+                line_id: Some("line-correction-test".to_owned()),
+                input_view_id: "input-view-v1-0000000000000001".to_owned(),
+                ink_binding_sha256: "a".repeat(64),
+                selected_strokes: vec![target.clone()],
+                source_sample_sequences: vec![sample_sequence],
+                stroke_views: vec![ProjectionStrokeViewV1 {
+                    stroke: target.clone(),
+                    frame,
+                }],
+            },
+            provider: ProjectionProviderProvenanceV1 {
+                provider_id: "external-online-provider".to_owned(),
+                provider_version: "synthetic-test-version".to_owned(),
+                model_version: None,
+                resource_version: None,
+                configuration_id: "operator-test-config".to_owned(),
+                configuration_fingerprint: "provider-config-v1-fnv64-0000000000000001".to_owned(),
+            },
+            candidates: vec![RecognitionCandidateV1 {
+                rank: 0,
+                recognized_text: "immutable provider candidate".to_owned(),
+                native_score_raw: None,
+                stroke_ranges: vec![ProjectionStrokeRangeV1 {
+                    stroke: target.clone(),
+                    first_journal_sequence: sample_sequence,
+                    last_journal_sequence: sample_sequence,
+                }],
+            }],
+            input_modalities: Some(vec![ProjectionInputModalityV1::OnlineStrokes]),
+            generated_raster: None,
+        };
+        writer
+            .append_recognition_projection_record(projection.clone(), 12)
+            .unwrap();
+        projection
+    }
+
+    #[test]
+    fn region_correction_queue_full_retries_once_and_acknowledges_after_durable_append() {
+        let path = temp_project("region-correction-queue-retry");
+        let mut journal_writer = new_writer(&path);
+        let target = correction_test_target("correction-queue-stroke");
+        let projection = append_correction_test_projection(
+            &mut journal_writer,
+            &target,
+            "correction-queue-projection",
+        );
+        let projection_snapshot = journal_writer.replay_state().clone();
+        let mut session =
+            CorrectionSession::open(&projection_snapshot, &projection.projection_id).unwrap();
+        session.set_text("durable human correction").unwrap();
+        let expected_correction = session
+            .build_correction("correction-queue-row")
+            .unwrap()
+            .unwrap();
+
+        let mut project_writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        for batch_id in 1..=8 {
+            project_writer.try_snapshot_for_convert(batch_id).unwrap();
+        }
+        let correction =
+            match project_writer.try_append_region_correction(9, expected_correction.clone(), 13) {
+                Err(CorrectionQueueError::QueueFull(correction)) => *correction,
+                other => panic!("expected an owned correction on queue saturation, got {other:?}"),
+            };
+
+        let mut snapshots_acknowledged = 0;
+        for _ in 0..2_000 {
+            snapshots_acknowledged += project_writer
+                .drain_acks()
+                .iter()
+                .filter(|ack| matches!(ack, ProjectWriterAck::ConvertSnapshot { .. }))
+                .count();
+            if snapshots_acknowledged == 8 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(snapshots_acknowledged, 8);
+        assert!(project_writer.is_idle());
+        project_writer
+            .try_append_region_correction(9, correction, 13)
+            .unwrap();
+
+        let mut hover = started_sample(&target);
+        hover.source_sequence = 2;
+        hover.app_arrival_elapsed_ns = 14;
+        hover.stroke_id = None;
+        hover.source_device_id = None;
+        hover.pointer_id = None;
+        project_writer
+            .try_capture_batch(
+                10,
+                vec![DirectCaptureEvent::PhysicalSample(Box::new(hover.clone()))],
+            )
+            .unwrap();
+
+        let mut correction_committed = false;
+        let mut capture_committed = false;
+        for _ in 0..2_000 {
+            for acknowledgement in project_writer.drain_acks() {
+                match acknowledgement {
+                    ProjectWriterAck::RegionCorrectionCommitted {
+                        batch_id: 9,
+                        record,
+                    } => match record.event {
+                        JournalEvent::RegionCorrection { correction, .. } => {
+                            assert_eq!(*correction, expected_correction);
+                            correction_committed = true;
+                        }
+                        other => panic!("unexpected correction record event: {other:?}"),
+                    },
+                    ProjectWriterAck::CaptureCommitted {
+                        batch_id: 10,
+                        records,
+                    } => {
+                        assert_eq!(records.len(), 1);
+                        assert!(matches!(
+                            &records[0].event,
+                            JournalEvent::PhysicalSample(sample) if **sample == hover
+                        ));
+                        capture_committed = true;
+                    }
+                    ProjectWriterAck::RegionCorrectionFailed {
+                        batch_id, error, ..
+                    } => {
+                        panic!("correction batch {batch_id} failed unexpectedly: {error}");
+                    }
+                    ProjectWriterAck::CaptureFailed {
+                        batch_id, error, ..
+                    } => {
+                        panic!("capture batch {batch_id} failed after correction commit: {error}");
+                    }
+                    _ => {}
+                }
+            }
+            if correction_committed && capture_committed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(correction_committed);
+        assert!(capture_committed);
+        assert!(project_writer.is_idle());
+        session.acknowledge_committed(&expected_correction).unwrap();
+        assert!(!session.is_dirty());
+        project_writer.finish(20, None).unwrap();
+
+        let persisted = read_journal(&path).unwrap();
+        assert_eq!(persisted.state.recognition_projections.len(), 1);
+        assert_eq!(persisted.state.region_corrections.len(), 1);
+        assert_eq!(
+            persisted.state.region_corrections[0].correction.action,
+            RegionCorrectionActionV1::SetText("durable human correction".to_owned())
+        );
+        assert_eq!(persisted.state.physical_samples.len(), 2);
+        assert_eq!(
+            persisted.state.physical_samples[0].sample,
+            started_sample(&target)
+        );
+        assert_eq!(persisted.state.physical_samples[1].sample, hover);
+        assert_eq!(
+            persisted.state.recognition_projections[0]
+                .projection
+                .candidates[0]
+                .recognized_text,
+            "immutable provider candidate"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_region_correction_is_recoverable_and_retains_draft_while_capture_continues() {
+        let path = temp_project("region-correction-stale-recoverable");
+        let mut journal_writer = new_writer(&path);
+        let target = correction_test_target("correction-stale-stroke");
+        let projection = append_correction_test_projection(
+            &mut journal_writer,
+            &target,
+            "correction-stale-projection",
+        );
+        let projection_snapshot = journal_writer.replay_state().clone();
+        let mut session =
+            CorrectionSession::open(&projection_snapshot, &projection.projection_id).unwrap();
+        session.set_text("copyable stale draft").unwrap();
+        let stale_correction = session
+            .build_correction("correction-stale-row")
+            .unwrap()
+            .unwrap();
+        journal_writer
+            .apply_edit_action_record(
+                13,
+                EditCommand::Tombstone {
+                    targets: vec![target.clone()],
+                },
+            )
+            .unwrap();
+        assert_ne!(
+            journal_writer.replay_state().logical_revision,
+            stale_correction.ink.logical_revision
+        );
+
+        let mut project_writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        project_writer
+            .try_append_region_correction(20, stale_correction, 14)
+            .unwrap();
+        let mut hover = started_sample(&target);
+        hover.source_sequence = 2;
+        hover.app_arrival_elapsed_ns = 15;
+        hover.stroke_id = None;
+        hover.source_device_id = None;
+        hover.pointer_id = None;
+        project_writer
+            .try_capture_batch(
+                21,
+                vec![DirectCaptureEvent::PhysicalSample(Box::new(hover.clone()))],
+            )
+            .unwrap();
+
+        let mut stale_failure = false;
+        let mut capture_committed = false;
+        for _ in 0..2_000 {
+            for acknowledgement in project_writer.drain_acks() {
+                match acknowledgement {
+                    ProjectWriterAck::RegionCorrectionFailed {
+                        batch_id: 20,
+                        writer_poisoned,
+                        ..
+                    } => {
+                        assert!(!writer_poisoned);
+                        stale_failure = true;
+                    }
+                    ProjectWriterAck::CaptureCommitted {
+                        batch_id: 21,
+                        records,
+                    } => {
+                        assert_eq!(records.len(), 1);
+                        capture_committed = true;
+                    }
+                    ProjectWriterAck::RegionCorrectionCommitted { .. } => {
+                        panic!("stale correction must not commit");
+                    }
+                    ProjectWriterAck::CaptureFailed {
+                        batch_id, error, ..
+                    } => {
+                        panic!("capture batch {batch_id} failed after stale correction: {error}");
+                    }
+                    _ => {}
+                }
+            }
+            if stale_failure && capture_committed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(stale_failure);
+        assert!(capture_committed);
+        assert!(project_writer.is_idle());
+        assert_eq!(session.text(), "copyable stale draft");
+        assert!(session.is_dirty());
+        assert_eq!(
+            session
+                .build_correction("correction-stale-row-retry")
+                .unwrap()
+                .unwrap()
+                .action,
+            RegionCorrectionActionV1::SetText("copyable stale draft".to_owned())
+        );
+        project_writer.finish(16, None).unwrap();
+
+        let persisted = read_journal(&path).unwrap();
+        assert_eq!(persisted.state.recognition_projections.len(), 1);
+        assert!(persisted.state.region_corrections.is_empty());
+        assert_eq!(persisted.state.physical_samples.len(), 2);
+        assert_eq!(
+            persisted.state.physical_samples[0].sample,
+            started_sample(&target)
+        );
+        assert_eq!(persisted.state.physical_samples[1].sample, hover);
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn project_writer_commits_native_up_then_durable_move_projection() {
         let path = temp_project("commit-move");
@@ -672,6 +1224,642 @@ mod tests {
                 ..
             } if targets == std::slice::from_ref(&target)
         )));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn convert_snapshot_commands_obey_the_existing_bounded_writer_queue() {
+        let path = temp_project("convert-snapshot-bounded-queue");
+        let writer = new_writer(&path);
+        let mut project_writer = ProjectWriterHandle::spawn(writer).unwrap();
+        for batch_id in 1..=8 {
+            project_writer.try_snapshot_for_convert(batch_id).unwrap();
+        }
+        assert!(matches!(
+            project_writer.try_snapshot_for_convert(9),
+            Err(ProjectQueueError::QueueFull)
+        ));
+
+        let mut snapshot_acknowledgements = 0;
+        for _ in 0..2_000 {
+            snapshot_acknowledgements += project_writer
+                .drain_acks()
+                .iter()
+                .filter(|ack| matches!(ack, ProjectWriterAck::ConvertSnapshot { .. }))
+                .count();
+            if snapshot_acknowledgements == 8 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(snapshot_acknowledgements, 8);
+        assert!(project_writer.is_idle());
+        project_writer.finish(1, None).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn saturated_projection_queue_can_retry_once_then_capture_continues() {
+        let path = temp_project("convert-projection-queue-retry");
+        let mut journal_writer = JournalWriter::create(
+            path.clone(),
+            JournalHeader {
+                journal_id: "project-runtime-queue-retry".to_owned(),
+                session_id: "capture-session".to_owned(),
+                config_id: Some("config-a".to_owned()),
+                device_model_declared: None,
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        let target = StrokeRef {
+            journal_id: "project-runtime-queue-retry".to_owned(),
+            session_id: "capture-session".to_owned(),
+            source_api: "direct-wm-pointer-pen-history".to_owned(),
+            device_id: Some("session-scoped-device-4".to_owned()),
+            pointer_id: Some(24),
+            stroke_id: "queue-retry-stroke".to_owned(),
+        };
+        let frame = StrokeViewFrame::default();
+        journal_writer
+            .start_stroke(target.clone(), frame, 9)
+            .unwrap();
+        journal_writer
+            .append_sample(started_sample(&target))
+            .unwrap();
+        journal_writer.commit_stroke(target.clone(), 11).unwrap();
+        let snapshot = journal_writer.replay_state().clone();
+        let source_sequence = snapshot
+            .physical_samples
+            .iter()
+            .find(|sample| sample.sample.stroke_ref(&snapshot.journal_id).as_ref() == Some(&target))
+            .unwrap()
+            .sequence;
+        let binding = ProjectionInkBindingV1 {
+            journal_id: snapshot.journal_id.clone(),
+            logical_revision: snapshot.logical_revision,
+            last_sequence: snapshot.last_sequence,
+            region_id: "region-queue-retry".to_owned(),
+            line_id: Some("line-1".to_owned()),
+            input_view_id: "input-view-v1-0000000000000001".to_owned(),
+            ink_binding_sha256: "a".repeat(64),
+            selected_strokes: vec![target.clone()],
+            source_sample_sequences: vec![source_sequence],
+            stroke_views: vec![ProjectionStrokeViewV1 {
+                stroke: target.clone(),
+                frame,
+            }],
+        };
+        let projection = RecognitionProjectionV1 {
+            projection_id: "queue-retry-projection".to_owned(),
+            ink: binding,
+            provider: ProjectionProviderProvenanceV1 {
+                provider_id: "external-raster-provider".to_owned(),
+                provider_version: "synthetic-test".to_owned(),
+                model_version: None,
+                resource_version: None,
+                configuration_id: "operator-test-config".to_owned(),
+                configuration_fingerprint: "provider-config-v1-fnv64-0000000000000001".to_owned(),
+            },
+            candidates: vec![RecognitionCandidateV1 {
+                rank: 0,
+                recognized_text: "synthetic queued projection".to_owned(),
+                native_score_raw: None,
+                stroke_ranges: vec![ProjectionStrokeRangeV1 {
+                    stroke: target.clone(),
+                    first_journal_sequence: source_sequence,
+                    last_journal_sequence: source_sequence,
+                }],
+            }],
+            generated_raster: None,
+            input_modalities: Some(vec![crate::journal::ProjectionInputModalityV1::Raster]),
+        };
+        let mut project_writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        for batch_id in 1..=8 {
+            project_writer.try_snapshot_for_convert(batch_id).unwrap();
+        }
+        let projection = match project_writer.try_append_recognition_projection(9, projection, 12) {
+            Err(ProjectionQueueError::QueueFull(projection)) => projection,
+            other => panic!("expected a recoverable full queue, got {other:?}"),
+        };
+
+        let mut snapshot_ack_count = 0;
+        for _ in 0..2_000 {
+            snapshot_ack_count += project_writer
+                .drain_acks()
+                .iter()
+                .filter(|ack| matches!(ack, ProjectWriterAck::ConvertSnapshot { .. }))
+                .count();
+            if snapshot_ack_count == 8 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(snapshot_ack_count, 8);
+        assert!(project_writer.is_idle());
+        project_writer
+            .try_append_recognition_projection(9, *projection, 12)
+            .unwrap();
+
+        let mut hover = started_sample(&target);
+        hover.source_sequence = 2;
+        hover.app_arrival_elapsed_ns = 13;
+        hover.stroke_id = None;
+        hover.source_device_id = None;
+        hover.pointer_id = None;
+        project_writer
+            .try_capture_batch(
+                10,
+                vec![DirectCaptureEvent::PhysicalSample(Box::new(hover.clone()))],
+            )
+            .unwrap();
+
+        let mut projection_ack_count = 0;
+        let mut capture_ack_seen = false;
+        for _ in 0..2_000 {
+            for acknowledgement in project_writer.drain_acks() {
+                match acknowledgement {
+                    ProjectWriterAck::RecognitionProjectionCommitted { batch_id: 9, .. } => {
+                        projection_ack_count += 1;
+                    }
+                    ProjectWriterAck::CaptureCommitted {
+                        batch_id: 10,
+                        records,
+                    } => {
+                        assert_eq!(records.len(), 1);
+                        assert!(matches!(
+                            &records[0].event,
+                            JournalEvent::PhysicalSample(sample) if **sample == hover
+                        ));
+                        capture_ack_seen = true;
+                    }
+                    other => panic!("unexpected ACK after projection retry: {other:?}"),
+                }
+            }
+            if projection_ack_count == 1 && capture_ack_seen {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(projection_ack_count, 1);
+        assert!(capture_ack_seen);
+        project_writer.finish(14, None).unwrap();
+        let persisted = read_journal(&path).unwrap();
+        assert_eq!(persisted.state.recognition_projections.len(), 1);
+        assert_eq!(
+            persisted.state.recognition_projections[0]
+                .projection
+                .projection_id,
+            "queue-retry-projection"
+        );
+        assert_eq!(persisted.state.physical_samples.len(), 2);
+        assert_eq!(persisted.state.physical_samples[1].sample, hover);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ordered_convert_snapshot_and_stale_projection_rejection_do_not_poison_capture_writer() {
+        fn next_ack(
+            writer: &mut ProjectWriterHandle,
+            predicate: impl Fn(&ProjectWriterAck) -> bool,
+        ) -> ProjectWriterAck {
+            for _ in 0..2_000 {
+                for ack in writer.drain_acks() {
+                    if predicate(&ack) {
+                        return ack;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            panic!("project writer did not produce the expected ACK");
+        }
+
+        let path = temp_project("convert-snapshot-stale-append");
+        let journal_writer = JournalWriter::create(
+            path.clone(),
+            JournalHeader {
+                journal_id: "project-runtime-convert-test".to_owned(),
+                session_id: "capture-session".to_owned(),
+                config_id: Some("config-a".to_owned()),
+                device_model_declared: None,
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        let target = StrokeRef {
+            journal_id: "project-runtime-convert-test".to_owned(),
+            session_id: "capture-session".to_owned(),
+            source_api: "direct-wm-pointer-pen-history".to_owned(),
+            device_id: Some("session-scoped-device-2".to_owned()),
+            pointer_id: Some(22),
+            stroke_id: "convert-stroke".to_owned(),
+        };
+        let frame = StrokeViewFrame::default();
+        let first_sample = started_sample(&target);
+        let mut project_writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        project_writer
+            .try_capture_batch(
+                1,
+                vec![
+                    DirectCaptureEvent::StrokeStarted {
+                        target: target.clone(),
+                        view_frame: frame,
+                        app_arrival_elapsed_ns: 9,
+                    },
+                    DirectCaptureEvent::PhysicalSample(Box::new(first_sample.clone())),
+                ],
+            )
+            .unwrap();
+        project_writer.try_snapshot_for_convert(2).unwrap();
+
+        let mut capture_ack_seen = false;
+        let mut snapshot_state = None;
+        for _ in 0..2_000 {
+            for ack in project_writer.drain_acks() {
+                match ack {
+                    ProjectWriterAck::CaptureCommitted {
+                        batch_id: 1,
+                        records,
+                    } => {
+                        assert_eq!(records.len(), 2);
+                        capture_ack_seen = true;
+                    }
+                    ProjectWriterAck::ConvertSnapshot { batch_id: 2, state } => {
+                        snapshot_state = Some(*state);
+                    }
+                    _ => {}
+                }
+            }
+            if capture_ack_seen && snapshot_state.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let snapshot_state = snapshot_state.expect("ordered snapshot must receive an ACK");
+        assert!(capture_ack_seen);
+        assert_eq!(snapshot_state.last_sequence, 2);
+        assert_eq!(snapshot_state.physical_samples.len(), 1);
+        assert_eq!(snapshot_state.stroke_starts.len(), 1);
+
+        let binding = ProjectionInkBindingV1 {
+            journal_id: snapshot_state.journal_id.clone(),
+            logical_revision: snapshot_state.logical_revision,
+            last_sequence: snapshot_state.last_sequence,
+            region_id: "region-queue-test".to_owned(),
+            line_id: Some("line-1".to_owned()),
+            input_view_id: "input-view-v1-0000000000000001".to_owned(),
+            ink_binding_sha256: "a".repeat(64),
+            selected_strokes: vec![target.clone()],
+            source_sample_sequences: vec![2],
+            stroke_views: vec![ProjectionStrokeViewV1 {
+                stroke: target.clone(),
+                frame,
+            }],
+        };
+        let stale_projection = RecognitionProjectionV1 {
+            projection_id: "convert-queue-projection".to_owned(),
+            ink: binding,
+            provider: ProjectionProviderProvenanceV1 {
+                provider_id: "local-test-provider".to_owned(),
+                provider_version: "test-version".to_owned(),
+                model_version: None,
+                resource_version: None,
+                configuration_id: "operator-test-config".to_owned(),
+                configuration_fingerprint: "provider-config-v1-fnv64-0000000000000001".to_owned(),
+            },
+            generated_raster: None,
+            input_modalities: None,
+            candidates: vec![RecognitionCandidateV1 {
+                rank: 0,
+                recognized_text: "test candidate".to_owned(),
+                native_score_raw: None,
+                stroke_ranges: vec![ProjectionStrokeRangeV1 {
+                    stroke: target.clone(),
+                    first_journal_sequence: 2,
+                    last_journal_sequence: 2,
+                }],
+            }],
+        };
+
+        let mut later_selected_sample = started_sample(&target);
+        later_selected_sample.source_sequence = 2;
+        later_selected_sample.app_arrival_elapsed_ns = 20;
+        later_selected_sample.position.as_mut().unwrap().x_raw = 101;
+        let second_sample = later_selected_sample.clone();
+        project_writer
+            .try_capture_batch(
+                3,
+                vec![DirectCaptureEvent::PhysicalSample(Box::new(
+                    later_selected_sample,
+                ))],
+            )
+            .unwrap();
+        project_writer
+            .try_append_recognition_projection(4, stale_projection, 21)
+            .unwrap();
+        let mut hover = started_sample(&target);
+        hover.stroke_id = None;
+        hover.source_device_id = None;
+        hover.pointer_id = None;
+        hover.source_sequence = 3;
+        hover.app_arrival_elapsed_ns = 22;
+        project_writer
+            .try_capture_batch(
+                5,
+                vec![DirectCaptureEvent::PhysicalSample(Box::new(hover.clone()))],
+            )
+            .unwrap();
+
+        let mut stale_failure_seen = false;
+        let mut later_capture_seen = false;
+        for _ in 0..2_000 {
+            for ack in project_writer.drain_acks() {
+                match ack {
+                    ProjectWriterAck::RecognitionProjectionFailed {
+                        batch_id: 4,
+                        writer_poisoned,
+                        ..
+                    } => {
+                        assert!(!writer_poisoned);
+                        stale_failure_seen = true;
+                    }
+                    ProjectWriterAck::CaptureCommitted {
+                        batch_id: 5,
+                        records,
+                    } => {
+                        assert_eq!(records.len(), 1);
+                        later_capture_seen = true;
+                    }
+                    ProjectWriterAck::CaptureFailed {
+                        batch_id, error, ..
+                    } => {
+                        panic!(
+                            "capture batch {batch_id} failed after a recoverable stale conversion: {error}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            if stale_failure_seen && later_capture_seen {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(stale_failure_seen);
+        assert!(later_capture_seen);
+        assert!(project_writer.is_idle());
+
+        project_writer.try_snapshot_for_convert(6).unwrap();
+        let fresh_snapshot = match next_ack(&mut project_writer, |ack| {
+            matches!(ack, ProjectWriterAck::ConvertSnapshot { batch_id: 6, .. })
+        }) {
+            ProjectWriterAck::ConvertSnapshot { state, .. } => *state,
+            _ => unreachable!("predicate accepts only the requested snapshot acknowledgement"),
+        };
+        assert_eq!(fresh_snapshot.last_sequence, 4);
+        assert_eq!(fresh_snapshot.physical_samples.len(), 3);
+        let fresh_sample_sequences = fresh_snapshot
+            .physical_samples
+            .iter()
+            .filter(|stored| {
+                stored
+                    .sample
+                    .stroke_ref(&fresh_snapshot.journal_id)
+                    .as_ref()
+                    == Some(&target)
+            })
+            .map(|stored| stored.sequence)
+            .collect::<Vec<_>>();
+        let fresh_binding = ProjectionInkBindingV1 {
+            journal_id: fresh_snapshot.journal_id.clone(),
+            logical_revision: fresh_snapshot.logical_revision,
+            last_sequence: fresh_snapshot.last_sequence,
+            region_id: "region-queue-test-fresh".to_owned(),
+            line_id: Some("line-1".to_owned()),
+            input_view_id: "input-view-v1-0000000000000002".to_owned(),
+            ink_binding_sha256: "b".repeat(64),
+            selected_strokes: vec![target.clone()],
+            source_sample_sequences: fresh_sample_sequences.clone(),
+            stroke_views: vec![ProjectionStrokeViewV1 {
+                stroke: target.clone(),
+                frame,
+            }],
+        };
+        let recovered_projection = RecognitionProjectionV1 {
+            projection_id: "convert-queue-recovered-projection".to_owned(),
+            ink: fresh_binding,
+            provider: ProjectionProviderProvenanceV1 {
+                provider_id: "local-test-provider".to_owned(),
+                provider_version: "test-version".to_owned(),
+                model_version: None,
+                resource_version: None,
+                configuration_id: "operator-test-config".to_owned(),
+                configuration_fingerprint: "provider-config-v1-fnv64-0000000000000001".to_owned(),
+            },
+            generated_raster: None,
+            input_modalities: None,
+            candidates: vec![RecognitionCandidateV1 {
+                rank: 0,
+                recognized_text: "recovered candidate".to_owned(),
+                native_score_raw: None,
+                stroke_ranges: vec![ProjectionStrokeRangeV1 {
+                    stroke: target.clone(),
+                    first_journal_sequence: fresh_sample_sequences[0],
+                    last_journal_sequence: *fresh_sample_sequences.last().unwrap(),
+                }],
+            }],
+        };
+        project_writer
+            .try_append_recognition_projection(7, recovered_projection, 25)
+            .unwrap();
+        let recovered_ack = next_ack(&mut project_writer, |ack| {
+            matches!(
+                ack,
+                ProjectWriterAck::RecognitionProjectionCommitted { batch_id: 7, .. }
+            )
+        });
+        assert!(matches!(
+            recovered_ack,
+            ProjectWriterAck::RecognitionProjectionCommitted { .. }
+        ));
+        assert!(project_writer.is_idle());
+        project_writer.finish(30, None).unwrap();
+
+        let persisted = read_journal(&path).unwrap();
+        assert_eq!(persisted.state.recognition_projections.len(), 1);
+        assert_eq!(persisted.state.physical_samples.len(), 3);
+        assert_eq!(persisted.state.physical_samples[0].sample, first_sample);
+        assert_eq!(persisted.state.physical_samples[1].sample, second_sample);
+        assert_eq!(persisted.state.physical_samples[2].sample, hover);
+        let stored_projection = &persisted.state.recognition_projections[0].projection;
+        assert_eq!(
+            stored_projection.projection_id,
+            "convert-queue-recovered-projection"
+        );
+        assert_eq!(
+            stored_projection.ink.journal_id,
+            "project-runtime-convert-test"
+        );
+        assert_eq!(stored_projection.ink.selected_strokes.as_slice(), &[target]);
+        assert_eq!(
+            stored_projection.ink.source_sample_sequences.as_slice(),
+            &[2, 3]
+        );
+        assert_eq!(stored_projection.ink.last_sequence, 4);
+        assert_eq!(
+            stored_projection.provider.provider_id,
+            "local-test-provider"
+        );
+        assert_eq!(
+            stored_projection.candidates[0].recognized_text,
+            "recovered candidate"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn oversized_projection_rejection_keeps_later_physical_capture_writable() {
+        let path = temp_project("convert-oversized-projection-recoverable");
+        let mut journal_writer = JournalWriter::create(
+            path.clone(),
+            JournalHeader {
+                journal_id: "project-runtime-oversized-convert-test".to_owned(),
+                session_id: "capture-session".to_owned(),
+                config_id: Some("config-a".to_owned()),
+                device_model_declared: None,
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        let target = StrokeRef {
+            journal_id: "project-runtime-oversized-convert-test".to_owned(),
+            session_id: "capture-session".to_owned(),
+            source_api: "direct-wm-pointer-pen-history".to_owned(),
+            device_id: Some("session-scoped-device-3".to_owned()),
+            pointer_id: Some(23),
+            stroke_id: "oversized-convert-stroke".to_owned(),
+        };
+        let frame = StrokeViewFrame::default();
+        let source_sample = started_sample(&target);
+        journal_writer
+            .start_stroke_record(target.clone(), frame, 9)
+            .unwrap();
+        journal_writer.append_sample_record(source_sample).unwrap();
+        journal_writer
+            .commit_stroke_record(target.clone(), 11)
+            .unwrap();
+        let state = journal_writer.replay_state();
+        let source_sequences = state
+            .physical_samples
+            .iter()
+            .filter(|stored| stored.sample.stroke_ref(&state.journal_id).as_ref() == Some(&target))
+            .map(|stored| stored.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(source_sequences.len(), 1);
+        let binding = ProjectionInkBindingV1 {
+            journal_id: state.journal_id.clone(),
+            logical_revision: state.logical_revision,
+            last_sequence: state.last_sequence,
+            region_id: "region-oversized-row".to_owned(),
+            line_id: Some("line-1".to_owned()),
+            input_view_id: "input-view-v1-0000000000000001".to_owned(),
+            ink_binding_sha256: "a".repeat(64),
+            selected_strokes: vec![target.clone()],
+            source_sample_sequences: source_sequences.clone(),
+            stroke_views: vec![ProjectionStrokeViewV1 {
+                stroke: target.clone(),
+                frame,
+            }],
+        };
+        let oversized_projection = RecognitionProjectionV1 {
+            projection_id: "oversized-convert-projection".to_owned(),
+            ink: binding,
+            provider: ProjectionProviderProvenanceV1 {
+                provider_id: "external-raster-provider".to_owned(),
+                provider_version: "synthetic-test".to_owned(),
+                model_version: None,
+                resource_version: None,
+                configuration_id: "operator-test-config".to_owned(),
+                configuration_fingerprint: "provider-config-v1-fnv64-0000000000000001".to_owned(),
+            },
+            candidates: vec![RecognitionCandidateV1 {
+                rank: 0,
+                recognized_text: "x".repeat(4097),
+                native_score_raw: None,
+                stroke_ranges: vec![ProjectionStrokeRangeV1 {
+                    stroke: target.clone(),
+                    first_journal_sequence: source_sequences[0],
+                    last_journal_sequence: source_sequences[0],
+                }],
+            }],
+            generated_raster: None,
+            input_modalities: Some(vec![crate::journal::ProjectionInputModalityV1::Raster]),
+        };
+        let mut project_writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        project_writer
+            .try_append_recognition_projection(2, oversized_projection, 12)
+            .unwrap();
+        let mut hover = started_sample(&target);
+        hover.source_sequence = 2;
+        hover.app_arrival_elapsed_ns = 13;
+        hover.stroke_id = None;
+        hover.source_device_id = None;
+        hover.pointer_id = None;
+        project_writer
+            .try_capture_batch(
+                3,
+                vec![DirectCaptureEvent::PhysicalSample(Box::new(hover.clone()))],
+            )
+            .unwrap();
+
+        let mut recoverable_failure_seen = false;
+        let mut capture_ack_seen = false;
+        for _ in 0..2_000 {
+            for acknowledgement in project_writer.drain_acks() {
+                match acknowledgement {
+                    ProjectWriterAck::RecognitionProjectionFailed {
+                        batch_id: 2,
+                        writer_poisoned,
+                        ..
+                    } => {
+                        assert!(!writer_poisoned);
+                        recoverable_failure_seen = true;
+                    }
+                    ProjectWriterAck::CaptureCommitted {
+                        batch_id: 3,
+                        records,
+                    } => {
+                        assert_eq!(records.len(), 1);
+                        assert!(matches!(
+                            &records[0].event,
+                            JournalEvent::PhysicalSample(sample) if **sample == hover
+                        ));
+                        capture_ack_seen = true;
+                    }
+                    ProjectWriterAck::CaptureFailed {
+                        batch_id, error, ..
+                    } => {
+                        panic!(
+                            "physical capture batch {batch_id} failed after a recoverable Convert rejection: {error}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            if recoverable_failure_seen && capture_ack_seen {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(recoverable_failure_seen);
+        assert!(capture_ack_seen);
+        assert!(project_writer.is_idle());
+        project_writer.finish(14, None).unwrap();
+
+        let persisted = read_journal(&path).unwrap();
+        assert!(persisted.state.recognition_projections.is_empty());
+        assert_eq!(persisted.state.physical_samples.len(), 2);
+        assert_eq!(persisted.state.physical_samples[1].sample, hover);
         fs::remove_file(path).unwrap();
     }
 

@@ -1397,6 +1397,20 @@ fn hex_encode(bytes: &[u8]) -> Result<String, io::Error> {
 fn canonical_ink_comparison_binding(
     request: &RecognitionRequestV1,
 ) -> io::Result<BenchmarkCanonicalInkComparisonBindingV1> {
+    Ok(BenchmarkCanonicalInkComparisonBindingV1 {
+        schema_version: CANONICAL_INK_COMPARISON_BINDING_SCHEMA_VERSION,
+        sha256_hex: canonical_ink_comparison_binding_sha256(request)?,
+        raster_pixel_parity: BenchmarkRasterPixelParityV1::Unverified,
+    })
+}
+
+/// Shared canonical-ink fingerprint used by benchmark rows and durable Convert
+/// projections. It intentionally excludes provider/configuration, requested
+/// modality, request ID, and raster payload; M4 `input_view_id` remains the
+/// separate per-request identity.
+pub(crate) fn canonical_ink_comparison_binding_sha256(
+    request: &RecognitionRequestV1,
+) -> io::Result<String> {
     let fingerprint = CanonicalInkComparisonFingerprintV1 {
         schema_version: CANONICAL_INK_COMPARISON_BINDING_SCHEMA_VERSION,
         protocol_version: request.protocol_version,
@@ -1420,11 +1434,7 @@ fn canonical_ink_comparison_binding(
             "canonical-ink comparison binding exceeds its fixed byte cap",
         ));
     }
-    Ok(BenchmarkCanonicalInkComparisonBindingV1 {
-        schema_version: CANONICAL_INK_COMPARISON_BINDING_SCHEMA_VERSION,
-        sha256_hex: hex_encode(&Sha256::digest(fingerprint_bytes))?,
-        raster_pixel_parity: BenchmarkRasterPixelParityV1::Unverified,
-    })
+    hex_encode(&Sha256::digest(fingerprint_bytes))
 }
 
 fn validate_sha256_hex(value: &str, label: &str) -> io::Result<()> {
