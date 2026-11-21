@@ -5,6 +5,8 @@ mod benchmark;
 mod canvas;
 mod convert;
 #[allow(dead_code)]
+mod correction;
+#[allow(dead_code)]
 mod journal;
 mod process_cpu;
 mod project_runtime;
@@ -1292,6 +1294,17 @@ impl ProbeApp {
                     } else if writer_poisoned {
                         self.mark_project_incomplete(
                             "project journal synchronization failed while saving a Convert result"
+                                .to_owned(),
+                        );
+                    }
+                }
+                ProjectWriterAck::RegionCorrectionCommitted { .. } => {}
+                ProjectWriterAck::RegionCorrectionFailed {
+                    writer_poisoned, ..
+                } => {
+                    if writer_poisoned {
+                        self.mark_project_incomplete(
+                            "project journal synchronization failed while saving a correction"
                                 .to_owned(),
                         );
                     }

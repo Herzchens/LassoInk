@@ -14,7 +14,8 @@ use crate::{
     canvas::DirectCaptureEvent,
     journal::{
         EditCommand, JournalEvent, JournalMetadata, JournalRecord, JournalReplayState,
-        JournalWriter, MetadataScope, RecognitionProjectionV1, StrokeInterruptionReason,
+        JournalWriter, MetadataScope, RecognitionProjectionV1, RegionCorrectionV1,
+        StrokeInterruptionReason,
     },
 };
 
@@ -47,6 +48,13 @@ enum Command {
     RecognitionProjection {
         batch_id: u64,
         projection: Box<RecognitionProjectionV1>,
+        app_arrival_elapsed_ns: u128,
+    },
+    /// Staged writer plumbing for the next correction-editor UI unit.
+    #[allow(dead_code)]
+    RegionCorrection {
+        batch_id: u64,
+        correction: Box<RegionCorrectionV1>,
         app_arrival_elapsed_ns: u128,
     },
     Finish {
@@ -90,6 +98,15 @@ pub(crate) enum ProjectWriterAck {
         error: String,
         writer_poisoned: bool,
     },
+    RegionCorrectionCommitted {
+        batch_id: u64,
+        record: JournalRecord,
+    },
+    RegionCorrectionFailed {
+        batch_id: u64,
+        error: String,
+        writer_poisoned: bool,
+    },
     Finished(Result<(), String>),
 }
 
@@ -111,6 +128,15 @@ pub(crate) enum ProjectQueueError {
 #[derive(Debug)]
 pub(crate) enum ProjectionQueueError {
     QueueFull(Box<RecognitionProjectionV1>),
+    WorkerStopped,
+}
+
+/// Queue result for the staged correction-editor writer API. The current
+/// source unit exercises the API in tests before the UI caller is added.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum CorrectionQueueError {
+    QueueFull(Box<RegionCorrectionV1>),
     WorkerStopped,
 }
 
@@ -365,6 +391,44 @@ impl ProjectWriterHandle {
                                 }
                             }
                         }
+                        Command::RegionCorrection {
+                            batch_id,
+                            correction,
+                            app_arrival_elapsed_ns,
+                        } => {
+                            let result = writer.append_region_correction_record(
+                                *correction,
+                                app_arrival_elapsed_ns,
+                            );
+                            match result {
+                                Ok(record) => {
+                                    if ack_sender
+                                        .send(ProjectWriterAck::RegionCorrectionCommitted {
+                                            batch_id,
+                                            record,
+                                        })
+                                        .is_err()
+                                        || writer.is_poisoned()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(error) => {
+                                    let writer_poisoned = writer.is_poisoned();
+                                    if ack_sender
+                                        .send(ProjectWriterAck::RegionCorrectionFailed {
+                                            batch_id,
+                                            error: error.to_string(),
+                                            writer_poisoned,
+                                        })
+                                        .is_err()
+                                        || writer_poisoned
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         Command::Finish {
                             app_arrival_elapsed_ns,
                             incomplete_reason,
@@ -527,6 +591,45 @@ impl ProjectWriterHandle {
         }
     }
 
+    /// Enqueues one immutable region correction. Queue saturation returns the
+    /// owned correction so the caller can retry exactly once after capacity
+    /// returns; journal validation and sync still happen in sequence on the
+    /// writer thread before the committed acknowledgement.
+    #[allow(dead_code)]
+    pub(crate) fn try_append_region_correction(
+        &mut self,
+        batch_id: u64,
+        correction: RegionCorrectionV1,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<(), CorrectionQueueError> {
+        if self.worker_stopped {
+            return Err(CorrectionQueueError::WorkerStopped);
+        }
+        if self.pending_commands >= COMMAND_CAPACITY {
+            return Err(CorrectionQueueError::QueueFull(Box::new(correction)));
+        }
+        match self.sender.try_send(Command::RegionCorrection {
+            batch_id,
+            correction: Box::new(correction),
+            app_arrival_elapsed_ns,
+        }) {
+            Ok(()) => {
+                self.pending_commands += 1;
+                Ok(())
+            }
+            Err(TrySendError::Full(Command::RegionCorrection { correction, .. })) => {
+                Err(CorrectionQueueError::QueueFull(correction))
+            }
+            Err(TrySendError::Disconnected(Command::RegionCorrection { .. })) => {
+                self.worker_stopped = true;
+                Err(CorrectionQueueError::WorkerStopped)
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                unreachable!("correction command is preserved by try_append_region_correction")
+            }
+        }
+    }
+
     fn try_send(&mut self, command: Command) -> Result<(), ProjectQueueError> {
         if self.worker_stopped {
             return Err(ProjectQueueError::WorkerStopped);
@@ -649,11 +752,13 @@ fn project_finalization_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::correction::CorrectionSession;
     use crate::journal::{
         JournalHeader, NativeTimestamp, PhysicalSample, ProjectionInkBindingV1,
-        ProjectionProviderProvenanceV1, ProjectionStrokeRangeV1, ProjectionStrokeViewV1,
-        RawPosition, RawPressure, RecognitionCandidateV1, RecognitionProjectionV1, StrokeRef,
-        StrokeViewFrame, read_journal,
+        ProjectionInputModalityV1, ProjectionProviderProvenanceV1, ProjectionStrokeRangeV1,
+        ProjectionStrokeViewV1, RawPosition, RawPressure, RecognitionCandidateV1,
+        RecognitionProjectionV1, RegionCorrectionActionV1, StrokeRef, StrokeViewFrame,
+        read_journal,
     };
     use std::{
         fs,
@@ -733,6 +838,325 @@ mod tests {
             rotation_raw: None,
             raw_payload: b"fixture-native-fields".to_vec(),
         }
+    }
+
+    fn correction_test_target(stroke_id: &str) -> StrokeRef {
+        StrokeRef {
+            journal_id: "project-runtime-test".to_owned(),
+            session_id: "capture-session".to_owned(),
+            source_api: "direct-wm-pointer-pen-history".to_owned(),
+            device_id: Some("session-scoped-device-17".to_owned()),
+            pointer_id: Some(17),
+            stroke_id: stroke_id.to_owned(),
+        }
+    }
+
+    fn append_correction_test_projection(
+        writer: &mut JournalWriter,
+        target: &StrokeRef,
+        projection_id: &str,
+    ) -> RecognitionProjectionV1 {
+        let frame = StrokeViewFrame::default();
+        writer
+            .start_stroke_record(target.clone(), frame, 9)
+            .unwrap();
+        writer.append_sample_record(started_sample(target)).unwrap();
+        writer.commit_stroke_record(target.clone(), 11).unwrap();
+
+        let state = writer.replay_state().clone();
+        let sample_sequence = state
+            .physical_samples
+            .iter()
+            .find(|sample| sample.sample.stroke_ref(&state.journal_id).as_ref() == Some(target))
+            .unwrap()
+            .sequence;
+        let projection = RecognitionProjectionV1 {
+            projection_id: projection_id.to_owned(),
+            ink: ProjectionInkBindingV1 {
+                journal_id: state.journal_id.clone(),
+                logical_revision: state.logical_revision,
+                last_sequence: state.last_sequence,
+                region_id: "region-correction-test".to_owned(),
+                line_id: Some("line-correction-test".to_owned()),
+                input_view_id: "input-view-v1-0000000000000001".to_owned(),
+                ink_binding_sha256: "a".repeat(64),
+                selected_strokes: vec![target.clone()],
+                source_sample_sequences: vec![sample_sequence],
+                stroke_views: vec![ProjectionStrokeViewV1 {
+                    stroke: target.clone(),
+                    frame,
+                }],
+            },
+            provider: ProjectionProviderProvenanceV1 {
+                provider_id: "external-online-provider".to_owned(),
+                provider_version: "synthetic-test-version".to_owned(),
+                model_version: None,
+                resource_version: None,
+                configuration_id: "operator-test-config".to_owned(),
+                configuration_fingerprint: "provider-config-v1-fnv64-0000000000000001".to_owned(),
+            },
+            candidates: vec![RecognitionCandidateV1 {
+                rank: 0,
+                recognized_text: "immutable provider candidate".to_owned(),
+                native_score_raw: None,
+                stroke_ranges: vec![ProjectionStrokeRangeV1 {
+                    stroke: target.clone(),
+                    first_journal_sequence: sample_sequence,
+                    last_journal_sequence: sample_sequence,
+                }],
+            }],
+            input_modalities: Some(vec![ProjectionInputModalityV1::OnlineStrokes]),
+            generated_raster: None,
+        };
+        writer
+            .append_recognition_projection_record(projection.clone(), 12)
+            .unwrap();
+        projection
+    }
+
+    #[test]
+    fn region_correction_queue_full_retries_once_and_acknowledges_after_durable_append() {
+        let path = temp_project("region-correction-queue-retry");
+        let mut journal_writer = new_writer(&path);
+        let target = correction_test_target("correction-queue-stroke");
+        let projection = append_correction_test_projection(
+            &mut journal_writer,
+            &target,
+            "correction-queue-projection",
+        );
+        let projection_snapshot = journal_writer.replay_state().clone();
+        let mut session =
+            CorrectionSession::open(&projection_snapshot, &projection.projection_id).unwrap();
+        session.set_text("durable human correction").unwrap();
+        let expected_correction = session
+            .build_correction("correction-queue-row")
+            .unwrap()
+            .unwrap();
+
+        let mut project_writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        for batch_id in 1..=8 {
+            project_writer.try_snapshot_for_convert(batch_id).unwrap();
+        }
+        let correction =
+            match project_writer.try_append_region_correction(9, expected_correction.clone(), 13) {
+                Err(CorrectionQueueError::QueueFull(correction)) => *correction,
+                other => panic!("expected an owned correction on queue saturation, got {other:?}"),
+            };
+
+        let mut snapshots_acknowledged = 0;
+        for _ in 0..2_000 {
+            snapshots_acknowledged += project_writer
+                .drain_acks()
+                .iter()
+                .filter(|ack| matches!(ack, ProjectWriterAck::ConvertSnapshot { .. }))
+                .count();
+            if snapshots_acknowledged == 8 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(snapshots_acknowledged, 8);
+        assert!(project_writer.is_idle());
+        project_writer
+            .try_append_region_correction(9, correction, 13)
+            .unwrap();
+
+        let mut hover = started_sample(&target);
+        hover.source_sequence = 2;
+        hover.app_arrival_elapsed_ns = 14;
+        hover.stroke_id = None;
+        hover.source_device_id = None;
+        hover.pointer_id = None;
+        project_writer
+            .try_capture_batch(
+                10,
+                vec![DirectCaptureEvent::PhysicalSample(Box::new(hover.clone()))],
+            )
+            .unwrap();
+
+        let mut correction_committed = false;
+        let mut capture_committed = false;
+        for _ in 0..2_000 {
+            for acknowledgement in project_writer.drain_acks() {
+                match acknowledgement {
+                    ProjectWriterAck::RegionCorrectionCommitted {
+                        batch_id: 9,
+                        record,
+                    } => match record.event {
+                        JournalEvent::RegionCorrection { correction, .. } => {
+                            assert_eq!(*correction, expected_correction);
+                            correction_committed = true;
+                        }
+                        other => panic!("unexpected correction record event: {other:?}"),
+                    },
+                    ProjectWriterAck::CaptureCommitted {
+                        batch_id: 10,
+                        records,
+                    } => {
+                        assert_eq!(records.len(), 1);
+                        assert!(matches!(
+                            &records[0].event,
+                            JournalEvent::PhysicalSample(sample) if **sample == hover
+                        ));
+                        capture_committed = true;
+                    }
+                    ProjectWriterAck::RegionCorrectionFailed {
+                        batch_id, error, ..
+                    } => {
+                        panic!("correction batch {batch_id} failed unexpectedly: {error}");
+                    }
+                    ProjectWriterAck::CaptureFailed {
+                        batch_id, error, ..
+                    } => {
+                        panic!("capture batch {batch_id} failed after correction commit: {error}");
+                    }
+                    _ => {}
+                }
+            }
+            if correction_committed && capture_committed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(correction_committed);
+        assert!(capture_committed);
+        assert!(project_writer.is_idle());
+        session.acknowledge_committed(&expected_correction).unwrap();
+        assert!(!session.is_dirty());
+        project_writer.finish(20, None).unwrap();
+
+        let persisted = read_journal(&path).unwrap();
+        assert_eq!(persisted.state.recognition_projections.len(), 1);
+        assert_eq!(persisted.state.region_corrections.len(), 1);
+        assert_eq!(
+            persisted.state.region_corrections[0].correction.action,
+            RegionCorrectionActionV1::SetText("durable human correction".to_owned())
+        );
+        assert_eq!(persisted.state.physical_samples.len(), 2);
+        assert_eq!(
+            persisted.state.physical_samples[0].sample,
+            started_sample(&target)
+        );
+        assert_eq!(persisted.state.physical_samples[1].sample, hover);
+        assert_eq!(
+            persisted.state.recognition_projections[0]
+                .projection
+                .candidates[0]
+                .recognized_text,
+            "immutable provider candidate"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_region_correction_is_recoverable_and_retains_draft_while_capture_continues() {
+        let path = temp_project("region-correction-stale-recoverable");
+        let mut journal_writer = new_writer(&path);
+        let target = correction_test_target("correction-stale-stroke");
+        let projection = append_correction_test_projection(
+            &mut journal_writer,
+            &target,
+            "correction-stale-projection",
+        );
+        let projection_snapshot = journal_writer.replay_state().clone();
+        let mut session =
+            CorrectionSession::open(&projection_snapshot, &projection.projection_id).unwrap();
+        session.set_text("copyable stale draft").unwrap();
+        let stale_correction = session
+            .build_correction("correction-stale-row")
+            .unwrap()
+            .unwrap();
+        journal_writer
+            .apply_edit_action_record(
+                13,
+                EditCommand::Tombstone {
+                    targets: vec![target.clone()],
+                },
+            )
+            .unwrap();
+        assert_ne!(
+            journal_writer.replay_state().logical_revision,
+            stale_correction.ink.logical_revision
+        );
+
+        let mut project_writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        project_writer
+            .try_append_region_correction(20, stale_correction, 14)
+            .unwrap();
+        let mut hover = started_sample(&target);
+        hover.source_sequence = 2;
+        hover.app_arrival_elapsed_ns = 15;
+        hover.stroke_id = None;
+        hover.source_device_id = None;
+        hover.pointer_id = None;
+        project_writer
+            .try_capture_batch(
+                21,
+                vec![DirectCaptureEvent::PhysicalSample(Box::new(hover.clone()))],
+            )
+            .unwrap();
+
+        let mut stale_failure = false;
+        let mut capture_committed = false;
+        for _ in 0..2_000 {
+            for acknowledgement in project_writer.drain_acks() {
+                match acknowledgement {
+                    ProjectWriterAck::RegionCorrectionFailed {
+                        batch_id: 20,
+                        writer_poisoned,
+                        ..
+                    } => {
+                        assert!(!writer_poisoned);
+                        stale_failure = true;
+                    }
+                    ProjectWriterAck::CaptureCommitted {
+                        batch_id: 21,
+                        records,
+                    } => {
+                        assert_eq!(records.len(), 1);
+                        capture_committed = true;
+                    }
+                    ProjectWriterAck::RegionCorrectionCommitted { .. } => {
+                        panic!("stale correction must not commit");
+                    }
+                    ProjectWriterAck::CaptureFailed {
+                        batch_id, error, ..
+                    } => {
+                        panic!("capture batch {batch_id} failed after stale correction: {error}");
+                    }
+                    _ => {}
+                }
+            }
+            if stale_failure && capture_committed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(stale_failure);
+        assert!(capture_committed);
+        assert!(project_writer.is_idle());
+        assert_eq!(session.text(), "copyable stale draft");
+        assert!(session.is_dirty());
+        assert_eq!(
+            session
+                .build_correction("correction-stale-row-retry")
+                .unwrap()
+                .unwrap()
+                .action,
+            RegionCorrectionActionV1::SetText("copyable stale draft".to_owned())
+        );
+        project_writer.finish(16, None).unwrap();
+
+        let persisted = read_journal(&path).unwrap();
+        assert_eq!(persisted.state.recognition_projections.len(), 1);
+        assert!(persisted.state.region_corrections.is_empty());
+        assert_eq!(persisted.state.physical_samples.len(), 2);
+        assert_eq!(
+            persisted.state.physical_samples[0].sample,
+            started_sample(&target)
+        );
+        assert_eq!(persisted.state.physical_samples[1].sample, hover);
+        let _ = fs::remove_file(path);
     }
 
     #[test]

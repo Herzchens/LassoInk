@@ -27,11 +27,11 @@ const MAX_JOURNAL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_JOURNAL_LINE_BYTES: usize = 64 * 1024;
 const MAX_JOURNAL_RECORDS: usize = 131_072;
 const MAX_SNAPSHOT_STATE_ENTRIES: usize = MAX_JOURNAL_RECORDS * 2 + 1;
-const MAX_JOURNAL_TEXT_BYTES: usize = 4096;
+pub(crate) const MAX_JOURNAL_TEXT_BYTES: usize = 4096;
 const MAX_RAW_PAYLOAD_BYTES: usize = 8192;
 const MAX_METADATA_TEXT_BYTES: usize = 4096;
 const MAX_RECOGNITION_PROJECTIONS: usize = 16_384;
-const MAX_REGION_CORRECTIONS: usize = 16_384;
+pub(crate) const MAX_REGION_CORRECTIONS: usize = 16_384;
 const MAX_PROJECTION_CANDIDATES: usize = 128;
 const MAX_PROJECTION_STROKES: usize = 512;
 const MAX_PROJECTION_SAMPLES: usize = 4096;
@@ -2656,7 +2656,16 @@ impl JournalWriter {
         correction: RegionCorrectionV1,
         app_arrival_elapsed_ns: u128,
     ) -> Result<u64, JournalError> {
-        self.append_event(JournalEvent::RegionCorrection {
+        self.append_region_correction_record(correction, app_arrival_elapsed_ns)
+            .map(|record| record.sequence)
+    }
+
+    pub(crate) fn append_region_correction_record(
+        &mut self,
+        correction: RegionCorrectionV1,
+        app_arrival_elapsed_ns: u128,
+    ) -> Result<JournalRecord, JournalError> {
+        self.append_event_record(JournalEvent::RegionCorrection {
             app_arrival_elapsed_ns,
             correction: Box::new(correction),
         })
@@ -5018,7 +5027,23 @@ fn validate_generated_raster_provenance(
     Ok(())
 }
 
-fn validate_region_correction_fields(correction: &RegionCorrectionV1) -> Result<(), JournalError> {
+pub(crate) fn validate_region_correction_text(text: &str) -> Result<(), JournalError> {
+    validate_region_correction_text_length(text.len())?;
+    validate_text(text, "region correction text", MAX_JOURNAL_TEXT_BYTES)
+}
+
+pub(crate) fn validate_region_correction_text_length(length: usize) -> Result<(), JournalError> {
+    if length > MAX_JOURNAL_TEXT_BYTES {
+        return Err(JournalError::limit(format!(
+            "region correction text exceeds {MAX_JOURNAL_TEXT_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_region_correction_fields(
+    correction: &RegionCorrectionV1,
+) -> Result<(), JournalError> {
     validate_text(
         &correction.correction_id,
         "region correction ID",
@@ -5038,7 +5063,7 @@ fn validate_region_correction_fields(correction: &RegionCorrectionV1) -> Result<
     if let RegionCorrectionActionV1::SetText(text) = &correction.action {
         // Empty text is a valid explicit SetText value; Reset remains a
         // separate enum variant and is never conflated with it.
-        validate_text(text, "region correction text", MAX_JOURNAL_TEXT_BYTES)?;
+        validate_region_correction_text(text)?;
     }
     Ok(())
 }
