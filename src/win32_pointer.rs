@@ -27,10 +27,10 @@ use windows_sys::Win32::{
     UI::{
         Input::Pointer::POINTER_PEN_INFO,
         WindowsAndMessaging::{
-            MSG, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, POINTER_INPUT_TYPE, PT_PEN,
-            WM_POINTERCAPTURECHANGED, WM_POINTERDEVICECHANGE, WM_POINTERDEVICEINRANGE,
-            WM_POINTERDEVICEOUTOFRANGE, WM_POINTERDOWN, WM_POINTERENTER, WM_POINTERLEAVE,
-            WM_POINTERUP, WM_POINTERUPDATE,
+            GetMessageExtraInfo, MSG, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y,
+            POINTER_INPUT_TYPE, PT_PEN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_POINTERCAPTURECHANGED,
+            WM_POINTERDEVICECHANGE, WM_POINTERDEVICEINRANGE, WM_POINTERDEVICEOUTOFRANGE,
+            WM_POINTERDOWN, WM_POINTERENTER, WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE,
         },
     },
 };
@@ -53,6 +53,10 @@ const USER32_DLL: [u16; 11] = [
     b'l' as u16,
     0,
 ];
+
+const MI_WP_SIGNATURE: usize = 0xFF51_5700;
+const MI_WP_SIGNATURE_MASK: usize = 0xFFFF_FF00;
+const MI_WP_TOUCH_MASK: usize = 0x80;
 const GET_POINTER_TYPE_NAME: &[u8] = b"GetPointerType\0";
 const GET_POINTER_PEN_INFO_HISTORY_NAME: &[u8] = b"GetPointerPenInfoHistory\0";
 const MAX_HISTORY_ENTRIES: u32 = 65_536;
@@ -415,9 +419,51 @@ pub(crate) struct WintabControlNotification {
 struct ActivePublicDispatch {
     message_sequence: u64,
     metadata: HookMessageMetadata,
+    mouse_input_origin: MouseMessageOrigin,
     association_used: bool,
     pointer_type_query_attempted: bool,
     pointer_type_query_result: Option<Result<i32, u32>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MouseMessageOrigin {
+    PenPromoted { cursor_id: u32 },
+    TouchPromoted { cursor_id: u32 },
+    Unknown,
+}
+
+fn is_left_mouse_button_message(message_id_raw: u32) -> bool {
+    matches!(message_id_raw, WM_LBUTTONDOWN | WM_LBUTTONUP)
+}
+
+fn left_mouse_message_matches(
+    message_id_raw: u32,
+    state: ElementState,
+    button: MouseButton,
+) -> bool {
+    button == MouseButton::Left
+        && matches!(
+            (message_id_raw, state),
+            (WM_LBUTTONDOWN, ElementState::Pressed) | (WM_LBUTTONUP, ElementState::Released)
+        )
+}
+
+fn mouse_message_origin_from_extra_info(extra_info: Option<isize>) -> MouseMessageOrigin {
+    let Some(extra_info) = extra_info else {
+        return MouseMessageOrigin::Unknown;
+    };
+    let extra_info = extra_info as usize;
+    if extra_info & MI_WP_SIGNATURE_MASK != MI_WP_SIGNATURE {
+        MouseMessageOrigin::Unknown
+    } else if extra_info & MI_WP_TOUCH_MASK != 0 {
+        MouseMessageOrigin::TouchPromoted {
+            cursor_id: u32::try_from(extra_info & 0x7F).unwrap_or_default(),
+        }
+    } else {
+        MouseMessageOrigin::PenPromoted {
+            cursor_id: u32::try_from(extra_info & 0x7F).unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -853,6 +899,7 @@ impl ProbeState {
         &mut self,
         message_sequence: u64,
         metadata: Option<HookMessageMetadata>,
+        mouse_input_origin: MouseMessageOrigin,
     ) {
         if self.public_callback_depth > 0 {
             self.active_public_dispatch = None;
@@ -863,15 +910,37 @@ impl ProbeState {
         self.public_association_ambiguous = false;
         self.active_public_dispatch = metadata
             .filter(|message| {
-                message.pointer_id != 0 && pointer_message_kind(message.message_id_raw).is_some()
+                (message.pointer_id != 0 && pointer_message_kind(message.message_id_raw).is_some())
+                    || is_left_mouse_button_message(message.message_id_raw)
             })
             .map(|metadata| ActivePublicDispatch {
                 message_sequence,
                 metadata,
+                mouse_input_origin,
                 association_used: false,
                 pointer_type_query_attempted: false,
                 pointer_type_query_result: None,
             });
+    }
+
+    pub(crate) fn public_mouse_input_origin(
+        &self,
+        window_hwnd_raw_session_scoped: Option<isize>,
+        state: ElementState,
+        button: MouseButton,
+    ) -> MouseMessageOrigin {
+        if self.public_association_ambiguous || self.public_callback_depth == 0 {
+            return MouseMessageOrigin::Unknown;
+        }
+        let Some(active) = self.active_public_dispatch else {
+            return MouseMessageOrigin::Unknown;
+        };
+        if window_hwnd_raw_session_scoped != Some(active.metadata.message_hwnd_raw_session_scoped)
+            || !left_mouse_message_matches(active.metadata.message_id_raw, state, button)
+        {
+            return MouseMessageOrigin::Unknown;
+        }
+        active.mouse_input_origin
     }
 
     pub(crate) fn expire_public_dispatch_candidate(&mut self) {
@@ -1813,6 +1882,16 @@ pub(crate) fn install_message_hook(
         // SAFETY: Winit's pointer is the current live MSG for this hook call.
         // Copy only its numeric fields; no pointer or handle ownership is kept.
         let message_metadata = unsafe { copy_message_metadata(message_pointer) };
+        let mouse_input_origin = if message_metadata
+            .is_some_and(|metadata| is_left_mouse_button_message(metadata.message_id_raw))
+        {
+            // SAFETY: Winit invokes this hook for the current retrieved message before dispatch,
+            // so GetMessageExtraInfo observes the origin tag for this left-button message.
+            let extra_info = unsafe { GetMessageExtraInfo() };
+            mouse_message_origin_from_extra_info(Some(extra_info))
+        } else {
+            MouseMessageOrigin::Unknown
+        };
         let hook_qpc_observation = if mode == CaptureMode::DirectWmPointer
             && message_metadata
                 .is_some_and(|metadata| pointer_message_kind(metadata.message_id_raw).is_some())
@@ -1834,7 +1913,7 @@ pub(crate) fn install_message_hook(
             }
         };
         let mut probe_state = state.borrow_mut();
-        probe_state.begin_native_dispatch(current_sequence, message_metadata);
+        probe_state.begin_native_dispatch(current_sequence, message_metadata, mouse_input_origin);
         if let Some(metadata) = message_metadata
             && let Some((kind, has_pointer_id)) = direct_lifecycle_message(metadata.message_id_raw)
         {
@@ -2367,20 +2446,22 @@ mod tests {
     use super::{
         CaptureIssue, CaptureSource, CoordinateSpace, CoordinateUnits, DirectPenHistoryBatch,
         HistoryBufferDecision, HistoryCountError, HookMessageMetadata, MAX_HISTORY_ENTRIES,
-        NativeApi, PointerAttribution, PointerMessageKind, PressureValidity, ProbeRecord,
-        ProbeState, PublicEventCapability, PublicMessageAssociation, PublicPenClassification,
-        PublicUnclassifiedReason, PublicWinitEventData, PublicWinitEventRecord, RawPoint,
-        RawScreenPosition, SampleValidationIssue, SessionOutputStage, StorageLimit, TouchPhase,
-        WintabContextConfig, WintabCoordinateSpace, WintabIssue, WintabPacketBatch,
-        WintabPacketSample, WintabPacketTimeMode, WintabStatus, ensure_native_history_fits,
-        history_buffer_decision, hook_message_metadata, normalize_newest_first, own_sample,
+        MouseMessageOrigin, NativeApi, PointerAttribution, PointerMessageKind, PressureValidity,
+        ProbeRecord, ProbeState, PublicEventCapability, PublicMessageAssociation,
+        PublicPenClassification, PublicUnclassifiedReason, PublicWinitEventData,
+        PublicWinitEventRecord, RawPoint, RawScreenPosition, SampleValidationIssue,
+        SessionOutputStage, StorageLimit, TouchPhase, WintabContextConfig, WintabCoordinateSpace,
+        WintabIssue, WintabPacketBatch, WintabPacketSample, WintabPacketTimeMode, WintabStatus,
+        ensure_native_history_fits, history_buffer_decision, hook_message_metadata,
+        mouse_message_origin_from_extra_info, normalize_newest_first, own_sample,
         pressure_validity,
     };
     use windows_sys::Win32::{
         Foundation::BOOL,
         UI::Input::Pointer::POINTER_PEN_INFO,
         UI::WindowsAndMessaging::{
-            MSG, PEN_MASK_PRESSURE, POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, WM_POINTERUPDATE,
+            MSG, PEN_MASK_PRESSURE, POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, WM_LBUTTONDOWN,
+            WM_POINTERUPDATE,
         },
     };
 
@@ -3070,7 +3151,7 @@ mod tests {
             message_time_ms_raw: None,
             pointer_id: 7,
         };
-        state.begin_native_dispatch(41, Some(metadata));
+        state.begin_native_dispatch(41, Some(metadata), MouseMessageOrigin::Unknown);
 
         let matching = state.public_touch_native_metadata(Some(0x2222), 7);
         assert_eq!(
@@ -3108,6 +3189,67 @@ mod tests {
     }
 
     #[test]
+    fn left_mouse_origin_uses_message_extra_info_and_exact_dispatch_match() {
+        assert_eq!(
+            mouse_message_origin_from_extra_info(None),
+            MouseMessageOrigin::Unknown
+        );
+        assert_eq!(
+            mouse_message_origin_from_extra_info(Some(0)),
+            MouseMessageOrigin::Unknown
+        );
+        assert_eq!(
+            mouse_message_origin_from_extra_info(Some((0xFF51_5700_u32 | 7) as isize)),
+            MouseMessageOrigin::PenPromoted { cursor_id: 7 }
+        );
+        assert_eq!(
+            mouse_message_origin_from_extra_info(Some((0xFF51_5700_u32 | 0x80 | 9) as isize)),
+            MouseMessageOrigin::TouchPromoted { cursor_id: 9 }
+        );
+
+        let mut state = ProbeState::default();
+        let metadata = HookMessageMetadata {
+            message_id_raw: WM_LBUTTONDOWN,
+            message_hwnd_raw_session_scoped: 0x2222,
+            wparam_raw: 0,
+            lparam_raw: 0,
+            message_time_ms_raw: Some(1),
+            pointer_id: 0,
+        };
+        state.begin_native_dispatch(
+            81,
+            Some(metadata),
+            MouseMessageOrigin::PenPromoted { cursor_id: 7 },
+        );
+        state.enter_winit_callback();
+        assert_eq!(
+            state.public_mouse_input_origin(
+                Some(0x2222),
+                winit::event::ElementState::Pressed,
+                winit::event::MouseButton::Left,
+            ),
+            MouseMessageOrigin::PenPromoted { cursor_id: 7 }
+        );
+        assert_eq!(
+            state.public_mouse_input_origin(
+                Some(0x3333),
+                winit::event::ElementState::Pressed,
+                winit::event::MouseButton::Left,
+            ),
+            MouseMessageOrigin::Unknown
+        );
+        assert_eq!(
+            state.public_mouse_input_origin(
+                Some(0x2222),
+                winit::event::ElementState::Released,
+                winit::event::MouseButton::Left,
+            ),
+            MouseMessageOrigin::Unknown
+        );
+        state.leave_winit_callback();
+    }
+
+    #[test]
     fn public_touch_is_not_classified_as_pen_without_native_pt_pen() {
         let mut state = ProbeState::default();
         state.set_public_pointer_type_api(Some(fake_get_pointer_type));
@@ -3119,7 +3261,7 @@ mod tests {
             message_time_ms_raw: None,
             pointer_id: 8,
         };
-        state.begin_native_dispatch(50, Some(metadata));
+        state.begin_native_dispatch(50, Some(metadata), MouseMessageOrigin::Unknown);
 
         let native = state.public_touch_native_metadata(Some(0x2222), 8);
         assert!(native.message_association.is_some());
@@ -3144,9 +3286,9 @@ mod tests {
             message_time_ms_raw: None,
             pointer_id: 7,
         };
-        state.begin_native_dispatch(41, Some(metadata));
+        state.begin_native_dispatch(41, Some(metadata), MouseMessageOrigin::Unknown);
         state.enter_winit_callback();
-        state.begin_native_dispatch(42, Some(metadata));
+        state.begin_native_dispatch(42, Some(metadata), MouseMessageOrigin::Unknown);
 
         let ambiguous = state.public_touch_native_metadata(Some(0x2222), 7);
         assert_eq!(ambiguous.message_association, None);
@@ -3174,7 +3316,7 @@ mod tests {
             message_time_ms_raw: None,
             pointer_id: 7,
         };
-        state.begin_native_dispatch(60, Some(metadata));
+        state.begin_native_dispatch(60, Some(metadata), MouseMessageOrigin::Unknown);
 
         state.enter_winit_callback();
         let current_dispatch = state.public_touch_native_metadata(Some(0x2222), 7);

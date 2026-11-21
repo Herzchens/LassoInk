@@ -541,6 +541,7 @@ impl ProjectWriterHandle {
         self.try_send(Command::Metadata(metadata))
     }
 
+    #[cfg(test)]
     pub(crate) fn is_idle(&self) -> bool {
         !self.worker_stopped && self.pending_commands == 0 && self.pending_samples == 0
     }
