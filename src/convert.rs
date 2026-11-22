@@ -44,9 +44,9 @@ use crate::{
 const MAX_LOCAL_PROVIDER_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_LOCAL_PROVIDERS: usize = 8;
 const MAX_LOCAL_LANGUAGE_HINTS: usize = 16;
-const CONVERT_RASTER_WIDTH_PX: u32 = 384;
-const CONVERT_RASTER_HEIGHT_PX: u32 = 384;
-const CONVERT_RASTER_SOURCE_PADDING_PX: i32 = 4;
+pub(crate) const CONVERT_RASTER_WIDTH_PX: u32 = 384;
+pub(crate) const CONVERT_RASTER_HEIGHT_PX: u32 = 384;
+pub(crate) const CONVERT_RASTER_SOURCE_PADDING_PX: i32 = 4;
 const MAX_PROVIDER_RASTER_BYTES: usize = 1024 * 1024;
 const CONVERT_RASTER_COORDINATE_SPACE: &str = "canonical-raster-output-v1";
 const CONVERT_RASTER_COORDINATE_UNITS: &str = "pixel";

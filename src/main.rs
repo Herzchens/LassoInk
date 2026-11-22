@@ -6,6 +6,7 @@ mod canvas;
 mod convert;
 #[allow(dead_code)]
 mod correction;
+mod export;
 #[allow(dead_code)]
 mod journal;
 mod process_cpu;
@@ -55,7 +56,10 @@ use std::{
     path::{Path, PathBuf},
     process,
     rc::Rc,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -129,8 +133,11 @@ struct ProbeApp {
     local_convert_provider: Option<LocalConvertProviderV1>,
     provider_worker: Option<ProviderWorkerHandle>,
     pending_convert: Option<PendingConvert>,
+    #[cfg(test)]
+    last_provider_error_code: Option<String>,
     correction_session: Option<CorrectionSession>,
     pending_correction: Option<PendingCorrectionWrite>,
+    pending_export: Option<PendingExport>,
     next_correction_id: u64,
     correction_focus: CorrectionPaneFocus,
     correction_panel_status: String,
@@ -195,6 +202,79 @@ struct PendingConvert {
     ink_binding: Option<journal::ProjectionInkBindingV1>,
     generated_raster: Option<journal::GeneratedRasterProvenanceV1>,
     phase: PendingConvertPhase,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingExportProjectionContext {
+    projection_id: String,
+    ink_binding: journal::ProjectionInkBindingV1,
+}
+
+#[derive(Clone, Debug)]
+enum PendingExportSource {
+    Projection {
+        projection_id: String,
+        ink_binding: journal::ProjectionInkBindingV1,
+    },
+    // This optional prior session is only an invalidation guard; ink-only
+    // bundle construction receives no projection or transcript identity.
+    InkOnly {
+        prior_projection: Option<PendingExportProjectionContext>,
+    },
+}
+
+struct PendingExport {
+    batch_id: u64,
+    target_path: PathBuf,
+    source: PendingExportSource,
+    selected_strokes: Vec<journal::StrokeRef>,
+    project_generation: u64,
+    view_generation: u64,
+    cancelled: Arc<AtomicBool>,
+    result_receiver: Option<std::sync::mpsc::Receiver<Result<(), export::ExportError>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for PendingExport {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn export_context_matches(
+    pending: &PendingExport,
+    project_generation: u64,
+    view_generation: u64,
+    projection_id: Option<&str>,
+    ink_binding: Option<&journal::ProjectionInkBindingV1>,
+    selected_strokes: Option<&[journal::StrokeRef]>,
+) -> bool {
+    let source_matches = match &pending.source {
+        PendingExportSource::Projection {
+            projection_id: expected_projection_id,
+            ink_binding: expected_binding,
+        } => {
+            projection_id == Some(expected_projection_id.as_str())
+                && ink_binding == Some(expected_binding)
+        }
+        PendingExportSource::InkOnly { prior_projection } => {
+            match (prior_projection, projection_id, ink_binding) {
+                (None, None, None) => true,
+                (Some(expected), Some(current_id), Some(current_binding)) => {
+                    expected.projection_id.as_str() == current_id
+                        && &expected.ink_binding == current_binding
+                }
+                _ => false,
+            }
+        }
+    };
+    pending.project_generation == project_generation
+        && pending.view_generation == view_generation
+        && source_matches
+        && selected_strokes == Some(pending.selected_strokes.as_slice())
 }
 
 enum PendingConvertPhase {
@@ -263,6 +343,7 @@ enum CorrectionPaneAction {
     Reset,
     Cancel,
     Copy,
+    Export,
     LoadProviderConfig,
 }
 
@@ -805,6 +886,7 @@ fn correction_action_hit_targets(
         ("[Reset]", CorrectionPaneAction::Reset),
         ("[Cancel]", CorrectionPaneAction::Cancel),
         ("[Copy]", CorrectionPaneAction::Copy),
+        ("[Export]", CorrectionPaneAction::Export),
     ];
     let mut cursor = 0usize;
     let mut targets = Vec::with_capacity(labels.len());
@@ -1296,6 +1378,58 @@ fn convert_provider_failure_message(error: &ProviderErrorKind) -> &'static str {
     }
 }
 
+#[cfg(test)]
+fn safe_provider_error_code_for_test(error: &ProviderErrorKind) -> String {
+    match error {
+        ProviderErrorKind::InvalidConfiguration(_) => "invalid_configuration".to_owned(),
+        ProviderErrorKind::InvalidRequest(_) => "invalid_request".to_owned(),
+        ProviderErrorKind::InvalidResponse(_) => "invalid_response".to_owned(),
+        ProviderErrorKind::ProtocolVersion { .. } => "protocol_version".to_owned(),
+        ProviderErrorKind::OversizedFrame { .. } => "oversized_frame".to_owned(),
+        ProviderErrorKind::TimedOut(provider_protocol::ProviderPhase::Handshake) => {
+            "handshake_timed_out".to_owned()
+        }
+        ProviderErrorKind::TimedOut(provider_protocol::ProviderPhase::Recognition) => {
+            "recognition_timed_out".to_owned()
+        }
+        ProviderErrorKind::TimedOut(provider_protocol::ProviderPhase::Shutdown) => {
+            "shutdown_timed_out".to_owned()
+        }
+        ProviderErrorKind::Cancelled => "cancelled".to_owned(),
+        ProviderErrorKind::SpawnFailed(_) => "spawn_failed".to_owned(),
+        ProviderErrorKind::IoFailed { .. } => "io_failed".to_owned(),
+        ProviderErrorKind::WorkerExited { .. } => "worker_exited".to_owned(),
+        ProviderErrorKind::UnexpectedFrame(_) => "unexpected_frame".to_owned(),
+        ProviderErrorKind::UnsupportedCapability(_) => "unsupported_capability".to_owned(),
+        ProviderErrorKind::ProviderFailure { code, .. } => {
+            let safe_code = !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+            format!(
+                "provider_failure:{}",
+                if safe_code {
+                    code.as_str()
+                } else {
+                    "<redacted>"
+                }
+            )
+        }
+        ProviderErrorKind::StaleSourceRevision => "stale_source_revision".to_owned(),
+        ProviderErrorKind::ProviderRequestMismatch => "provider_request_mismatch".to_owned(),
+        ProviderErrorKind::ProviderConfigurationMismatch => {
+            "provider_configuration_mismatch".to_owned()
+        }
+        ProviderErrorKind::WorkerThreadPanicked => "worker_thread_panicked".to_owned(),
+        ProviderErrorKind::UnsupportedPlatform => "unsupported_platform".to_owned(),
+        ProviderErrorKind::WorkerCapacityReached => "worker_capacity_reached".to_owned(),
+        ProviderErrorKind::WorkerSubsystemPoisoned => "worker_subsystem_poisoned".to_owned(),
+        ProviderErrorKind::ProcessCleanupFailed(_) => "process_cleanup_failed".to_owned(),
+        ProviderErrorKind::AllocationFailed => "allocation_failed".to_owned(),
+    }
+}
+
 #[derive(Debug, Default)]
 struct ControlledStallTrigger {
     duration_ms: Option<u64>,
@@ -1487,6 +1621,10 @@ impl ProbeApp {
     }
 
     fn start_or_cancel_convert(&mut self) {
+        #[cfg(test)]
+        {
+            self.last_provider_error_code = None;
+        }
         if self.pending_convert.is_some() {
             self.cancel_convert("Convert canceled by the user".to_owned());
             return;
@@ -1613,12 +1751,34 @@ impl ProbeApp {
 
     fn note_convert_view_change(&mut self) {
         self.convert_view_generation = self.convert_view_generation.saturating_add(1);
+        self.cancel_stale_export();
         if self.pending_convert.as_ref().is_some_and(|pending| {
             !matches!(&pending.phase, PendingConvertPhase::Persisting { .. })
         }) {
             self.cancel_convert(
                 "Convert canceled because the selection or view changed".to_owned(),
             );
+        }
+    }
+
+    fn export_context_is_current(&self, pending: &PendingExport) -> bool {
+        let session = self.correction_session.as_ref();
+        let selected_strokes = self.canvas_scene.selected_targets().ok();
+        export_context_matches(
+            pending,
+            self.project_generation,
+            self.convert_view_generation,
+            session.map(|session| session.projection_id()),
+            session.map(|session| &session.projection().ink),
+            selected_strokes.as_deref(),
+        )
+    }
+
+    fn cancel_stale_export(&self) {
+        if let Some(pending) = self.pending_export.as_ref()
+            && !self.export_context_is_current(pending)
+        {
+            pending.cancelled.store(true, Ordering::Release);
         }
     }
 
@@ -1859,7 +2019,7 @@ impl ProbeApp {
                 "Provider output and corrections appear here.".to_owned(),
             );
         }
-        let action_label = "[Convert] [Save] [Reset] [Cancel] [Copy]";
+        let action_label = "[Convert] [Save] [Reset] [Cancel] [Copy] [Export]";
         let action_row = append_pane_line(&mut layout, action_label.to_owned());
         layout.action_row = Some(action_row);
         layout.action_hit_targets =
@@ -1900,7 +2060,7 @@ impl ProbeApp {
             },
         ));
         let (export_path_line, mut export_path_layout) = inline_text_editor_line(
-            "Export path: ",
+            "Export folder: ",
             &self.export_path_editor,
             InlineEditorField::ExportPath,
             text_width,
@@ -1910,7 +2070,10 @@ impl ProbeApp {
         export_path_layout.row_index = export_path_row;
         layout.export_path_row = Some(export_path_row);
         layout.inline_editor_rows.push(export_path_layout);
-        append_pane_line(&mut layout, "Export is not implemented.".to_owned());
+        append_pane_line(
+            &mut layout,
+            "Export makes a new Markdown/HTML bundle with the original ink PNG.".to_owned(),
+        );
         Ok(layout)
     }
 
@@ -3165,8 +3328,263 @@ impl ProbeApp {
             CorrectionPaneAction::Reset => self.reset_correction_draft(),
             CorrectionPaneAction::Cancel => self.cancel_correction_draft(),
             CorrectionPaneAction::Copy => self.copy_correction_text(),
+            CorrectionPaneAction::Export => self.start_export(),
             CorrectionPaneAction::LoadProviderConfig => self.load_local_provider_from_pane(),
         }
+    }
+
+    fn start_export(&mut self) {
+        if self.pending_export.is_some() {
+            self.cancel_export();
+            return;
+        }
+        if self.project_writer.is_none()
+            || self.project_incomplete_reason.is_some()
+            || self.pending_convert.is_some()
+            || self.pending_correction.is_some()
+            || self.deferred_capture_batch.is_some()
+            || self.canvas_scene.has_preview_strokes()
+            || self.direct_ui_pointer_owners.has_active_canvas_pointer()
+            || self
+                .correction_session
+                .as_ref()
+                .is_some_and(|session| session.is_dirty() || session.editor().has_preedit())
+        {
+            self.correction_panel_status =
+                "Export requires a quiet, complete project with no unsaved correction.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        if self.export_path_editor.has_preedit() {
+            self.correction_panel_status =
+                "Finish or cancel the export folder edit before exporting.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        let selected_strokes = match self.canvas_scene.selected_targets() {
+            Ok(selected) if !selected.is_empty() => selected,
+            Ok(_) => {
+                self.correction_panel_status =
+                    "Select committed ink before exporting a region.".to_owned();
+                self.request_redraw();
+                return;
+            }
+            Err(_) => {
+                self.correction_panel_status =
+                    "Export selection exceeds its fixed limits.".to_owned();
+                self.request_redraw();
+                return;
+            }
+        };
+        let source = match self.correction_session.as_ref() {
+            Some(session)
+                if export::selected_strokes_match_binding(
+                    &selected_strokes,
+                    &session.projection().ink.selected_strokes,
+                ) =>
+            {
+                PendingExportSource::Projection {
+                    projection_id: session.projection_id().to_owned(),
+                    ink_binding: session.projection().ink.clone(),
+                }
+            }
+            Some(session) => PendingExportSource::InkOnly {
+                prior_projection: Some(PendingExportProjectionContext {
+                    projection_id: session.projection_id().to_owned(),
+                    ink_binding: session.projection().ink.clone(),
+                }),
+            },
+            None => PendingExportSource::InkOnly {
+                prior_projection: None,
+            },
+        };
+        let target_path = PathBuf::from(self.export_path_editor.text());
+        if !export::is_absolute_local_target(&target_path) {
+            self.correction_panel_status =
+                "Choose an absolute local folder under an existing parent.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        let Some(batch_id) = self.allocate_project_batch_id() else {
+            self.correction_panel_status = "Export snapshot identifier was exhausted.".to_owned();
+            self.request_redraw();
+            return;
+        };
+        let snapshot_result = self
+            .project_writer
+            .as_mut()
+            .map(|writer| writer.try_snapshot_for_convert(batch_id));
+        match snapshot_result {
+            None => {
+                self.correction_panel_status =
+                    "Project writer is unavailable; export was not started.".to_owned();
+            }
+            Some(Ok(())) => {
+                let ink_only = matches!(&source, PendingExportSource::InkOnly { .. });
+                self.pending_export = Some(PendingExport {
+                    batch_id,
+                    target_path,
+                    source,
+                    selected_strokes,
+                    project_generation: self.project_generation,
+                    view_generation: self.convert_view_generation,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    result_receiver: None,
+                    worker: None,
+                });
+                self.correction_panel_status = if ink_only {
+                    "Ink-only export snapshot queued; the original selected ink will be staged off the UI thread.".to_owned()
+                } else {
+                    "Export snapshot queued; this saved region will be staged off the UI thread."
+                        .to_owned()
+                };
+            }
+            Some(Err(ProjectQueueError::QueueFull | ProjectQueueError::Backpressure { .. })) => {
+                self.correction_panel_status =
+                    "Project writer is busy; retry the export when storage catches up.".to_owned();
+            }
+            Some(Err(_)) => {
+                self.correction_panel_status =
+                    "Project writer is unavailable; export was not started.".to_owned();
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn cancel_export(&mut self) {
+        if let Some(pending) = self.pending_export.as_ref() {
+            pending.cancelled.store(true, Ordering::Release);
+            self.correction_panel_status =
+                "Export cancellation requested; owned staging cleanup is best-effort.".to_owned();
+            self.request_redraw();
+        }
+    }
+
+    fn start_export_worker(&mut self, batch_id: u64, state: journal::JournalReplayState) {
+        let Some(pending) = self.pending_export.as_ref() else {
+            self.handle_convert_snapshot(batch_id, state);
+            return;
+        };
+        if pending.batch_id != batch_id || pending.result_receiver.is_some() {
+            self.handle_convert_snapshot(batch_id, state);
+            return;
+        }
+        if pending.cancelled.load(Ordering::Acquire)
+            || !self.export_context_is_current(pending)
+            || self.pending_correction.is_some()
+        {
+            self.pending_export = None;
+            self.correction_panel_status =
+                "Export canceled because its selected source changed.".to_owned();
+            self.request_redraw();
+            return;
+        }
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let target_path = pending.target_path.clone();
+        let source = pending.source.clone();
+        let selected_strokes = pending.selected_strokes.clone();
+        let cancelled = Arc::clone(&pending.cancelled);
+        let thread = std::thread::Builder::new()
+            .name(format!("lassoink-export-{batch_id}"))
+            .spawn(move || {
+                let bundle_result = match source {
+                    PendingExportSource::Projection {
+                        projection_id,
+                        ink_binding,
+                    } => export::build_selected_region_bundle(
+                        &state,
+                        &projection_id,
+                        &ink_binding,
+                        &selected_strokes,
+                        &cancelled,
+                    ),
+                    PendingExportSource::InkOnly { .. } => {
+                        export::build_ink_only_bundle(&state, &selected_strokes, &cancelled)
+                    }
+                };
+                let result = bundle_result.and_then(|bundle| {
+                    export::publish_export_bundle(&target_path, &bundle, batch_id, &cancelled)
+                });
+                let _ = sender.send(result);
+            });
+        match thread {
+            Ok(worker) => {
+                let pending = self
+                    .pending_export
+                    .as_mut()
+                    .expect("export request is still owned");
+                pending.result_receiver = Some(receiver);
+                pending.worker = Some(worker);
+                self.correction_panel_status =
+                    "Exporting the frozen selection; press Export again to cancel before publication."
+                        .to_owned();
+            }
+            Err(_) => {
+                self.pending_export = None;
+                self.correction_panel_status =
+                    "Could not start the bounded export worker.".to_owned();
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn poll_export_worker(&mut self) {
+        let result = self.pending_export.as_ref().and_then(|pending| {
+            pending
+                .result_receiver
+                .as_ref()
+                .map(|receiver| receiver.try_recv())
+        });
+        let Some(result) = result else {
+            return;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(export::ExportError::IoFailure),
+        };
+        let mut pending = self
+            .pending_export
+            .take()
+            .expect("export result has an owner");
+        let worker_panicked = pending
+            .worker
+            .take()
+            .is_some_and(|worker| worker.join().is_err());
+        self.correction_panel_status = if worker_panicked {
+            "Export worker stopped unexpectedly; existing files were preserved.".to_owned()
+        } else {
+            match result {
+                Ok(()) => "Markdown/HTML export completed with the original ink image.".to_owned(),
+                Err(export::ExportError::Cancelled) => {
+                    "Export canceled before publication; existing files were preserved.".to_owned()
+                }
+                Err(export::ExportError::DestinationExists) => {
+                    "Export target already exists; choose a new folder.".to_owned()
+                }
+                Err(export::ExportError::InvalidTarget) => {
+                    "Choose an absolute local export folder.".to_owned()
+                }
+                Err(export::ExportError::InvalidSelection | export::ExportError::StaleSource) => {
+                    "Export canceled because the selected source is stale.".to_owned()
+                }
+                Err(export::ExportError::InvalidText) => {
+                    "Export text is invalid or exceeds its fixed bound.".to_owned()
+                }
+                Err(export::ExportError::InkUnavailable) => {
+                    "Selected ink could not be rendered; no text-only bundle was published."
+                        .to_owned()
+                }
+                Err(
+                    export::ExportError::AllocationFailed | export::ExportError::OutputTooLarge,
+                ) => "Export exceeded bounded memory or output limits.".to_owned(),
+                Err(export::ExportError::IoFailure) => {
+                    "Export failed; existing files were preserved.".to_owned()
+                }
+            }
+        };
+        self.request_redraw();
     }
 
     fn save_correction(&mut self) {
@@ -4050,7 +4468,14 @@ impl ProbeApp {
                     self.mark_project_incomplete(format!("project metadata write failed: {error}"));
                 }
                 ProjectWriterAck::ConvertSnapshot { batch_id, state } => {
-                    self.handle_convert_snapshot(batch_id, *state);
+                    let export_pending = self.pending_export.as_ref().is_some_and(|pending| {
+                        pending.batch_id == batch_id && pending.result_receiver.is_none()
+                    });
+                    if export_pending {
+                        self.start_export_worker(batch_id, *state);
+                    } else {
+                        self.handle_convert_snapshot(batch_id, *state);
+                    }
                 }
                 ProjectWriterAck::RecognitionProjectionCommitted { batch_id, record } => {
                     let matches_pending = self.pending_convert.as_ref().is_some_and(|pending| {
@@ -4082,6 +4507,7 @@ impl ProbeApp {
                                 {
                                     Ok(session) => {
                                         self.correction_session = Some(session);
+                                        self.cancel_stale_export();
                                         self.correction_panel_status =
                                             "New durable provider output opened; raw result is immutable.".to_owned();
                                     }
@@ -4718,6 +5144,11 @@ impl ProbeApp {
                 let execution = match outcome.outcome {
                     Ok(execution) => execution,
                     Err(error) => {
+                        #[cfg(test)]
+                        {
+                            self.last_provider_error_code =
+                                Some(safe_provider_error_code_for_test(&error.kind));
+                        }
                         self.provider_worker = None;
                         self.canvas_status =
                             convert_provider_failure_message(&error.kind).to_owned();
@@ -4797,6 +5228,7 @@ impl ProbeApp {
 
     fn mark_project_incomplete(&mut self, reason: String) {
         self.project_generation = self.project_generation.saturating_add(1);
+        self.cancel_stale_export();
         if self.pending_convert.as_ref().is_some_and(|pending| {
             !matches!(&pending.phase, PendingConvertPhase::Persisting { .. })
         }) {
@@ -5330,6 +5762,7 @@ impl ProbeApp {
 
     fn finish_project_writer(&mut self) -> Result<(), String> {
         self.project_generation = self.project_generation.saturating_add(1);
+        self.cancel_stale_export();
         self.cancel_convert("Convert canceled when the project closed".to_owned());
         self.cancel_and_join_preparation_for_shutdown();
         self.process_pending_project_capture();
@@ -5763,6 +6196,7 @@ impl ApplicationHandler for ProbeApp {
 
         match event {
             WindowEvent::CloseRequested => {
+                self.cancel_export();
                 if let Some(window) = self.window.as_ref() {
                     window.set_ime_allowed(false);
                 }
@@ -6077,6 +6511,7 @@ impl ApplicationHandler for ProbeApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.process_pending_project_capture();
         self.poll_convert();
+        self.poll_export_worker();
         {
             let mut state = self.probe_state.borrow_mut();
             state.expire_public_dispatch_candidate();
@@ -6400,8 +6835,11 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
         local_convert_provider,
         provider_worker: None,
         pending_convert: None,
+        #[cfg(test)]
+        last_provider_error_code: None,
         correction_session: initial_correction_session,
         pending_correction: None,
+        pending_export: None,
         next_correction_id: 1,
         correction_focus: CorrectionPaneFocus::None,
         correction_panel_status: initial_correction_status,
@@ -7257,18 +7695,19 @@ mod correction_pane_pointer_owner_tests {
     fn action_hit_targets_follow_measured_labels_and_spacing() {
         let mut measurements = GdiTextAdvanceCache::default();
         let targets = correction_action_hit_targets(
-            "[Convert] [Save] [Reset] [Cancel] [Copy]",
+            "[Convert] [Save] [Reset] [Cancel] [Copy] [Export]",
             &mut measurements,
         )
         .unwrap();
-        assert_eq!(targets.len(), 5);
+        assert_eq!(targets.len(), 6);
         assert_eq!(targets[0].1, CorrectionPaneAction::Convert);
         assert_eq!(targets[1].1, CorrectionPaneAction::Save);
         assert_eq!(targets[2].1, CorrectionPaneAction::Reset);
         assert_eq!(targets[3].1, CorrectionPaneAction::Cancel);
         assert_eq!(targets[4].1, CorrectionPaneAction::Copy);
+        assert_eq!(targets[5].1, CorrectionPaneAction::Export);
         assert_eq!(targets[0].0, 0..80);
-        assert_eq!(targets[4].0, 272..320);
+        assert_eq!(targets[4].0, 272..328);
     }
 
     #[test]
@@ -7291,7 +7730,7 @@ mod correction_pane_pointer_owner_tests {
                 .unwrap();
         assert_eq!(naive_offset, 147);
         let measured_actions = correction_action_hit_targets(
-            "[Convert] [Save] [Reset] [Cancel] [Copy]",
+            "[Convert] [Save] [Reset] [Cancel] [Copy] [Export]",
             &mut GdiTextAdvanceCache::default(),
         )
         .unwrap();
@@ -7448,7 +7887,7 @@ mod correction_pane_scroll_tests {
         );
         let top_actions = append_pane_line(
             &mut top_layout,
-            "[Convert] [Save] [Reset] [Cancel] [Copy]".to_owned(),
+            "[Convert] [Save] [Reset] [Cancel] [Copy] [Export]".to_owned(),
         );
         let top_config = append_pane_line(&mut top_layout, "[Load config]".to_owned());
 
@@ -7462,7 +7901,7 @@ mod correction_pane_scroll_tests {
         );
         let bottom_actions = append_pane_line(
             &mut bottom_layout,
-            "[Convert] [Save] [Reset] [Cancel] [Copy]".to_owned(),
+            "[Convert] [Save] [Reset] [Cancel] [Copy] [Export]".to_owned(),
         );
         let bottom_config = append_pane_line(&mut bottom_layout, "[Load config]".to_owned());
         assert_eq!(top_actions, bottom_actions);
@@ -7569,7 +8008,7 @@ mod correction_pane_scroll_tests {
         assert!(
             wide.last().copied().unwrap_or_default() > narrow.last().copied().unwrap_or_default()
         );
-        let action_label = "[Convert] [Save] [Reset] [Cancel] [Copy]";
+        let action_label = "[Convert] [Save] [Reset] [Cancel] [Copy] [Export]";
         assert!(
             measurements
                 .advances(action_label)
@@ -7769,9 +8208,10 @@ mod convert_controller_tests {
     use super::{
         CaptureMode, ControlledStallTrigger, CorrectionPaneFocus, CorrectionPaneScrollOffsets,
         CorrectionTextEditor, DirectUiPointerOwnerTracker, GdiTextAdvanceCache, ModifiersState,
-        PendingConvert, PendingConvertPhase, PendingRecordCursor, ProbeApp, ProbeState,
-        WintabCapture, convert_context_matches, convert_phase_is_persisting,
-        convert_provider_failure_message,
+        PendingConvert, PendingConvertPhase, PendingExport, PendingExportProjectionContext,
+        PendingExportSource, PendingRecordCursor, ProbeApp, ProbeState, WintabCapture,
+        convert_context_matches, convert_phase_is_persisting, convert_provider_failure_message,
+        export_context_matches,
     };
     use crate::{
         canvas::{
@@ -7789,7 +8229,9 @@ mod convert_controller_tests {
     };
     use std::{
         cell::RefCell,
-        fs, process,
+        fs,
+        path::PathBuf,
+        process,
         rc::Rc,
         sync::{Arc, atomic::AtomicBool},
         time::{Duration, Instant},
@@ -7865,6 +8307,160 @@ mod convert_controller_tests {
             11,
             Some(std::slice::from_ref(&stroke)),
             true,
+        ));
+    }
+
+    #[test]
+    fn export_context_requires_same_project_view_projection_binding_and_selection() {
+        let stroke = selected_stroke("export-selected");
+        let binding = ProjectionInkBindingV1 {
+            journal_id: stroke.journal_id.clone(),
+            logical_revision: 1,
+            last_sequence: 3,
+            region_id: "export-region".to_owned(),
+            line_id: Some("export-line".to_owned()),
+            input_view_id: "input-view-v1-0000000000000001".to_owned(),
+            ink_binding_sha256: "a".repeat(64),
+            selected_strokes: vec![stroke.clone()],
+            source_sample_sequences: vec![2],
+            stroke_views: Vec::new(),
+        };
+        let pending = PendingExport {
+            batch_id: 4,
+            target_path: PathBuf::from(r"C:\exports\new-bundle"),
+            source: PendingExportSource::Projection {
+                projection_id: "export-projection".to_owned(),
+                ink_binding: binding.clone(),
+            },
+            selected_strokes: vec![stroke.clone()],
+            project_generation: 7,
+            view_generation: 11,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            result_receiver: None,
+            worker: None,
+        };
+
+        assert!(export_context_matches(
+            &pending,
+            7,
+            11,
+            Some("export-projection"),
+            Some(&binding),
+            Some(std::slice::from_ref(&stroke)),
+        ));
+        assert!(!export_context_matches(
+            &pending,
+            8,
+            11,
+            Some("export-projection"),
+            Some(&binding),
+            Some(std::slice::from_ref(&stroke)),
+        ));
+        assert!(!export_context_matches(
+            &pending,
+            7,
+            12,
+            Some("export-projection"),
+            Some(&binding),
+            Some(std::slice::from_ref(&stroke)),
+        ));
+        assert!(!export_context_matches(
+            &pending,
+            7,
+            11,
+            Some("new-projection"),
+            Some(&binding),
+            Some(std::slice::from_ref(&stroke)),
+        ));
+        let mut changed_binding = binding.clone();
+        changed_binding.logical_revision = changed_binding.logical_revision.saturating_add(1);
+        assert!(!export_context_matches(
+            &pending,
+            7,
+            11,
+            Some("export-projection"),
+            Some(&changed_binding),
+            Some(std::slice::from_ref(&stroke)),
+        ));
+        let changed_stroke = selected_stroke("changed-selection");
+        assert!(!export_context_matches(
+            &pending,
+            7,
+            11,
+            Some("export-projection"),
+            Some(&binding),
+            Some(std::slice::from_ref(&changed_stroke)),
+        ));
+
+        let ink_only_pending = PendingExport {
+            batch_id: 5,
+            target_path: PathBuf::from(r"C:\exports\ink-only-bundle"),
+            source: PendingExportSource::InkOnly {
+                prior_projection: None,
+            },
+            selected_strokes: vec![stroke.clone()],
+            project_generation: 7,
+            view_generation: 11,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            result_receiver: None,
+            worker: None,
+        };
+        assert!(export_context_matches(
+            &ink_only_pending,
+            7,
+            11,
+            None,
+            None,
+            Some(std::slice::from_ref(&stroke)),
+        ));
+        assert!(!export_context_matches(
+            &ink_only_pending,
+            7,
+            11,
+            Some("projection-appeared"),
+            Some(&binding),
+            Some(std::slice::from_ref(&stroke)),
+        ));
+
+        let ink_only_with_prior_session = PendingExport {
+            batch_id: 6,
+            target_path: PathBuf::from(r"C:\exports\other-region-bundle"),
+            source: PendingExportSource::InkOnly {
+                prior_projection: Some(PendingExportProjectionContext {
+                    projection_id: "export-projection".to_owned(),
+                    ink_binding: binding.clone(),
+                }),
+            },
+            selected_strokes: vec![changed_stroke.clone()],
+            project_generation: 7,
+            view_generation: 11,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            result_receiver: None,
+            worker: None,
+        };
+        assert!(export_context_matches(
+            &ink_only_with_prior_session,
+            7,
+            11,
+            Some("export-projection"),
+            Some(&binding),
+            Some(std::slice::from_ref(&changed_stroke)),
+        ));
+        assert!(!export_context_matches(
+            &ink_only_with_prior_session,
+            7,
+            11,
+            Some("replacement-projection"),
+            Some(&binding),
+            Some(std::slice::from_ref(&changed_stroke)),
+        ));
+        assert!(!export_context_matches(
+            &ink_only_with_prior_session,
+            7,
+            11,
+            Some("export-projection"),
+            Some(&changed_binding),
+            Some(std::slice::from_ref(&changed_stroke)),
         ));
     }
 
@@ -7977,8 +8573,11 @@ mod convert_controller_tests {
             local_convert_provider: None,
             provider_worker: None,
             pending_convert: None,
+            #[cfg(test)]
+            last_provider_error_code: None,
             correction_session: None,
             pending_correction: None,
+            pending_export: None,
             next_correction_id: 1,
             correction_focus: CorrectionPaneFocus::None,
             correction_panel_status: String::new(),
@@ -8183,8 +8782,15 @@ mod convert_controller_tests {
 mod f4_convert_mock_pipeline_tests {
     use super::*;
     use crate::{
-        canvas::PROVISIONAL_DIRECT_SOURCE_API,
-        convert::{LocalConvertProviderV1, prepare_conversion},
+        canvas::{
+            CanonicalRasterProjectionSpecV1, PROVISIONAL_DIRECT_SOURCE_API,
+            build_canonical_raster_projection_plan, render_canonical_raster,
+            transform_canonical_raster_geometry,
+        },
+        convert::{
+            CONVERT_RASTER_HEIGHT_PX, CONVERT_RASTER_SOURCE_PADDING_PX, CONVERT_RASTER_WIDTH_PX,
+            LocalConvertProviderV1, prepare_conversion,
+        },
         journal::{
             PhysicalSample, ProjectionInkBindingV1, ProjectionInputModalityV1,
             ProjectionProviderProvenanceV1, RawPosition, RecognitionCandidateV1,
@@ -8209,6 +8815,14 @@ mod f4_convert_mock_pipeline_tests {
     impl Drop for ReleaseWorkerOnDrop {
         fn drop(&mut self) {
             let _ = fs::write(&self.0, b"release");
+        }
+    }
+
+    struct SenocrExportTempDirectory(PathBuf);
+
+    impl Drop for SenocrExportTempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
         }
     }
 
@@ -8445,7 +9059,7 @@ mod f4_convert_mock_pipeline_tests {
         project_journal_id: String,
         active_session_id: String,
         writer: ProjectWriterHandle,
-        provider: LocalConvertProviderV1,
+        provider: Option<LocalConvertProviderV1>,
         scene: CanvasScene,
         app_clock_origin: Instant,
     ) -> ProbeApp {
@@ -8475,11 +9089,14 @@ mod f4_convert_mock_pipeline_tests {
             project_writer: Some(writer),
             project_path,
             project_journal_id,
-            local_convert_provider: Some(provider),
+            local_convert_provider: provider,
             provider_worker: None,
             pending_convert: None,
+            #[cfg(test)]
+            last_provider_error_code: None,
             correction_session: None,
             pending_correction: None,
+            pending_export: None,
             next_correction_id: 1,
             correction_focus: CorrectionPaneFocus::None,
             correction_panel_status: String::new(),
@@ -8623,7 +9240,7 @@ mod f4_convert_mock_pipeline_tests {
             journal_id.to_owned(),
             session_id.to_owned(),
             writer,
-            provider,
+            Some(provider),
             CanvasScene::default(),
             Instant::now(),
         );
@@ -8778,7 +9395,7 @@ mod f4_convert_mock_pipeline_tests {
             journal_id.to_owned(),
             active_session_id.to_owned(),
             project_writer,
-            provider,
+            Some(provider),
             scene,
             Instant::now(),
         );
@@ -8919,7 +9536,7 @@ mod f4_convert_mock_pipeline_tests {
             journal_id.to_owned(),
             session_id.to_owned(),
             writer,
-            provider,
+            Some(provider),
             scene,
             Instant::now(),
         );
@@ -9099,12 +9716,23 @@ mod f4_convert_mock_pipeline_tests {
         while !finished(app) {
             app.drain_project_writer_acks();
             app.poll_convert();
+            app.poll_export_worker();
             assert!(
                 Instant::now() < deadline,
                 "F4 mock pipeline did not reach its checkpoint"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn wait_for_convert_completion(app: &mut ProbeApp, timeout: Duration) {
+        wait_for_app(app, timeout, |app| app.pending_convert.is_none());
+        assert_eq!(
+            app.canvas_status,
+            "Convert result was durably saved as a projection",
+            "F4 production Convert ended before a projection was durably saved; provider code: {}",
+            app.last_provider_error_code.as_deref().unwrap_or("none")
+        );
     }
 
     #[test]
@@ -9162,7 +9790,7 @@ mod f4_convert_mock_pipeline_tests {
             journal_id.to_owned(),
             active_session_id.to_owned(),
             writer,
-            first_provider,
+            Some(first_provider),
             scene,
             app_clock_origin,
         );
@@ -9228,9 +9856,9 @@ mod f4_convert_mock_pipeline_tests {
         assert!(pane.load_config_row.is_some());
         assert!(pane.export_path_row.is_some());
         assert!(
-            pane.lines
+            pane.action_hit_targets
                 .iter()
-                .any(|line| line.contains("Export is not implemented"))
+                .any(|(_, action)| { *action == CorrectionPaneAction::Export })
         );
         assert!(
             app.correction_session
@@ -9605,7 +10233,7 @@ mod f4_convert_mock_pipeline_tests {
             journal_id.to_owned(),
             session_id.to_owned(),
             writer,
-            provider,
+            Some(provider),
             scene,
             Instant::now(),
         );
@@ -9687,7 +10315,387 @@ mod f4_convert_mock_pipeline_tests {
         let _ = fs::remove_dir_all(test_directory);
     }
 
+    #[test]
+    #[ignore = "guarded hosted production F4, durable correction, and local export using the pinned SenOCR assets"]
+    fn senocr_f4_convert_human_correction_export_e2e() {
+        crate::provider_protocol::tests::require_senocr_m4_worker_test_opt_in();
+        const MODEL_REVISION: &str = "1e70dff4ef0429b0d88a2b873fb5d03300af1a41";
+
+        let runner_temp = PathBuf::from(
+            std::env::var_os("RUNNER_TEMP").expect("guarded hosted runner temporary directory"),
+        );
+        let shared_dir = PathBuf::from(
+            std::env::var_os("LASSOINK_SENOCR_E2E_SHARED_DIR")
+                .expect("guarded SenOCR shared directory"),
+        );
+        assert!(runner_temp.is_absolute() && shared_dir.is_absolute());
+        assert_eq!(
+            shared_dir
+                .parent()
+                .and_then(|parent| parent.canonicalize().ok()),
+            runner_temp.canonicalize().ok()
+        );
+        fs::create_dir(&shared_dir).expect("create fresh guarded F4 shared directory");
+        let _shared_directory_guard = SenocrExportTempDirectory(shared_dir.clone());
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let test_directory = shared_dir.join(format!("f4-export-{}-{nonce}", process::id()));
+        fs::create_dir(&test_directory).expect("create unique F4 export test directory");
+        let _test_directory_guard = SenocrExportTempDirectory(test_directory.clone());
+
+        let python_executable = PathBuf::from(
+            std::env::var_os("LASSOINK_SENOCR_PYTHON").expect("guarded pinned Python executable"),
+        );
+        let asset_root = PathBuf::from(
+            std::env::var_os("LASSOINK_SENOCR_ASSET_ROOT")
+                .expect("guarded 12-asset SenOCR fixture"),
+        );
+        let worker_script =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/senocr_fp32_worker.py");
+        assert!(python_executable.is_absolute() && asset_root.is_absolute());
+        assert!(worker_script.is_absolute() && asset_root.is_dir());
+
+        let provider_config_path = test_directory.join("senocr-f4-export-provider.json");
+        let provider_config = serde_json::json!({
+            "schema_version": 1,
+            "providers": [{
+                "provider_id": "senocr-v1-fp32-local",
+                "executable_path": python_executable.to_string_lossy(),
+                "arguments": [worker_script.to_string_lossy()],
+                "protocol_configuration": {
+                    "configuration_id": "senocr-v1-fp32-local",
+                    "values": {
+                        "asset_root": asset_root.to_string_lossy(),
+                        "model_id": "VietAlphaLabs/SenOCR-Vi",
+                        "model_revision": MODEL_REVISION,
+                    }
+                },
+                "requested_input_modalities": ["raster"],
+                "language_hints": ["vi-VN"]
+            }]
+        });
+        fs::write(
+            &provider_config_path,
+            serde_json::to_vec(&provider_config).unwrap(),
+        )
+        .expect("write local test-only provider configuration");
+        let provider = LocalConvertProviderV1::load(&provider_config_path, None)
+            .unwrap_or_else(|_| panic!("guarded SenOCR provider configuration was rejected"));
+
+        let project_path = test_directory.join("senocr-f4-export-project.inkj");
+        let journal_id = "senocr-f4-export-project";
+        let session_id = "senocr-f4-export-session";
+        let target = direct_target(journal_id, session_id, "senocr-f4-export-stroke");
+        let frame = StrokeViewFrame::default();
+        let mut journal_writer = JournalWriter::create(
+            project_path.clone(),
+            JournalHeader {
+                journal_id: journal_id.to_owned(),
+                session_id: session_id.to_owned(),
+                config_id: Some("f4-synthetic-config".to_owned()),
+                device_model_declared: None,
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        journal_writer
+            .start_stroke(target.clone(), frame, 1)
+            .unwrap();
+        journal_writer
+            .append_sample(direct_sample(&target, 1, 120))
+            .unwrap();
+        journal_writer.commit_stroke(target.clone(), 2).unwrap();
+        let initial_state = journal_writer.replay_state().clone();
+
+        // The earlier M4 E2E removes its shared directory after the guarded
+        // worker parity check. Rebuild this F4 fixture from the same canonical
+        // render plan used by production Convert so the worker can verify its
+        // PNG decode against the exact selected source pixels.
+        let raster_plan =
+            build_canonical_raster_projection_plan(&initial_state, std::slice::from_ref(&target))
+                .unwrap();
+        let raster_spec = CanonicalRasterProjectionSpecV1::new(
+            CONVERT_RASTER_WIDTH_PX,
+            CONVERT_RASTER_HEIGHT_PX,
+            raster_plan
+                .source_crop_with_padding(CONVERT_RASTER_SOURCE_PADDING_PX)
+                .unwrap(),
+        );
+        let raster_geometry =
+            transform_canonical_raster_geometry(&raster_plan, &raster_spec).unwrap();
+        let raster_image = render_canonical_raster(&raster_geometry).unwrap();
+        let (raster_width, raster_height, raster_stride) =
+            raster_image.output_dimensions_and_stride();
+        assert_eq!(
+            (raster_width, raster_height),
+            (CONVERT_RASTER_WIDTH_PX, CONVERT_RASTER_HEIGHT_PX)
+        );
+        let rgba = raster_image.rgba8_premultiplied_srgb_top_down();
+        assert_eq!(
+            rgba.len(),
+            (raster_stride as usize) * (raster_height as usize)
+        );
+        assert!(
+            rgba.len()
+                <= (CONVERT_RASTER_WIDTH_PX as usize) * (CONVERT_RASTER_HEIGHT_PX as usize) * 4
+        );
+        let mut parity_baseline = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(shared_dir.join("canonical-rgba.bin"))
+            .expect("create test-only F4 canonical pixel baseline");
+        std::io::Write::write_all(&mut parity_baseline, rgba)
+            .expect("write test-only F4 canonical pixel baseline");
+        std::io::Write::flush(&mut parity_baseline)
+            .expect("flush test-only F4 canonical pixel baseline");
+        parity_baseline
+            .sync_all()
+            .expect("sync test-only F4 canonical pixel baseline");
+        drop(parity_baseline);
+
+        let mut scene =
+            CanvasScene::from_journal(&initial_state, PROVISIONAL_DIRECT_SOURCE_API).unwrap();
+        scene.select_target(Some(target.clone())).unwrap();
+        let writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        let mut app = make_test_app(
+            project_path.clone(),
+            journal_id.to_owned(),
+            session_id.to_owned(),
+            writer,
+            Some(provider),
+            scene,
+            Instant::now(),
+        );
+        app.client_size = Some((960, 720));
+
+        // This is the production controller path invoked by F4; the selected
+        // source is synthetic ink and the worker uses only the pinned assets.
+        app.start_or_cancel_convert();
+        wait_for_convert_completion(&mut app, Duration::from_secs(300));
+        assert!(app.project_writer.as_ref().unwrap().is_idle());
+        let projection = app.correction_session.as_ref().unwrap().projection();
+        assert_eq!(projection.provider.provider_id, "senocr-v1-fp32-local");
+        assert_eq!(
+            projection.provider.model_version.as_deref(),
+            Some(MODEL_REVISION)
+        );
+        let provider_version = projection.provider.provider_version.clone();
+        let resource_version = projection
+            .provider
+            .resource_version
+            .clone()
+            .expect("pinned SenOCR worker reports its runtime profile");
+        let configuration_fingerprint = projection.provider.configuration_fingerprint.clone();
+        assert_eq!(projection.ink.selected_strokes, vec![target.clone()]);
+        assert!(
+            projection
+                .candidates
+                .iter()
+                .any(|candidate| candidate.rank == 0)
+        );
+
+        let human_text =
+            "Human NFD e\u{301}\nsecond line <safe> [plain](https://not-a-reference.invalid)";
+        app.set_correction_focus(CorrectionPaneFocus::CorrectionEditor);
+        let session = app.correction_session.as_mut().unwrap();
+        session.select_all();
+        session.insert_text(human_text).unwrap();
+        app.save_correction();
+        wait_for_app(&mut app, Duration::from_secs(20), |app| {
+            app.pending_correction.is_none()
+                && app.correction_session.as_ref().is_some_and(|session| {
+                    !session.is_dirty()
+                        && session.correction_history().len() == 1
+                        && session.effective_text() == Some(human_text)
+                })
+        });
+
+        let export_path = test_directory.join("selected-region-bundle");
+        app.export_path_editor
+            .insert_text(&export_path.to_string_lossy())
+            .unwrap();
+        let pane = app.correction_pane_layout().unwrap();
+        assert!(
+            pane.action_hit_targets
+                .iter()
+                .any(|(_, action)| *action == CorrectionPaneAction::Export)
+        );
+        app.dispatch_pane_action(CorrectionPaneAction::Export);
+        wait_for_app(&mut app, Duration::from_secs(30), |app| {
+            app.pending_export.is_none() && app.correction_panel_status.contains("export completed")
+        });
+
+        let markdown = fs::read_to_string(export_path.join("document.md")).unwrap();
+        let html = fs::read_to_string(export_path.join("index.html")).unwrap();
+        let png = fs::read(export_path.join("assets/selected-region.png")).unwrap();
+        assert!(markdown.contains("Human NFD e\u{301}"));
+        assert!(markdown.contains("assets/selected-region.png"));
+        assert!(markdown.contains("Selection binding SHA-256"));
+        assert!(markdown.contains("Projection identity SHA-256"));
+        assert!(markdown.contains("Correction identity SHA-256"));
+        assert!(markdown.contains("Export raster spec SHA-256"));
+        assert!(markdown.contains("Export PNG SHA-256"));
+        assert!(!markdown.contains("](https://not-a-reference.invalid)"));
+        assert!(html.contains("Human NFD e\u{301}"));
+        assert!(html.contains("&lt;safe&gt;"));
+        assert!(!html.contains("<safe>"));
+        for private_path in [
+            &asset_root,
+            &provider_config_path,
+            &project_path,
+            &python_executable,
+            &worker_script,
+            &shared_dir,
+            &test_directory,
+            &export_path,
+        ] {
+            let private_path_text = private_path.to_string_lossy();
+            assert!(!markdown.contains(private_path_text.as_ref()));
+            assert!(!html.contains(private_path_text.as_ref()));
+        }
+        assert!(!markdown.contains("senocr-v1-fp32-local"));
+        assert!(!html.contains("senocr-v1-fp32-local"));
+        assert!(markdown.contains("Provider version:"));
+        assert!(html.contains("Provider version"));
+        assert!(html.contains(provider_version.as_str()));
+        assert!(html.contains("Resource version"));
+        assert!(html.contains(resource_version.as_str()));
+        assert!(html.contains("Provider configuration fingerprint SHA-256"));
+        assert!(!html.contains(configuration_fingerprint.as_str()));
+        assert!(markdown.contains(MODEL_REVISION));
+        assert!(html.contains(MODEL_REVISION));
+        assert!(html.contains("src=\"assets/selected-region.png\""));
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(png.len() <= canvas::MAX_CANONICAL_RASTER_PNG_BYTES);
+
+        app.finish_project_writer().unwrap();
+        let persisted = read_journal(&project_path).unwrap();
+        assert_eq!(persisted.state.recognition_projections.len(), 1);
+        assert_eq!(persisted.state.region_corrections.len(), 1);
+        assert!(matches!(
+            &persisted.state.region_corrections[0].correction.action,
+            RegionCorrectionActionV1::SetText(text) if text == human_text
+        ));
+    }
+
     fn release_marker_guarded_write(path: &std::path::Path) {
         fs::write(path, b"release").unwrap();
+    }
+
+    #[test]
+    #[ignore = "guarded hosted Windows ink-only export without a stored provider projection"]
+    fn ink_only_export_without_projection_or_provider_publishes_selected_ink() {
+        require_native_ui_test_opt_in();
+        let test_directory = std::env::temp_dir().join(format!(
+            "lassoink-ink-only-export-{}-{}",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir(&test_directory).unwrap();
+        let _test_directory_guard = SenocrExportTempDirectory(test_directory.clone());
+        let project_path = test_directory.join("ink-only-project.inkj");
+        let journal_id = "ink-only-project";
+        let session_id = "ink-only-session";
+        let target = direct_target(journal_id, session_id, "ink-only-stroke");
+        let mut journal_writer = JournalWriter::create(
+            project_path.clone(),
+            JournalHeader {
+                journal_id: journal_id.to_owned(),
+                session_id: session_id.to_owned(),
+                config_id: Some("ink-only-config".to_owned()),
+                device_model_declared: None,
+                tilt_supported_declared: Some(false),
+            },
+        )
+        .unwrap();
+        journal_writer
+            .start_stroke(target.clone(), StrokeViewFrame::default(), 1)
+            .unwrap();
+        journal_writer
+            .append_sample(direct_sample(&target, 1, 120))
+            .unwrap();
+        journal_writer.commit_stroke(target.clone(), 2).unwrap();
+        assert!(
+            journal_writer
+                .replay_state()
+                .recognition_projections
+                .is_empty()
+        );
+        assert!(journal_writer.replay_state().region_corrections.is_empty());
+        let initial_state = journal_writer.replay_state().clone();
+        let mut scene =
+            CanvasScene::from_journal(&initial_state, PROVISIONAL_DIRECT_SOURCE_API).unwrap();
+        scene.select_target(Some(target)).unwrap();
+        let writer = ProjectWriterHandle::spawn(journal_writer).unwrap();
+        let mut app = make_test_app(
+            project_path.clone(),
+            journal_id.to_owned(),
+            session_id.to_owned(),
+            writer,
+            None,
+            scene,
+            Instant::now(),
+        );
+        app.client_size = Some((960, 720));
+        let export_path = test_directory.join("ink-only-bundle");
+        app.export_path_editor
+            .insert_text(&export_path.to_string_lossy())
+            .unwrap();
+        assert!(app.local_convert_provider.is_none());
+        assert!(app.provider_worker.is_none());
+        app.dispatch_pane_action(CorrectionPaneAction::Export);
+        wait_for_app(&mut app, Duration::from_secs(30), |app| {
+            app.pending_export.is_none() && app.correction_panel_status.contains("export completed")
+        });
+        assert!(app.local_convert_provider.is_none());
+        assert!(app.provider_worker.is_none());
+
+        let markdown = fs::read_to_string(export_path.join("document.md")).unwrap();
+        let html = fs::read_to_string(export_path.join("index.html")).unwrap();
+        let png = fs::read(export_path.join("assets/selected-region.png")).unwrap();
+        assert!(markdown.contains("ink-only export"));
+        assert!(markdown.contains("Binding kind: ink only"));
+        assert!(!markdown.contains("Projection identity SHA-256"));
+        assert!(!markdown.contains("Provider identity SHA-256"));
+        assert!(html.contains("ink-only export"));
+        assert!(html.contains("Binding kind"));
+        assert!(!html.contains("Projection identity SHA-256"));
+        assert!(!html.contains("Provider identity SHA-256"));
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(png.len() <= canvas::MAX_CANONICAL_RASTER_PNG_BYTES);
+
+        let (mut prior_session, _, _, _) = scroll_state_correction_session(journal_id);
+        prior_session.cancel();
+        assert!(!prior_session.is_dirty());
+        app.correction_session = Some(prior_session);
+        let old_session_export_path = test_directory.join("ink-only-with-prior-session");
+        app.export_path_editor =
+            CorrectionTextEditor::new(&old_session_export_path.to_string_lossy()).unwrap();
+        app.dispatch_pane_action(CorrectionPaneAction::Export);
+        assert!(matches!(
+            app.pending_export.as_ref().map(|pending| &pending.source),
+            Some(PendingExportSource::InkOnly {
+                prior_projection: Some(prior)
+            }) if prior.projection_id == "pane-scroll-projection"
+        ));
+        wait_for_app(&mut app, Duration::from_secs(30), |app| {
+            app.pending_export.is_none() && app.correction_panel_status.contains("export completed")
+        });
+        assert!(app.local_convert_provider.is_none());
+        assert!(app.provider_worker.is_none());
+        let old_session_markdown =
+            fs::read_to_string(old_session_export_path.join("document.md")).unwrap();
+        assert!(old_session_markdown.contains("Binding kind: ink only"));
+        assert!(!old_session_markdown.contains("Projection identity SHA-256"));
+
+        app.finish_project_writer().unwrap();
+        let persisted = read_journal(&project_path).unwrap();
+        assert!(persisted.state.recognition_projections.is_empty());
+        assert!(persisted.state.region_corrections.is_empty());
     }
 }

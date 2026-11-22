@@ -1641,6 +1641,36 @@ impl JournalReplayState {
         Ok(())
     }
 
+    /// Revalidates the exact projection and its append-only correction history
+    /// before deriving an external export from this replay snapshot. A later
+    /// derived record may advance `last_sequence`; selected-ink validation
+    /// still rejects changes to the bound strokes or view.
+    pub(crate) fn validate_export_projection_binding(
+        &self,
+        projection_id: &str,
+        binding: &ProjectionInkBindingV1,
+    ) -> Result<(), JournalError> {
+        let stored_projection = self
+            .recognition_projections
+            .iter()
+            .find(|stored| stored.projection.projection_id == projection_id)
+            .ok_or_else(|| JournalError::invalid("export target projection is unknown"))?;
+        if &stored_projection.projection.ink != binding {
+            return Err(JournalError::invalid(
+                "export binding differs from the exact stored projection source",
+            ));
+        }
+        self.validate_recognition_projection(&stored_projection.projection)?;
+        for stored_correction in self
+            .region_corrections
+            .iter()
+            .filter(|stored| stored.correction.projection_id == projection_id)
+        {
+            self.validate_region_correction(&stored_correction.correction)?;
+        }
+        Ok(())
+    }
+
     fn prepare_record(
         &mut self,
         _header: &JournalHeader,

@@ -26,6 +26,7 @@ ALLOWED_BRANCHES = frozenset(
         "feat/benchmark-fidelity",
         "feat/benchmark-observability",
         "feat/benchmark-resources",
+        "feat/experimental-convert",
     }
 )
 MODEL_REPOSITORY = "VietAlphaLabs/SenOCR-Vi"

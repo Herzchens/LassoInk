@@ -4352,7 +4352,7 @@ pub(crate) mod tests {
     }
 
     #[cfg(windows)]
-    fn require_senocr_m4_worker_test_opt_in() {
+    pub(crate) fn require_senocr_m4_worker_test_opt_in() {
         assert!(
             std::env::var("LASSOINK_RUN_SENOCR_M4_E2E").is_ok_and(|value| value == "1"),
             "the model-backed M4 worker test requires its dedicated hosted opt-in"
@@ -4382,6 +4382,7 @@ pub(crate) mod tests {
                 "feat/benchmark-fidelity"
                     | "feat/benchmark-observability"
                     | "feat/benchmark-resources"
+                    | "feat/experimental-convert"
             ),
             "the guarded worker PR branch is not allowlisted"
         );

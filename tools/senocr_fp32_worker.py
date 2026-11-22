@@ -540,6 +540,7 @@ SENOCR_E2E_ALLOWED_HEAD_REFS = frozenset(
         "feat/benchmark-fidelity",
         "feat/benchmark-observability",
         "feat/benchmark-resources",
+        "feat/experimental-convert",
     }
 )
 
