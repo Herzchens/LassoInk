@@ -3,6 +3,7 @@ name: Windows CI
 on:
   push:
   pull_request:
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -11,6 +12,7 @@ jobs:
 
   verify:
     name: Verify M5/M6 benchmark harness and default tests on Windows x64
+    if: github.event_name != 'pull_request' || github.event.action != 'labeled'
     runs-on: windows-2025
     steps:
       - name: Check out exact PR head or pushed commit
@@ -52,6 +54,7 @@ jobs:
 
   native-ui:
     name: Guarded Windows and provider subprocess tests
+    if: github.event_name != 'pull_request' || github.event.action != 'labeled'
     needs: verify
     runs-on: windows-2025
     timeout-minutes: 20
@@ -89,6 +92,7 @@ jobs:
 
   raster-reference-protocol:
     name: Test stdlib Raster worker protocol helpers
+    if: github.event_name != 'pull_request' || github.event.action != 'labeled'
     runs-on: windows-2025
     timeout-minutes: 10
     permissions:
@@ -125,6 +129,7 @@ jobs:
   raster-cpu-compatibility:
     name: Guarded SenOCR CPU compatibility and M4 Raster worker E2E
     if: >-
+      (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
       github.repository == 'Herzchens/LassoInk' &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
@@ -362,3 +367,261 @@ jobs:
           $apngFixture = [IO.Path]::GetFullPath((Join-Path $runnerTemp 'senocr-apng-negative.png'))
           if ([IO.Path]::GetDirectoryName($apngFixture) -cne $runnerTemp) { throw 'APNG cleanup path escaped RUNNER_TEMP.' }
           if (Test-Path -LiteralPath $apngFixture) { Remove-Item -LiteralPath $apngFixture -Force }
+
+  document-export:
+    name: Locked DOCX/PDF feature and renderer verification
+    if: >-
+      github.repository == 'Herzchens/LassoInk' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref == 'feat/document-exports'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Guard hosted exact-head PR before checkout or downloads
+        shell: pwsh
+        env:
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_EVENT: ${{ github.event_name }}
+          EXPECTED_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || '' }}
+          EXPECTED_BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+          EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
+        run: |
+          if ($env:EXPECTED_REPOSITORY -cne 'Herzchens/LassoInk') { throw 'Official repository guard failed.' }
+          if ($env:EXPECTED_EVENT -cne 'pull_request') { throw 'Pull request event is required.' }
+          if ($env:EXPECTED_HEAD_REPOSITORY -cne 'Herzchens/LassoInk') { throw 'Same-repository PR head is required.' }
+          if ($env:EXPECTED_BASE_REF -cne 'main') { throw 'The PR base must be main.' }
+          if ($env:EXPECTED_HEAD_REF -cne 'feat/document-exports') { throw 'The PR branch is not eligible.' }
+          if ($env:EXPECTED_HEAD_SHA -notmatch '^[0-9a-f]{40}$') { throw 'The exact PR head SHA is missing.' }
+          if ($env:CI -cne 'true' -or $env:GITHUB_ACTIONS -cne 'true') { throw 'Actions guard failed.' }
+          if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64') {
+            throw 'GitHub-hosted Windows x64 is required.'
+          }
+          $runnerTemp = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          $validationRoot = [System.IO.Path]::GetFullPath((Join-Path $runnerTemp 'document-export-validation'))
+          if ([System.IO.Path]::GetDirectoryName($validationRoot) -cne $runnerTemp) { throw 'Validation paths must stay under RUNNER_TEMP.' }
+          $cargoHome = Join-Path $validationRoot 'cargo-home'
+          $rustupHome = Join-Path $validationRoot 'rustup-home'
+          $targetDir = Join-Path $validationRoot 'target'
+          $javaTemp = Join-Path $runnerTemp 'document-export-java-tmp'
+          $artifactRoot = Join-Path $validationRoot 'artifacts'
+          $dependencyRoot = Join-Path $artifactRoot 'dependency'
+          $fixtureRoot = Join-Path $artifactRoot 'synthetic-fixtures'
+          $scratchRoot = Join-Path $validationRoot 'scratch'
+          New-Item -ItemType Directory -Force -Path $cargoHome, $rustupHome, $targetDir, $javaTemp, $dependencyRoot, $scratchRoot | Out-Null
+          $runnerEnvironment = @(
+            "CARGO_HOME=$cargoHome",
+            "RUSTUP_HOME=$rustupHome",
+            "CARGO_TARGET_DIR=$targetDir",
+            "TEMP=$runnerTemp",
+            "TMP=$runnerTemp",
+            "JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=$javaTemp",
+            "LASSOINK_DOCUMENT_EXPORT_FIXTURE_OUT=$fixtureRoot"
+          )
+          $environmentText = ($runnerEnvironment -join [System.Environment]::NewLine) + [System.Environment]::NewLine
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, $environmentText, [System.Text.UTF8Encoding]::new($false))
+
+      - name: Check out exact PR head without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Herzchens/LassoInk
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Verify checked-out exact head
+        shell: pwsh
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -cne $env:EXPECTED_HEAD_SHA) { throw 'Checked-out commit does not match the PR head SHA.' }
+          if ($env:EXPECTED_HEAD_REF -cne 'feat/document-exports') { throw 'Checked-out PR branch does not match the guarded branch.' }
+          if (-not (Test-Path -LiteralPath 'Cargo.lock' -PathType Leaf)) { throw 'The checked-in lockfile is required.' }
+
+      - name: Set up pinned Python x64
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13.17'
+          architecture: x64
+          check-latest: false
+
+      - name: Set up signed Temurin 21.0.12.1+1 x64
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21.0.12.1+1'
+          architecture: x64
+          check-latest: false
+          verify-signature: true
+          force-download: true
+
+      - name: Install pinned Rust 1.100.0 MSVC toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.100.0 --profile minimal --component clippy --component rustfmt --target x86_64-pc-windows-msvc
+
+      - name: Build locked target inventory and feature tree
+        id: locked-inventory
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $validationRoot = Join-Path $env:RUNNER_TEMP 'document-export-validation'
+          $metadataPath = Join-Path $validationRoot 'scratch\metadata-windows-msvc.json'
+          $metadata = & cargo +1.100.0 metadata --locked --format-version 1 --filter-platform x86_64-pc-windows-msvc --features document-export-feasibility
+          if ($LASTEXITCODE -ne 0) { throw 'Target-filtered locked cargo metadata failed.' }
+          [System.IO.File]::WriteAllText($metadataPath, ($metadata -join [System.Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+          $dependencyRoot = Join-Path $validationRoot 'artifacts\dependency'
+          python scripts/inventory_document_export_dependencies.py --metadata $metadataPath --target x86_64-pc-windows-msvc --output (Join-Path $dependencyRoot 'target-license-msrv-inventory.json')
+          if ($LASTEXITCODE -ne 0) { throw 'Target-filtered license/MSRV inventory failed.' }
+          $tree = & cargo +1.100.0 tree --locked --workspace --target x86_64-pc-windows-msvc --features document-export-feasibility -e features
+          if ($LASTEXITCODE -ne 0) { throw 'Locked target feature tree failed.' }
+          $treeText = $tree -join [System.Environment]::NewLine
+          $treeText = [regex]::Replace($treeText, '(?i)[A-Z]:[\\/][^\r\n]+', '[runner-path]')
+          [System.IO.File]::WriteAllText((Join-Path $dependencyRoot 'feature-tree.txt'), $treeText, [System.Text.UTF8Encoding]::new($false))
+
+      - name: Run feature-enabled Clippy on locked MSVC graph
+        id: feature-clippy
+        continue-on-error: true
+        shell: pwsh
+        run: cargo +1.100.0 clippy --locked --workspace --all-targets --features document-export-feasibility --target x86_64-pc-windows-msvc -- -D warnings
+
+      - name: Run feature-enabled locked workspace tests
+        id: locked-feature-tests
+        if: steps.locked-inventory.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: cargo +1.100.0 test --workspace --tests --locked --features document-export-feasibility --target x86_64-pc-windows-msvc
+
+      - name: Download and verify pinned LibreOffice and PDFBox; load the font in this runner session
+        id: tools
+        if: steps.locked-inventory.outcome == 'success' && steps.locked-feature-tests.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $validationRoot = Join-Path $env:RUNNER_TEMP 'document-export-validation'
+          $toolRoot = Join-Path $validationRoot 'tools'
+          New-Item -ItemType Directory -Force -Path $toolRoot | Out-Null
+          $loUri = 'https://download.documentfoundation.org/libreoffice/stable/26.8.3/win/x86_64/LibreOffice_26.8.3_Win_x86-64.msi'
+          $loMsi = Join-Path $toolRoot 'LibreOffice_26.8.3_Win_x86-64.msi'
+          Invoke-WebRequest -Uri $loUri -OutFile $loMsi
+          $loExpected = '0E6918C273EABBDBBD800EE0DACBBF130A14C13C2E4CEC861B06DD59E015BF94'
+          if ((Get-FileHash -LiteralPath $loMsi -Algorithm SHA256).Hash -cne $loExpected) { throw 'LibreOffice 26.8.3 MSI SHA-256 mismatch.' }
+          $loSignature = Get-AuthenticodeSignature -LiteralPath $loMsi
+          if ($loSignature.Status -ne 'Valid' -or $loSignature.SignerCertificate.Subject -notmatch 'The Document Foundation') { throw 'LibreOffice MSI Authenticode signature is not valid for The Document Foundation.' }
+          $loInstall = Join-Path $toolRoot 'LibreOffice'
+          $installArgs = @('/i', ('"{0}"' -f $loMsi), '/qn', '/norestart', ('INSTALLLOCATION="{0}"' -f $loInstall))
+          $install = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\msiexec.exe') -ArgumentList $installArgs -Wait -PassThru -WindowStyle Hidden
+          if ($install.ExitCode -notin @(0, 3010)) { throw 'LibreOffice MSI install failed.' }
+          if (-not (Test-Path -LiteralPath (Join-Path $loInstall 'program\soffice.exe') -PathType Leaf)) { throw 'LibreOffice executable was not found in its runner-temp install.' }
+
+          $pdfboxUri = 'https://downloads.apache.org/pdfbox/3.0.8/pdfbox-app-3.0.8.jar'
+          $pdfboxJar = Join-Path $toolRoot 'pdfbox-app-3.0.8.jar'
+          $pdfboxSidecar = Join-Path $toolRoot 'pdfbox-app-3.0.8.jar.sha512'
+          Invoke-WebRequest -Uri $pdfboxUri -OutFile $pdfboxJar
+          Invoke-WebRequest -Uri "$pdfboxUri.sha512" -OutFile $pdfboxSidecar
+          $pdfboxExpected = '768847238f683568507bf73570a2b6fedcbe58b25c7b4f97fba536ba110b290fe96ba065aed58629d41fb94857d76bc1978c2f31d294b553c69f287f71ee9600'
+          $publishedPdfboxHash = ((Get-Content -LiteralPath $pdfboxSidecar -Raw).Trim() -split '\s+')[0]
+          if ($publishedPdfboxHash -cne $pdfboxExpected) { throw 'Apache PDFBox 3.0.8 published SHA-512 sidecar differs from the pin.' }
+          if ((Get-FileHash -LiteralPath $pdfboxJar -Algorithm SHA512).Hash.ToLowerInvariant() -cne $pdfboxExpected) { throw 'PDFBox 3.0.8 JAR SHA-512 mismatch.' }
+
+          $fontSource = Join-Path $env:GITHUB_WORKSPACE 'assets\fonts\NotoSans-Regular.ttf'
+          $fontTemp = Join-Path $toolRoot 'NotoSans-Regular.ttf'
+          Copy-Item -LiteralPath $fontSource -Destination $fontTemp
+          if ((Get-FileHash -LiteralPath $fontTemp -Algorithm SHA256).Hash -cne '478C558EA716033CD60C03438F628DFA75694DCF6B5F6D505A2F05FD2B4F3823') { throw 'Temporary Noto Sans font hash mismatch.' }
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class RunnerTempFont {
+            [DllImport("gdi32.dll", EntryPoint="AddFontResourceExW", ExactSpelling=true, CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern int AddFontResourceEx(string fileName, uint flags, IntPtr reserved);
+            [DllImport("gdi32.dll", EntryPoint="RemoveFontResourceExW", ExactSpelling=true, CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern bool RemoveFontResourceEx(string fileName, uint flags, IntPtr reserved);
+            [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)]
+            public static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+          }
+          '@
+          if ([RunnerTempFont]::AddFontResourceEx($fontTemp, [uint32]0, [IntPtr]::Zero) -le 0) { throw 'Could not load the pinned Noto Sans face into the hosted runner session.' }
+          $broadcastResult = [IntPtr]::Zero
+          [void][RunnerTempFont]::SendMessageTimeout([IntPtr]0xffff, [uint32]0x001d, [IntPtr]::Zero, [IntPtr]::Zero, [uint32]0x0002, [uint32]5000, [ref]$broadcastResult)
+
+      - name: Emit fixed synthetic DOCX/PDF/PNG fixtures under RUNNER_TEMP
+        id: fixtures
+        if: steps.tools.outcome == 'success' && steps.locked-feature-tests.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: cargo +1.100.0 test --locked --workspace --tests --features document-export-feasibility --target x86_64-pc-windows-msvc emit_document_export_feasibility_fixtures_under_runner_temp -- --ignored
+
+      - name: Check DOCX packages and run LibreOffice/PDFBox hosted verification
+        id: renderer-qa
+        if: steps.fixtures.outcome == 'success' && steps.tools.outcome == 'success' && steps.locked-inventory.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $validationRoot = Join-Path $env:RUNNER_TEMP 'document-export-validation'
+          $artifactRoot = Join-Path $validationRoot 'artifacts'
+          $scratch = Join-Path $validationRoot 'renderer-scratch'
+          New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+          $soffice = Join-Path $validationRoot 'tools\LibreOffice\program\soffice.exe'
+          $java = (Get-Command java.exe).Source
+          $javac = (Get-Command javac.exe).Source
+          python scripts/check_document_export_fixtures.py --fixtures (Join-Path $artifactRoot 'synthetic-fixtures') --scratch $scratch --artifact-root (Join-Path $artifactRoot 'renderer') --soffice $soffice --java $java --javac $javac --pdfbox-jar (Join-Path $validationRoot 'tools\pdfbox-app-3.0.8.jar') --proof-source (Join-Path $env:GITHUB_WORKSPACE 'scripts\DocumentExportPdfProof.java')
+          if ($LASTEXITCODE -ne 0) { throw 'Hosted synthetic renderer verification failed.' }
+
+      - name: Remove the runner-session font
+        if: always()
+        shell: pwsh
+        run: |
+          $fontTemp = Join-Path $env:RUNNER_TEMP 'document-export-validation\tools\NotoSans-Regular.ttf'
+          if (Test-Path -LiteralPath $fontTemp -PathType Leaf) {
+            Add-Type -TypeDefinition @'
+            using System;
+            using System.Runtime.InteropServices;
+            public static class RunnerTempFontCleanup {
+              [DllImport("gdi32.dll", EntryPoint="RemoveFontResourceExW", ExactSpelling=true, CharSet=CharSet.Unicode, SetLastError=true)]
+              public static extern bool RemoveFontResourceEx(string fileName, uint flags, IntPtr reserved);
+              [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)]
+              public static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+            }
+          '@
+            [void][RunnerTempFontCleanup]::RemoveFontResourceEx($fontTemp, [uint32]0, [IntPtr]::Zero)
+            $broadcastResult = [IntPtr]::Zero
+            [void][RunnerTempFontCleanup]::SendMessageTimeout([IntPtr]0xffff, [uint32]0x001d, [IntPtr]::Zero, [IntPtr]::Zero, [uint32]0x0002, [uint32]5000, [ref]$broadcastResult)
+          }
+
+      - name: Upload only fixed synthetic validation artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: document-export-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}\document-export-validation\artifacts
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Fail if an exact-head locked validation gate failed or was skipped
+        if: always()
+        shell: pwsh
+        env:
+          LOCKED_INVENTORY_OUTCOME: ${{ steps.locked-inventory.outcome }}
+          FEATURE_CLIPPY_OUTCOME: ${{ steps.feature-clippy.outcome }}
+          LOCKED_FEATURE_TESTS_OUTCOME: ${{ steps.locked-feature-tests.outcome }}
+          TOOLS_OUTCOME: ${{ steps.tools.outcome }}
+          FIXTURES_OUTCOME: ${{ steps.fixtures.outcome }}
+          RENDERER_QA_OUTCOME: ${{ steps.renderer-qa.outcome }}
+        run: |
+          $outcomes = @{
+            locked_inventory = $env:LOCKED_INVENTORY_OUTCOME
+            feature_clippy = $env:FEATURE_CLIPPY_OUTCOME
+            locked_feature_tests = $env:LOCKED_FEATURE_TESTS_OUTCOME
+            tools = $env:TOOLS_OUTCOME
+            fixtures = $env:FIXTURES_OUTCOME
+            renderer_qa = $env:RENDERER_QA_OUTCOME
+          }
+          $failed = @($outcomes.GetEnumerator() | Where-Object { $_.Value -ne 'success' })
+          if ($failed.Count -gt 0) {
+            $details = ($failed | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', '
+            throw "Locked exact-head validation did not complete all gates: $details"
+          }

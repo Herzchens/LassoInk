@@ -1312,6 +1312,19 @@ fn wide_path(path: &Path) -> Result<Vec<u16>, ExportError> {
     Ok(wide)
 }
 
+// Source-only feasibility scaffold. These serializers remain unavailable to
+// production exports until hosted renderer and text-mapping gates are reviewed.
+#[cfg(test)]
+pub(super) mod document;
+#[cfg(test)]
+mod document_export_tests;
+#[cfg(test)]
+pub(super) mod document_fixtures;
+#[cfg(test)]
+pub(super) mod docx_serializer;
+#[cfg(test)]
+pub(super) mod pdf_serializer;
+
 #[cfg(test)]
 mod tests {
     use super::*;

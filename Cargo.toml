@@ -16,6 +16,14 @@ unicode-segmentation = "=1.13.3"
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
 tiny-skia = { version = "=0.12.0", default-features = false, features = ["std", "png-format"] }
 
+[dev-dependencies]
+docx-rs = { version = "=0.4.22", default-features = false }
+printpdf = { version = "=0.13.0", default-features = false, features = ["text_layout", "png"] }
+
+[features]
+# Enables only the ignored hosted fixture emitter; serializer modules stay test-only.
+document-export-feasibility = []
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "=0.52.0", features = [
     "Win32_Foundation",
