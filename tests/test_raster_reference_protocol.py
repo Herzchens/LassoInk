@@ -21,6 +21,7 @@ from tools import senocr_runtime_profile as runtime_profile
 
 SENOCR_E2E_ALLOWED_HEAD_REFS = frozenset(
     {
+        "feat/document-exports",
         "feat/benchmark-fidelity",
         "feat/benchmark-observability",
         "feat/benchmark-resources",

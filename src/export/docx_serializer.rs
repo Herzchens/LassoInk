@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use docx_rs::{
     BreakType, Docx, LineSpacing, LineSpacingType, PageMargin, Paragraph, Pic, Run, RunFonts,
@@ -12,7 +13,7 @@ use super::{
     },
 };
 
-const MAX_DOCX_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const MAX_DOCX_BYTES: usize = 4 * 1024 * 1024;
 const DOCX_PAGE_WIDTH_TWIPS: u32 = 11_906;
 const DOCX_PAGE_HEIGHT_TWIPS: u32 = 16_838;
 const DOCX_PAGE_MARGIN_TWIPS: i32 = 1_020;
@@ -24,13 +25,25 @@ const DOCX_IMAGE_MAX_WIDTH_EMU: u64 = 6_263_000;
 const DOCX_IMAGE_MAX_HEIGHT_EMU: u64 = 6_858_000;
 const DOCX_FONT_FAMILY: &str = "Noto Sans";
 
-/// Serializes the frozen semantic region as a minimal DOCX package. This
-/// feasibility path writes plain text, explicit line breaks, allowlisted
-/// provenance, and one internally-related PNG image only.
+/// Serializes the frozen semantic region as a minimal DOCX package. It writes
+/// plain text, explicit line breaks, allowlisted provenance, and one internally
+/// related PNG image only.
+#[cfg(test)]
 pub(super) fn serialize_docx(
     region: &ExportRegionV1,
     selected_ink_png: &[u8],
 ) -> Result<Vec<u8>, ExportError> {
+    serialize_docx_cancellable(region, selected_ink_png, &AtomicBool::new(false))
+}
+
+pub(super) fn serialize_docx_cancellable(
+    region: &ExportRegionV1,
+    selected_ink_png: &[u8],
+    cancelled: &AtomicBool,
+) -> Result<Vec<u8>, ExportError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
     validate_selected_ink(region, selected_ink_png)?;
     let view = project_region(region)?;
     validate_docx_view_text(&view)?;
@@ -64,6 +77,9 @@ pub(super) fn serialize_docx(
     if let Some(lines) = &view.lines {
         let mut run = Run::new();
         for (line_index, line) in lines.iter().enumerate() {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(ExportError::Cancelled);
+            }
             if line_index > 0 {
                 run = run.add_break(BreakType::TextWrapping);
             }
@@ -74,6 +90,9 @@ pub(super) fn serialize_docx(
 
     docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text("Provenance")));
     for field in &view.provenance_fields {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ExportError::Cancelled);
+        }
         if is_sha256_digest(&field.value) {
             let mut label_run = Run::new();
             label_run = append_xml_safe_text(label_run, &field.label)?;
@@ -96,6 +115,9 @@ pub(super) fn serialize_docx(
     docx = docx.add_paragraph(
         Paragraph::new().add_run(Run::new().add_text(region.raw_ink_fallback.alt_text)),
     );
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
     let (image_width_emu, image_height_emu) =
         fit_image_size_emu(view.raster_width_px, view.raster_height_px)?;
     let mut image_bytes = Vec::new();
@@ -112,6 +134,9 @@ pub(super) fn serialize_docx(
         / EMU_PER_TWIP;
     let image_line_height_twips =
         i32::try_from(image_line_height_twips).map_err(|_| ExportError::OutputTooLarge)?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
     docx = docx.add_paragraph(
         Paragraph::new()
             .line_spacing(
@@ -125,6 +150,9 @@ pub(super) fn serialize_docx(
     let mut output = Cursor::new(Vec::new());
     docx.pack(&mut output).map_err(|_| ExportError::IoFailure)?;
     let bytes = output.into_inner();
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
     if bytes.is_empty() || bytes.len() > MAX_DOCX_BYTES {
         return Err(ExportError::OutputTooLarge);
     }

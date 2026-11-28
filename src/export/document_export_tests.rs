@@ -1,7 +1,11 @@
+#[cfg(feature = "document-export-fixture-emitter")]
+use super::document_fixtures::synthetic_grayscale_antialias_fixture;
 use super::{
-    ExportError, TranscriptOriginV1, document::project_region, document::validate_selected_ink,
+    ExportError, ExportFormat, ExportFormats, ExportRequestError, TranscriptOriginV1,
+    document::project_region, document::validate_selected_ink,
     document_fixtures::synthetic_fixture,
 };
+use std::sync::atomic::AtomicBool;
 
 #[test]
 fn transcript_presence_empty_state_and_reset_remain_distinct() {
@@ -58,6 +62,113 @@ fn docx_rejects_xml_forbidden_controls_without_rewriting_source_ir() {
 }
 
 #[test]
+fn optional_format_failures_are_isolated_and_report_the_selected_format() {
+    let source_text = "kept\u{0001}source";
+    let (region, png) = synthetic_fixture(Some(source_text), TranscriptOriginV1::SetText);
+    let binding_hash_before = region.provenance.source_binding_sha256.clone();
+    let markdown_html = super::finish_export_bundle(
+        region.clone(),
+        png.clone(),
+        ExportFormats::DEFAULT,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(markdown_html.markdown.is_some());
+    assert!(markdown_html.html.is_some());
+    assert!(markdown_html.docx.is_none());
+    assert!(markdown_html.pdf.is_none());
+    assert!(
+        String::from_utf8(markdown_html.markdown.unwrap())
+            .unwrap()
+            .contains(source_text)
+    );
+    assert!(
+        String::from_utf8(markdown_html.html.unwrap())
+            .unwrap()
+            .contains(source_text)
+    );
+
+    let docx_only = ExportFormats {
+        markdown: false,
+        html: false,
+        docx: true,
+        pdf: false,
+    };
+    let docx_failure = super::finish_export_bundle(
+        region.clone(),
+        png.clone(),
+        docx_only,
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert_eq!(
+        docx_failure,
+        ExportRequestError::Format {
+            format: ExportFormat::Docx,
+            error: ExportError::InvalidText,
+        }
+    );
+
+    let pdf_only = ExportFormats {
+        markdown: false,
+        html: false,
+        docx: false,
+        pdf: true,
+    };
+    let pdf_failure =
+        super::finish_export_bundle(region.clone(), png, pdf_only, &AtomicBool::new(false))
+            .unwrap_err();
+    assert_eq!(
+        pdf_failure,
+        ExportRequestError::Format {
+            format: ExportFormat::Pdf,
+            error: ExportError::InvalidText,
+        }
+    );
+    assert_eq!(
+        region.paragraph.as_ref().unwrap().lines[0].runs[0].text,
+        source_text
+    );
+    assert_eq!(region.provenance.source_binding_sha256, binding_hash_before);
+}
+
+#[test]
+fn export_request_rejects_an_empty_format_set() {
+    let (region, png) = synthetic_fixture(Some("text"), TranscriptOriginV1::Provider);
+    let failure = super::finish_export_bundle(
+        region,
+        png,
+        ExportFormats {
+            markdown: false,
+            html: false,
+            docx: false,
+            pdf: false,
+        },
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert_eq!(
+        failure,
+        ExportRequestError::Export(ExportError::NoFormatsRequested)
+    );
+}
+
+#[test]
+fn requested_serializer_cancellation_returns_before_creating_output() {
+    let (region, png) =
+        synthetic_fixture(Some("NFD a\u{0302}\u{0301}"), TranscriptOriginV1::Provider);
+    let cancelled = AtomicBool::new(true);
+    assert_eq!(
+        super::docx_serializer::serialize_docx_cancellable(&region, &png, &cancelled),
+        Err(ExportError::Cancelled)
+    );
+    assert_eq!(
+        super::pdf_serializer::serialize_pdf_cancellable(&region, &png, &cancelled),
+        Err(ExportError::Cancelled)
+    );
+}
+
+#[test]
 fn docx_keeps_xml_valid_c1_scalars_eligible() {
     let source_text = "valid\u{007F}\u{0085}\u{009F} text";
     let (region, png) = synthetic_fixture(Some(source_text), TranscriptOriginV1::SetText);
@@ -97,10 +208,10 @@ fn original_ink_bytes_are_bound_to_the_raster_provenance_hash() {
     );
 }
 
-#[cfg(feature = "document-export-feasibility")]
+#[cfg(feature = "document-export-fixture-emitter")]
 #[test]
 #[ignore = "opt-in hosted Windows DOCX/PDF renderer fixture emitter"]
-fn emit_document_export_feasibility_fixtures_under_runner_temp() {
+fn emit_document_export_fixtures_under_runner_temp() {
     use std::{
         fs::{self, OpenOptions},
         io::Write,
@@ -166,6 +277,11 @@ fn emit_document_export_feasibility_fixtures_under_runner_temp() {
             TranscriptOriginV1::Provider,
         ),
         (
+            "mixed-normalization-ligatures",
+            Some("[[MIXED: ấ | a\u{0302}\u{0301} | repeated repeated | office fi fl ffi]]"),
+            TranscriptOriginV1::SetText,
+        ),
+        (
             "line-order",
             Some("[[first line\nsecond line\nthird line]]"),
             TranscriptOriginV1::Provider,
@@ -214,10 +330,43 @@ fn emit_document_export_feasibility_fixtures_under_runner_temp() {
             "png_sha256": png_sha256,
             "strict_pdf_text": matches!(
                 name,
-                "nfc-vietnamese" | "nfd-vietnamese" | "line-order" | "maximum-lines"
+                "nfc-vietnamese"
+                    | "nfd-vietnamese"
+                    | "mixed-normalization-ligatures"
+                    | "line-order"
+                    | "maximum-lines"
             ),
         }));
     }
+
+    let grayscale_name = "grayscale-antialias";
+    let grayscale_source = "[[GRAY-MIDTONE]]";
+    let (grayscale_region, grayscale_png) =
+        synthetic_grayscale_antialias_fixture(Some(grayscale_source), TranscriptOriginV1::SetText);
+    let grayscale_png_name = format!("{grayscale_name}.png");
+    let grayscale_docx_name = format!("{grayscale_name}.docx");
+    let grayscale_pdf_name = format!("{grayscale_name}.pdf");
+    let grayscale_docx = super::docx_serializer::serialize_docx(&grayscale_region, &grayscale_png)
+        .expect("valid grayscale synthetic DOCX must serialize");
+    let grayscale_pdf = super::pdf_serializer::serialize_pdf(&grayscale_region, &grayscale_png)
+        .expect("valid grayscale synthetic PDF must serialize");
+    write_new(&output, &grayscale_png_name, &grayscale_png);
+    write_new(&output, &grayscale_docx_name, &grayscale_docx);
+    write_new(&output, &grayscale_pdf_name, &grayscale_pdf);
+    let grayscale_projected =
+        project_region(&grayscale_region).expect("grayscale synthetic IR must project");
+    manifest_cases.push(json!({
+        "name": grayscale_name,
+        "origin": format!("{:?}", TranscriptOriginV1::SetText),
+        "state_label": grayscale_projected.state_label,
+        "source_text": grayscale_source,
+        "docx": grayscale_docx_name,
+        "pdf": grayscale_pdf_name,
+        "png": grayscale_png_name,
+        "png_sha256": grayscale_region.provenance.raster.png_bytes_sha256,
+        "strict_pdf_text": true,
+        "image_fixture_kind": "grayscale-antialiased-midtone",
+    }));
 
     let c1_text = "XML C1: \u{007F}\u{0085}\u{009F}; separators: \u{2028}\u{2029}";
     let (c1_region, c1_png) = synthetic_fixture(Some(c1_text), TranscriptOriginV1::SetText);

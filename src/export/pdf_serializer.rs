@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use printpdf::xobject::DictItem;
 use printpdf::{
-    LineShaper, Mm, Op, ParsedFont, PdfDocument, PdfPage, PdfSaveOptions, Pt, RawImage, TextMatrix,
-    XObjectTransform, show_placed_glyphs,
+    ImageCompression, ImageOptimizationOptions, LineShaper, Mm, Op, ParsedFont, PdfDocument,
+    PdfPage, PdfSaveOptions, Pt, RawImage, TextMatrix, XObjectTransform, show_placed_glyphs,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -13,7 +14,7 @@ use super::{
 };
 use crate::journal::MAX_JOURNAL_TEXT_BYTES;
 
-const MAX_PDF_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const MAX_PDF_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PDF_PAGES: usize = 96;
 const LINES_PER_PAGE: usize = 52;
 const FONT_SIZE: Pt = Pt(11.0);
@@ -34,13 +35,22 @@ struct PdfTextLine {
 /// only PDF page operations; it does not pass IR text through HTML or any
 /// active content.
 ///
-/// Feasibility only: exact `/ToUnicode` mapping for every shaped source cluster
-/// remains unverified against pinned printpdf 0.13.0. The supplemental
-/// `/ActualText` spans below do not satisfy that separate acceptance gate.
+#[cfg(test)]
 pub(super) fn serialize_pdf(
     region: &ExportRegionV1,
     selected_ink_png: &[u8],
 ) -> Result<Vec<u8>, ExportError> {
+    serialize_pdf_cancellable(region, selected_ink_png, &AtomicBool::new(false))
+}
+
+pub(super) fn serialize_pdf_cancellable(
+    region: &ExportRegionV1,
+    selected_ink_png: &[u8],
+    cancelled: &AtomicBool,
+) -> Result<Vec<u8>, ExportError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
     validate_selected_ink(region, selected_ink_png)?;
     let view = project_region(region)?;
 
@@ -64,6 +74,9 @@ pub(super) fn serialize_pdf(
     let mut operations = vec![Op::StartTextSection];
     let mut row_on_page = 0usize;
     for text_line in &text_lines {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ExportError::Cancelled);
+        }
         let mut shaped_lines = wrap_and_shape(&text_line.text, &shaper, &font, content_width_pt)?;
         let last_line = shaped_lines.len().saturating_sub(1);
         for (line_index, (mut actual_text, shaped_line)) in shaped_lines.drain(..).enumerate() {
@@ -104,8 +117,14 @@ pub(super) fn serialize_pdf(
     operations.push(Op::EndTextSection);
     push_text_page(&mut pages, operations)?;
 
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
     let image = RawImage::decode_from_bytes(selected_ink_png, &mut warnings)
         .map_err(|_| ExportError::InkUnavailable)?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
     if image.width != view.raster_width_px as usize
         || image.height != view.raster_height_px as usize
     {
@@ -153,20 +172,35 @@ pub(super) fn serialize_pdf(
             ..Default::default()
         },
     });
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
     if pages.len().saturating_add(1) > MAX_PDF_PAGES {
         return Err(ExportError::OutputTooLarge);
     }
     pages.push(PdfPage::new(page_width, page_height, image_page_ops));
     document.pages = pages;
 
+    let image_optimization = ImageOptimizationOptions {
+        quality: None,
+        max_image_size: None,
+        dither_greyscale: Some(false),
+        convert_to_greyscale: Some(false),
+        auto_optimize: Some(false),
+        format: Some(ImageCompression::Flate),
+    };
     let bytes = document.save(
         &PdfSaveOptions {
             subset_fonts: true,
             optimize: false,
+            image_optimization: Some(image_optimization),
             ..Default::default()
         },
         &mut warnings,
     );
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled);
+    }
     if bytes.len() > MAX_PDF_BYTES {
         return Err(ExportError::OutputTooLarge);
     }

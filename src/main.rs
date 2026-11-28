@@ -90,6 +90,23 @@ const MAX_DIRECT_CANVAS_POINTER_OWNERS: usize = 256;
 const CORRECTION_PANE_MAX_EDITOR_ROWS: usize = 4;
 const MAX_DEFERRED_PANE_ACTIONS: usize = 32;
 
+fn export_error_summary(error: export::ExportError) -> &'static str {
+    match error {
+        export::ExportError::Cancelled => "canceled",
+        export::ExportError::InvalidTarget => "invalid destination",
+        export::ExportError::InvalidSelection => "invalid selection",
+        export::ExportError::StaleSource => "source changed",
+        export::ExportError::InvalidText => "text is not supported by this format",
+        export::ExportError::InkUnavailable => "selected ink is unavailable",
+        export::ExportError::AllocationFailed => "memory bound exceeded",
+        export::ExportError::OutputTooLarge => "output bound exceeded",
+        export::ExportError::DestinationExists => "destination already exists",
+        export::ExportError::IoFailure => "serialization or write failed",
+        export::ExportError::NoFormatsRequested => "no format is selected",
+        export::ExportError::IncompleteOutputSet => "a requested file was missing",
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn require_native_ui_test_opt_in() {
     fn env_is(key: &str, expected: &str) -> bool {
@@ -138,6 +155,7 @@ struct ProbeApp {
     correction_session: Option<CorrectionSession>,
     pending_correction: Option<PendingCorrectionWrite>,
     pending_export: Option<PendingExport>,
+    export_formats: export::ExportFormats,
     next_correction_id: u64,
     correction_focus: CorrectionPaneFocus,
     correction_panel_status: String,
@@ -226,12 +244,13 @@ enum PendingExportSource {
 struct PendingExport {
     batch_id: u64,
     target_path: PathBuf,
+    formats: export::ExportFormats,
     source: PendingExportSource,
     selected_strokes: Vec<journal::StrokeRef>,
     project_generation: u64,
     view_generation: u64,
     cancelled: Arc<AtomicBool>,
-    result_receiver: Option<std::sync::mpsc::Receiver<Result<(), export::ExportError>>>,
+    result_receiver: Option<std::sync::mpsc::Receiver<Result<(), export::ExportRequestError>>>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -344,6 +363,10 @@ enum CorrectionPaneAction {
     Cancel,
     Copy,
     Export,
+    ToggleMarkdown,
+    ToggleHtml,
+    ToggleDocx,
+    TogglePdf,
     LoadProviderConfig,
 }
 
@@ -520,6 +543,8 @@ struct CorrectionPaneLayout {
     editor_row_hit_offsets: Vec<Vec<i32>>,
     action_row: Option<usize>,
     action_hit_targets: Vec<(Range<i32>, CorrectionPaneAction)>,
+    format_row: Option<usize>,
+    format_hit_targets: Vec<(Range<i32>, CorrectionPaneAction)>,
     scroll_regions: Vec<CorrectionPaneScrollRegion>,
     inline_editor_rows: Vec<InlineEditorRowLayout>,
     provider_path_row: Option<usize>,
@@ -877,9 +902,6 @@ fn correction_action_hit_targets(
     label: &str,
     measurements: &mut GdiTextAdvanceCache,
 ) -> io::Result<Vec<(Range<i32>, CorrectionPaneAction)>> {
-    let advances = measurements.advances(label)?;
-    let boundaries = grapheme_pixel_boundaries(label, &advances);
-    let graphemes = label.graphemes(true).collect::<Vec<_>>();
     let labels = [
         ("[Convert]", CorrectionPaneAction::Convert),
         ("[Save]", CorrectionPaneAction::Save),
@@ -888,6 +910,43 @@ fn correction_action_hit_targets(
         ("[Copy]", CorrectionPaneAction::Copy),
         ("[Export]", CorrectionPaneAction::Export),
     ];
+    measured_action_hit_targets(label, &labels, measurements)
+}
+
+fn correction_format_hit_targets(
+    label: &str,
+    formats: export::ExportFormats,
+    measurements: &mut GdiTextAdvanceCache,
+) -> io::Result<Vec<(Range<i32>, CorrectionPaneAction)>> {
+    let labels = [
+        (
+            export::ExportFormat::Markdown.ui_label(formats.markdown),
+            CorrectionPaneAction::ToggleMarkdown,
+        ),
+        (
+            export::ExportFormat::Html.ui_label(formats.html),
+            CorrectionPaneAction::ToggleHtml,
+        ),
+        (
+            export::ExportFormat::Docx.ui_label(formats.docx),
+            CorrectionPaneAction::ToggleDocx,
+        ),
+        (
+            export::ExportFormat::Pdf.ui_label(formats.pdf),
+            CorrectionPaneAction::TogglePdf,
+        ),
+    ];
+    measured_action_hit_targets(label, &labels, measurements)
+}
+
+fn measured_action_hit_targets(
+    label: &str,
+    labels: &[(&str, CorrectionPaneAction)],
+    measurements: &mut GdiTextAdvanceCache,
+) -> io::Result<Vec<(Range<i32>, CorrectionPaneAction)>> {
+    let advances = measurements.advances(label)?;
+    let boundaries = grapheme_pixel_boundaries(label, &advances);
+    let graphemes = label.graphemes(true).collect::<Vec<_>>();
     let mut cursor = 0usize;
     let mut targets = Vec::with_capacity(labels.len());
     for (index, (button, action)) in labels.iter().enumerate() {
@@ -1173,12 +1232,16 @@ fn correction_pane_action_at_client_layout(
         y.saturating_sub(CORRECTION_PANE_PADDING_PX) / CORRECTION_PANE_ROW_HEIGHT_PX,
     )
     .ok()?;
-    if layout.action_row == Some(row) {
+    if layout.action_row == Some(row) || layout.format_row == Some(row) {
         let action_offset = x
             .saturating_sub(pane_left)
             .saturating_sub(CORRECTION_PANE_PADDING_PX);
-        return layout
-            .action_hit_targets
+        let targets = if layout.action_row == Some(row) {
+            &layout.action_hit_targets
+        } else {
+            &layout.format_hit_targets
+        };
+        return targets
             .iter()
             .find(|(target, _)| target.contains(&action_offset))
             .map(|(_, action)| *action);
@@ -1857,6 +1920,8 @@ impl ProbeApp {
             editor_row_hit_offsets: Vec::new(),
             action_row: None,
             action_hit_targets: Vec::new(),
+            format_row: None,
+            format_hit_targets: Vec::new(),
             scroll_regions: Vec::new(),
             inline_editor_rows: Vec::new(),
             provider_path_row: None,
@@ -2019,6 +2084,22 @@ impl ProbeApp {
                 "Provider output and corrections appear here.".to_owned(),
             );
         }
+        append_pane_line(&mut layout, "Export formats: * selected".to_owned());
+        let format_label = format!(
+            "{} {} {} {}",
+            export::ExportFormat::Markdown.ui_label(self.export_formats.markdown),
+            export::ExportFormat::Html.ui_label(self.export_formats.html),
+            export::ExportFormat::Docx.ui_label(self.export_formats.docx),
+            export::ExportFormat::Pdf.ui_label(self.export_formats.pdf),
+        );
+        let format_row = append_pane_line(&mut layout, format_label.clone());
+        layout.format_row = Some(format_row);
+        layout.format_hit_targets = correction_format_hit_targets(
+            &format_label,
+            self.export_formats,
+            &mut self.pane_text_measurements,
+        )?;
+
         let action_label = "[Convert] [Save] [Reset] [Cancel] [Copy] [Export]";
         let action_row = append_pane_line(&mut layout, action_label.to_owned());
         layout.action_row = Some(action_row);
@@ -2072,7 +2153,7 @@ impl ProbeApp {
         layout.inline_editor_rows.push(export_path_layout);
         append_pane_line(
             &mut layout,
-            "Export makes a new Markdown/HTML bundle with the original ink PNG.".to_owned(),
+            "Export writes every selected format together; DOCX/PDF include the selected original ink.".to_owned(),
         );
         Ok(layout)
     }
@@ -2106,7 +2187,11 @@ impl ProbeApp {
         )
         .unwrap_or(usize::MAX);
         match self.correction_pane_layout() {
-            Ok(layout) => layout.action_row == Some(row) || layout.load_config_row == Some(row),
+            Ok(layout) => {
+                layout.action_row == Some(row)
+                    || layout.format_row == Some(row)
+                    || layout.load_config_row == Some(row)
+            }
             Err(_) => true,
         }
     }
@@ -2871,12 +2956,16 @@ impl ProbeApp {
         let Ok(layout) = self.correction_pane_layout() else {
             return true;
         };
-        if layout.action_row == Some(row) {
+        if layout.action_row == Some(row) || layout.format_row == Some(row) {
             let action_offset = x
                 .saturating_sub(pane_left)
                 .saturating_sub(CORRECTION_PANE_PADDING_PX);
-            if let Some((_, action)) = layout
-                .action_hit_targets
+            let targets = if layout.action_row == Some(row) {
+                &layout.action_hit_targets
+            } else {
+                &layout.format_hit_targets
+            };
+            if let Some((_, action)) = targets
                 .iter()
                 .find(|(target, _)| target.contains(&action_offset))
             {
@@ -3329,8 +3418,32 @@ impl ProbeApp {
             CorrectionPaneAction::Cancel => self.cancel_correction_draft(),
             CorrectionPaneAction::Copy => self.copy_correction_text(),
             CorrectionPaneAction::Export => self.start_export(),
+            CorrectionPaneAction::ToggleMarkdown => {
+                self.toggle_export_format(export::ExportFormat::Markdown)
+            }
+            CorrectionPaneAction::ToggleHtml => {
+                self.toggle_export_format(export::ExportFormat::Html)
+            }
+            CorrectionPaneAction::ToggleDocx => {
+                self.toggle_export_format(export::ExportFormat::Docx)
+            }
+            CorrectionPaneAction::TogglePdf => self.toggle_export_format(export::ExportFormat::Pdf),
             CorrectionPaneAction::LoadProviderConfig => self.load_local_provider_from_pane(),
         }
+    }
+
+    fn toggle_export_format(&mut self, format: export::ExportFormat) {
+        let mut formats = self.export_formats;
+        if !formats.toggle(format) {
+            self.correction_panel_status = "Keep at least one export format selected.".to_owned();
+        } else {
+            self.export_formats = formats;
+            self.correction_panel_status = format!(
+                "Selected export formats: {}.",
+                self.export_formats.selected_names()
+            );
+        }
+        self.request_redraw();
     }
 
     fn start_export(&mut self) {
@@ -3358,6 +3471,13 @@ impl ProbeApp {
         if self.export_path_editor.has_preedit() {
             self.correction_panel_status =
                 "Finish or cancel the export folder edit before exporting.".to_owned();
+            self.request_redraw();
+            return;
+        }
+        let formats = self.export_formats;
+        if !formats.any() {
+            self.correction_panel_status =
+                "Keep at least one export format selected before exporting.".to_owned();
             self.request_redraw();
             return;
         }
@@ -3424,6 +3544,7 @@ impl ProbeApp {
                 self.pending_export = Some(PendingExport {
                     batch_id,
                     target_path,
+                    formats,
                     source,
                     selected_strokes,
                     project_generation: self.project_generation,
@@ -3433,10 +3554,15 @@ impl ProbeApp {
                     worker: None,
                 });
                 self.correction_panel_status = if ink_only {
-                    "Ink-only export snapshot queued; the original selected ink will be staged off the UI thread.".to_owned()
+                    format!(
+                        "Ink-only {} export snapshot queued off the UI thread.",
+                        formats.selected_names()
+                    )
                 } else {
-                    "Export snapshot queued; this saved region will be staged off the UI thread."
-                        .to_owned()
+                    format!(
+                        "{} export snapshot queued off the UI thread.",
+                        formats.selected_names()
+                    )
                 };
             }
             Some(Err(ProjectQueueError::QueueFull | ProjectQueueError::Backpressure { .. })) => {
@@ -3482,6 +3608,7 @@ impl ProbeApp {
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let target_path = pending.target_path.clone();
+        let formats = pending.formats;
         let source = pending.source.clone();
         let selected_strokes = pending.selected_strokes.clone();
         let cancelled = Arc::clone(&pending.cancelled);
@@ -3492,19 +3619,26 @@ impl ProbeApp {
                     PendingExportSource::Projection {
                         projection_id,
                         ink_binding,
-                    } => export::build_selected_region_bundle(
+                    } => export::build_selected_region_bundle_with_formats(
                         &state,
                         &projection_id,
                         &ink_binding,
                         &selected_strokes,
+                        formats,
                         &cancelled,
                     ),
                     PendingExportSource::InkOnly { .. } => {
-                        export::build_ink_only_bundle(&state, &selected_strokes, &cancelled)
+                        export::build_ink_only_bundle_with_formats(
+                            &state,
+                            &selected_strokes,
+                            formats,
+                            &cancelled,
+                        )
                     }
                 };
                 let result = bundle_result.and_then(|bundle| {
                     export::publish_export_bundle(&target_path, &bundle, batch_id, &cancelled)
+                        .map_err(export::ExportRequestError::Export)
                 });
                 let _ = sender.send(result);
             });
@@ -3542,7 +3676,9 @@ impl ProbeApp {
         let result = match result {
             Ok(result) => result,
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(export::ExportError::IoFailure),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(
+                export::ExportRequestError::Export(export::ExportError::IoFailure),
+            ),
         };
         let mut pending = self
             .pending_export
@@ -3552,36 +3688,50 @@ impl ProbeApp {
             .worker
             .take()
             .is_some_and(|worker| worker.join().is_err());
+        let selected_formats = pending.formats.selected_names();
         self.correction_panel_status = if worker_panicked {
             "Export worker stopped unexpectedly; existing files were preserved.".to_owned()
         } else {
             match result {
-                Ok(()) => "Markdown/HTML export completed with the original ink image.".to_owned(),
-                Err(export::ExportError::Cancelled) => {
+                Ok(()) => {
+                    format!("{selected_formats} export completed with the original ink image.")
+                }
+                Err(export::ExportRequestError::Format { format, error }) => format!(
+                    "{} export failed ({}); no files were published.",
+                    format.display_name(),
+                    export_error_summary(error)
+                ),
+                Err(export::ExportRequestError::Export(export::ExportError::Cancelled)) => {
                     "Export canceled before publication; existing files were preserved.".to_owned()
                 }
-                Err(export::ExportError::DestinationExists) => {
+                Err(export::ExportRequestError::Export(export::ExportError::DestinationExists)) => {
                     "Export target already exists; choose a new folder.".to_owned()
                 }
-                Err(export::ExportError::InvalidTarget) => {
+                Err(export::ExportRequestError::Export(export::ExportError::InvalidTarget)) => {
                     "Choose an absolute local export folder.".to_owned()
                 }
-                Err(export::ExportError::InvalidSelection | export::ExportError::StaleSource) => {
-                    "Export canceled because the selected source is stale.".to_owned()
-                }
-                Err(export::ExportError::InvalidText) => {
+                Err(export::ExportRequestError::Export(
+                    export::ExportError::InvalidSelection | export::ExportError::StaleSource,
+                )) => "Export canceled because the selected source is stale.".to_owned(),
+                Err(export::ExportRequestError::Export(export::ExportError::InvalidText)) => {
                     "Export text is invalid or exceeds its fixed bound.".to_owned()
                 }
-                Err(export::ExportError::InkUnavailable) => {
+                Err(export::ExportRequestError::Export(export::ExportError::InkUnavailable)) => {
                     "Selected ink could not be rendered; no text-only bundle was published."
                         .to_owned()
                 }
-                Err(
+                Err(export::ExportRequestError::Export(
                     export::ExportError::AllocationFailed | export::ExportError::OutputTooLarge,
-                ) => "Export exceeded bounded memory or output limits.".to_owned(),
-                Err(export::ExportError::IoFailure) => {
+                )) => "Export exceeded bounded memory or output limits.".to_owned(),
+                Err(export::ExportRequestError::Export(export::ExportError::IoFailure)) => {
                     "Export failed; existing files were preserved.".to_owned()
                 }
+                Err(export::ExportRequestError::Export(
+                    export::ExportError::NoFormatsRequested,
+                )) => "Select at least one export format before exporting.".to_owned(),
+                Err(export::ExportRequestError::Export(
+                    export::ExportError::IncompleteOutputSet,
+                )) => "A requested export file was missing; no files were published.".to_owned(),
             }
         };
         self.request_redraw();
@@ -6840,6 +6990,7 @@ fn run_window(options: RunOptions) -> Result<(), Box<dyn Error>> {
         correction_session: initial_correction_session,
         pending_correction: None,
         pending_export: None,
+        export_formats: export::ExportFormats::DEFAULT,
         next_correction_id: 1,
         correction_focus: CorrectionPaneFocus::None,
         correction_panel_status: initial_correction_status,
@@ -7494,12 +7645,15 @@ mod pending_record_cursor_tests {
 #[cfg(test)]
 mod correction_pane_pointer_owner_tests {
     use super::{
-        CORRECTION_PANE_PADDING_PX, CanvasOrigin, CorrectionPaneAction,
-        DirectUiPointerOwnerTracker, DirectUiPointerRoute, GdiTextAdvanceCache,
-        MAX_UI_POINTER_OWNERS, correction_action_hit_targets,
-        correction_pane_contains_client_point, correction_pane_left_edge,
-        direct_screen_point_in_correction_pane, should_process_winit_mouse_input,
+        CORRECTION_PANE_PADDING_PX, CORRECTION_PANE_ROW_HEIGHT_PX, CanvasOrigin,
+        CorrectionPaneAction, CorrectionPaneLayout, DirectUiPointerOwnerTracker,
+        DirectUiPointerRoute, GdiTextAdvanceCache, MAX_UI_POINTER_OWNERS,
+        correction_action_hit_targets, correction_format_hit_targets,
+        correction_pane_action_at_client_layout, correction_pane_contains_client_point,
+        correction_pane_left_edge, direct_screen_point_in_correction_pane,
+        should_process_winit_mouse_input,
     };
+    use crate::export::{ExportFormat, ExportFormats};
     use crate::win32_pointer::{CaptureMode, MouseMessageOrigin, PointerMessageKind};
 
     #[test]
@@ -7708,6 +7862,55 @@ mod correction_pane_pointer_owner_tests {
         assert_eq!(targets[5].1, CorrectionPaneAction::Export);
         assert_eq!(targets[0].0, 0..80);
         assert_eq!(targets[4].0, 272..328);
+    }
+
+    #[test]
+    fn format_selection_hit_targets_are_visible_and_accessible_in_the_pane() {
+        let formats = ExportFormats::DEFAULT;
+        assert_eq!(formats.selected_names(), "Markdown, HTML");
+        let label = "[MD*] [HTML*] [DOCX] [PDF]";
+        let targets =
+            correction_format_hit_targets(label, formats, &mut GdiTextAdvanceCache::default())
+                .unwrap();
+        assert_eq!(targets.len(), 4);
+        assert_eq!(targets[0].1, CorrectionPaneAction::ToggleMarkdown);
+        assert_eq!(targets[1].1, CorrectionPaneAction::ToggleHtml);
+        assert_eq!(targets[2].1, CorrectionPaneAction::ToggleDocx);
+        assert_eq!(targets[3].1, CorrectionPaneAction::TogglePdf);
+
+        let layout = CorrectionPaneLayout {
+            format_row: Some(1),
+            format_hit_targets: targets.clone(),
+            ..CorrectionPaneLayout::default()
+        };
+        let pdf_x = 600 + CORRECTION_PANE_PADDING_PX + targets[3].0.start + 1;
+        let pdf_y = CORRECTION_PANE_PADDING_PX + CORRECTION_PANE_ROW_HEIGHT_PX + 1;
+        assert_eq!(
+            correction_pane_action_at_client_layout(pdf_x, pdf_y, (960, 720), &layout),
+            Some(CorrectionPaneAction::TogglePdf)
+        );
+
+        let mut selected = formats;
+        assert!(selected.toggle(ExportFormat::Pdf));
+        assert_eq!(selected.selected_names(), "Markdown, HTML, PDF");
+        assert!(ExportFormat::Pdf.ui_label(selected.pdf).contains('*'));
+
+        let mut only_pdf = ExportFormats {
+            markdown: false,
+            html: false,
+            docx: false,
+            pdf: true,
+        };
+        assert!(!only_pdf.toggle(ExportFormat::Pdf));
+        assert_eq!(
+            only_pdf,
+            ExportFormats {
+                markdown: false,
+                html: false,
+                docx: false,
+                pdf: true,
+            }
+        );
     }
 
     #[test]
@@ -8328,6 +8531,7 @@ mod convert_controller_tests {
         let pending = PendingExport {
             batch_id: 4,
             target_path: PathBuf::from(r"C:\exports\new-bundle"),
+            formats: crate::export::ExportFormats::DEFAULT,
             source: PendingExportSource::Projection {
                 projection_id: "export-projection".to_owned(),
                 ink_binding: binding.clone(),
@@ -8395,6 +8599,7 @@ mod convert_controller_tests {
         let ink_only_pending = PendingExport {
             batch_id: 5,
             target_path: PathBuf::from(r"C:\exports\ink-only-bundle"),
+            formats: crate::export::ExportFormats::DEFAULT,
             source: PendingExportSource::InkOnly {
                 prior_projection: None,
             },
@@ -8425,6 +8630,7 @@ mod convert_controller_tests {
         let ink_only_with_prior_session = PendingExport {
             batch_id: 6,
             target_path: PathBuf::from(r"C:\exports\other-region-bundle"),
+            formats: crate::export::ExportFormats::DEFAULT,
             source: PendingExportSource::InkOnly {
                 prior_projection: Some(PendingExportProjectionContext {
                     projection_id: "export-projection".to_owned(),
@@ -8578,6 +8784,7 @@ mod convert_controller_tests {
             correction_session: None,
             pending_correction: None,
             pending_export: None,
+            export_formats: crate::export::ExportFormats::DEFAULT,
             next_correction_id: 1,
             correction_focus: CorrectionPaneFocus::None,
             correction_panel_status: String::new(),
@@ -9097,6 +9304,7 @@ mod f4_convert_mock_pipeline_tests {
             correction_session: None,
             pending_correction: None,
             pending_export: None,
+            export_formats: export::ExportFormats::DEFAULT,
             next_correction_id: 1,
             correction_focus: CorrectionPaneFocus::None,
             correction_panel_status: String::new(),
@@ -9545,6 +9753,21 @@ mod f4_convert_mock_pipeline_tests {
         app.canvas_origin = Some(CanvasOrigin::default());
         app.client_size = Some((960, 720));
 
+        let layout = app.correction_pane_layout().unwrap();
+        let pdf_target = layout
+            .format_hit_targets
+            .iter()
+            .find(|(_, action)| *action == CorrectionPaneAction::TogglePdf)
+            .map(|(range, _)| range.clone())
+            .unwrap();
+        let format_row = layout.format_row.unwrap();
+        let format_click_x = 600 + CORRECTION_PANE_PADDING_PX + pdf_target.start + 1;
+        let format_click_y = CORRECTION_PANE_PADDING_PX
+            + i32::try_from(format_row).unwrap() * CORRECTION_PANE_ROW_HEIGHT_PX
+            + 2;
+        app.canvas_cursor_client = Some((f64::from(format_click_x), f64::from(format_click_y)));
+        assert!(app.handle_correction_mouse_button(MouseButton::Left, ElementState::Pressed));
+        assert!(app.export_formats.pdf);
         let layout = app.correction_pane_layout().unwrap();
         let action_row = layout.action_row.unwrap();
         let click_x = 600 + CORRECTION_PANE_PADDING_PX + 16;
@@ -10320,10 +10543,43 @@ mod f4_convert_mock_pipeline_tests {
     fn senocr_f4_convert_human_correction_export_e2e() {
         crate::provider_protocol::tests::require_senocr_m4_worker_test_opt_in();
         const MODEL_REVISION: &str = "1e70dff4ef0429b0d88a2b873fb5d03300af1a41";
+        use sha2::{Digest, Sha256};
 
         let runner_temp = PathBuf::from(
             std::env::var_os("RUNNER_TEMP").expect("guarded hosted runner temporary directory"),
         );
+        let production_proof_enabled =
+            std::env::var("LASSOINK_SENOCR_EXPORT_PROOF_ENABLED").is_ok_and(|value| value == "1");
+        let production_export_path = if production_proof_enabled {
+            let path = PathBuf::from(
+                std::env::var_os("LASSOINK_SENOCR_PRODUCTION_EXPORT_OUT")
+                    .expect("guarded production export output path"),
+            );
+            assert!(path.is_absolute());
+            assert_eq!(
+                path.parent().and_then(|parent| parent.canonicalize().ok()),
+                runner_temp.canonicalize().ok()
+            );
+            assert!(!path.exists(), "production export destination must be new");
+            Some(path)
+        } else {
+            None
+        };
+        let production_proof_dir = if production_proof_enabled {
+            let path = PathBuf::from(
+                std::env::var_os("LASSOINK_SENOCR_EXPORT_PROOF_DIR")
+                    .expect("guarded production export proof directory"),
+            );
+            assert!(path.is_absolute());
+            assert_eq!(
+                path.parent().and_then(|parent| parent.canonicalize().ok()),
+                runner_temp.canonicalize().ok()
+            );
+            fs::create_dir(&path).expect("create fresh production export proof directory");
+            Some(path)
+        } else {
+            None
+        };
         let shared_dir = PathBuf::from(
             std::env::var_os("LASSOINK_SENOCR_E2E_SHARED_DIR")
                 .expect("guarded SenOCR shared directory"),
@@ -10476,6 +10732,12 @@ mod f4_convert_mock_pipeline_tests {
         wait_for_convert_completion(&mut app, Duration::from_secs(300));
         assert!(app.project_writer.as_ref().unwrap().is_idle());
         let projection = app.correction_session.as_ref().unwrap().projection();
+        let projection_id = app
+            .correction_session
+            .as_ref()
+            .unwrap()
+            .projection_id()
+            .to_owned();
         assert_eq!(projection.provider.provider_id, "senocr-v1-fp32-local");
         assert_eq!(
             projection.provider.model_version.as_deref(),
@@ -10512,10 +10774,17 @@ mod f4_convert_mock_pipeline_tests {
                 })
         });
 
-        let export_path = test_directory.join("selected-region-bundle");
+        let export_path =
+            production_export_path.unwrap_or_else(|| test_directory.join("selected-region-bundle"));
         app.export_path_editor
             .insert_text(&export_path.to_string_lossy())
             .unwrap();
+        app.dispatch_pane_action(CorrectionPaneAction::ToggleDocx);
+        app.dispatch_pane_action(CorrectionPaneAction::TogglePdf);
+        assert_eq!(
+            app.export_formats.selected_names(),
+            "Markdown, HTML, DOCX, PDF"
+        );
         let pane = app.correction_pane_layout().unwrap();
         assert!(
             pane.action_hit_targets
@@ -10530,6 +10799,8 @@ mod f4_convert_mock_pipeline_tests {
         let markdown = fs::read_to_string(export_path.join("document.md")).unwrap();
         let html = fs::read_to_string(export_path.join("index.html")).unwrap();
         let png = fs::read(export_path.join("assets/selected-region.png")).unwrap();
+        let docx = fs::read(export_path.join("document.docx")).unwrap();
+        let pdf = fs::read(export_path.join("document.pdf")).unwrap();
         assert!(markdown.contains("Human NFD e\u{301}"));
         assert!(markdown.contains("assets/selected-region.png"));
         assert!(markdown.contains("Selection binding SHA-256"));
@@ -10569,6 +10840,10 @@ mod f4_convert_mock_pipeline_tests {
         assert!(html.contains("src=\"assets/selected-region.png\""));
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(png.len() <= canvas::MAX_CANONICAL_RASTER_PNG_BYTES);
+        assert!(docx.starts_with(b"PK\x03\x04"));
+        assert!(docx.len() <= 4 * 1024 * 1024);
+        assert!(pdf.starts_with(b"%PDF-"));
+        assert!(pdf.len() <= 8 * 1024 * 1024);
 
         app.finish_project_writer().unwrap();
         let persisted = read_journal(&project_path).unwrap();
@@ -10578,6 +10853,139 @@ mod f4_convert_mock_pipeline_tests {
             &persisted.state.region_corrections[0].correction.action,
             RegionCorrectionActionV1::SetText(text) if text == human_text
         ));
+        if let Some(proof_dir) = production_proof_dir {
+            let provenance_labels = [
+                "Provenance schema",
+                "Binding kind",
+                "Logical revision",
+                "Snapshot sequence",
+                "Projection source sequence",
+                "Ink binding SHA-256",
+                "Selected stroke count",
+                "Bound source sample count",
+                "Selection binding SHA-256",
+                "Projection identity SHA-256",
+                "Correction identity SHA-256",
+                "Provider identity SHA-256",
+                "Provider version",
+                "Model version",
+                "Resource version",
+                "Provider configuration fingerprint SHA-256",
+                "Export raster source SHA-256",
+                "Export raster spec SHA-256",
+                "Export PNG SHA-256",
+                "Export raster artifact SHA-256",
+                "Export PNG dimensions",
+            ];
+            let expected_provenance = provenance_labels
+                .iter()
+                .map(|label| {
+                    let prefix = format!("- {label}: ");
+                    let value = markdown
+                        .lines()
+                        .find_map(|line| line.strip_prefix(&prefix))
+                        .unwrap_or_else(|| panic!("Markdown provenance field missing: {label}"));
+                    serde_json::json!({ "label": label, "value": value })
+                })
+                .collect::<Vec<_>>();
+            let private_paths = [
+                &asset_root,
+                &provider_config_path,
+                &project_path,
+                &python_executable,
+                &worker_script,
+                &shared_dir,
+                &test_directory,
+                &export_path,
+                &proof_dir,
+            ];
+            let mut private_values = private_paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            private_values.extend(
+                private_paths
+                    .iter()
+                    .filter_map(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned()),
+            );
+            private_values.extend([
+                journal_id.to_owned(),
+                session_id.to_owned(),
+                target.stroke_id.clone(),
+                projection_id,
+                persisted.state.region_corrections[0]
+                    .correction
+                    .correction_id
+                    .clone(),
+                configuration_fingerprint.clone(),
+                "senocr-v1-fp32-local".to_owned(),
+                "VietAlphaLabs/SenOCR-Vi".to_owned(),
+                proof_dir
+                    .join("manifest.json")
+                    .to_string_lossy()
+                    .into_owned(),
+                proof_dir
+                    .join("expected-human-text.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]);
+            private_values.retain(|value| !value.is_empty());
+            let provider_transcript = persisted.state.recognition_projections[0]
+                .projection
+                .candidates
+                .iter()
+                .find(|candidate| candidate.rank == 0)
+                .map(|candidate| candidate.recognized_text.as_str())
+                .unwrap_or_default();
+            for segment in provider_transcript
+                .split(['\r', '\n'])
+                .filter(|segment| segment.chars().count() >= 8)
+            {
+                if !human_text.contains(segment) {
+                    private_values.push(segment.to_owned());
+                }
+            }
+            let png_digest: [u8; 32] = Sha256::digest(&png).into();
+            let png_sha256 = crate::export::hex_sha256(&png_digest).unwrap();
+            let manifest = serde_json::json!({
+                "schema_version": 1,
+                "expected_source": human_text,
+                "state_label": "Transcript source: saved user correction.",
+                "fallback_alt_text": "Original selected ink",
+                "png_sha256": png_sha256,
+                "expected_provenance": expected_provenance,
+                "forbidden_values": private_values,
+                "model_revision": MODEL_REVISION,
+            });
+            let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+            let manifest_path = proof_dir.join("manifest.json");
+            let mut manifest_file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(manifest_path)
+                .expect("create fresh temporary production export proof manifest");
+            std::io::Write::write_all(&mut manifest_file, &manifest_bytes)
+                .expect("write temporary production export proof manifest");
+            std::io::Write::flush(&mut manifest_file)
+                .expect("flush temporary production export proof manifest");
+            manifest_file
+                .sync_all()
+                .expect("sync temporary production export proof manifest");
+            let expected_text_path = proof_dir.join("expected-human-text.txt");
+            let mut expected_text_file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(expected_text_path)
+                .expect("create fresh temporary production source text");
+            std::io::Write::write_all(&mut expected_text_file, human_text.as_bytes())
+                .expect("write temporary production source text");
+            std::io::Write::flush(&mut expected_text_file)
+                .expect("flush temporary production source text");
+            expected_text_file
+                .sync_all()
+                .expect("sync temporary production source text");
+        }
     }
 
     fn release_marker_guarded_write(path: &std::path::Path) {

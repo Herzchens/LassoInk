@@ -1,5 +1,7 @@
 use sha2::{Digest, Sha256};
 use tiny_skia::{Color, Pixmap};
+#[cfg(feature = "document-export-fixture-emitter")]
+use tiny_skia::{FillRule, Paint, PathBuilder, Transform};
 
 use super::{
     ExportProvenanceV1, ExportRasterProvenanceV1, ExportRegionV1, ExportSourceBindingV1,
@@ -55,6 +57,45 @@ pub(super) fn synthetic_fixture(
         },
     };
 
+    (region, selected_ink_png)
+}
+
+/// Fixed, model-free grayscale source with an opaque background, antialiased
+/// midtone edges, and an interior midtone. This exercises PDF grayscale encoding
+/// independently of the colored corner marker used by the layout fixture.
+#[cfg(feature = "document-export-fixture-emitter")]
+pub(super) fn synthetic_grayscale_antialias_fixture(
+    text: Option<&str>,
+    transcript_origin: TranscriptOriginV1,
+) -> (ExportRegionV1, Vec<u8>) {
+    let mut pixmap = Pixmap::new(32, 32).expect("small grayscale synthetic pixmap allocates");
+    pixmap.fill(Color::from_rgba8(255, 255, 255, 255));
+
+    let mut path = PathBuilder::new();
+    path.move_to(4.25, 3.5);
+    path.line_to(28.5, 8.25);
+    path.line_to(21.0, 29.5);
+    path.line_to(6.5, 24.0);
+    path.close();
+    let path = path.finish().expect("grayscale antialias path is valid");
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(128, 128, 128, 255);
+    paint.anti_alias = true;
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+
+    let selected_ink_png = pixmap
+        .encode_png()
+        .expect("grayscale synthetic PNG encodes");
+    let png_digest: [u8; 32] = Sha256::digest(&selected_ink_png).into();
+    let png_sha256 = super::hex_sha256(&png_digest).expect("synthetic digest formats");
+    let (mut region, _colored_marker_png) = synthetic_fixture(text, transcript_origin);
+    region.provenance.raster.png_bytes_sha256 = png_sha256;
     (region, selected_ink_png)
 }
 

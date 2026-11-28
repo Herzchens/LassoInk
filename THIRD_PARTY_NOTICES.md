@@ -1,8 +1,15 @@
 # Third-party notices
 
-This file records attribution and license material for the pinned DOCX/PDF test dependency closure and the bundled Noto Sans face. `docx-rs` and `printpdf` are declared as development dependencies, and the serializer/fixture modules are test-only. These notices do not state that those crates are included in current product artifacts.
+This file records attribution and license material for the direct DOCX/PDF libraries, the bundled Noto Sans face, and selected transitive packages with additional or nonstandard notice obligations. It is not an exhaustive dependency inventory. `docx-rs` and `printpdf` are regular application dependencies; Markdown/HTML remain the default export selection, while DOCX/PDF are opt-in formats. The PDF serializer embeds a subset of Noto Sans; the DOCX serializer names Noto Sans and does not embed a font.
 
-The repository root [LICENSE](LICENSE) is the project's Apache License 2.0 text. For the dependencies below, source-published license files are preserved separately under `third_party_licenses/`, including package-specific Apache text and attribution lines. Cargo's slash-form license strings are reproduced as declared; the slash is not interpreted here.
+The repository root [LICENSE](LICENSE) is the project's Apache License 2.0 text. For the dependencies below, source-published license files are preserved separately under `third_party_licenses/`, including package-specific MIT/Apache text and attribution lines. Cargo's slash-form license strings are reproduced as declared; the slash is not interpreted here.
+
+## Direct DOCX/PDF libraries
+
+| Package | Locked checksum | Declared license | License text | Versioned source locator |
+| --- | --- | --- | --- | --- |
+| `docx-rs 0.4.22` | `7fdf00e8af6d0b3e92d4bbf9b76f773d8b84ea80f310324ad16cbdc2e653e02c` | `MIT` | [MIT](third_party_licenses/MIT-docx-rs.txt) — Copyright (c) 2020 bokuweb | [Published source](https://docs.rs/crate/docx-rs/0.4.22/source/); [license at the published source commit](https://github.com/bokuweb/docx-rs/blob/f04cf8b47a925b2b6fff850dcb75069aae89dab4/LICENSE) |
+| `printpdf 0.13.0` | `59188c84413d8fdaf0ca2f3b28a0151bbfa888961be523d314425a594c73e4d5` | `MIT` | [MIT](third_party_licenses/MIT-printpdf.txt) — Copyright (c) 2017 Felix Schütt | [Versioned source](https://github.com/fschutt/printpdf/tree/v0.13.0); [LICENSE](https://github.com/fschutt/printpdf/blob/v0.13.0/LICENSE) |
 
 ## Pathfinder geometry
 
@@ -14,7 +21,7 @@ The nine source copyright headers identify The Pathfinder Project Developers: 20
 
 `azul-simplecss 0.2.3` is locked with checksum `beea02de84f7d4c090ccf9a2bddcd0595105b35c2ed0c9a0ed66aca4b79559bd`. Its declared license is `MPL-2.0`; its authors are Reizner Evgeniy and Felix Schütt. The [published crate source](https://docs.rs/crate/azul-simplecss/0.2.3/source/) records `fschutt/simplecss` commit `debf5110c88e6077560417e88b3dd60d09264358`, and the crate's `LICENSE.txt` is preserved at [third_party_licenses/MPL-2.0-azul-simplecss.txt](third_party_licenses/MPL-2.0-azul-simplecss.txt).
 
-The published source package is available at [crates.io](https://crates.io/api/v1/crates/azul-simplecss/0.2.3/download), with the corresponding upstream source at [the pinned repository commit](https://github.com/fschutt/simplecss/tree/debf5110c88e6077560417e88b3dd60d09264358). If a distribution includes the MPL-covered code, recipients must be told how to obtain its source as required by MPL-2.0 Sections 3.1–3.2. This dependency is currently development-only and is not included in product artifacts.
+The published source package is available at [crates.io](https://crates.io/api/v1/crates/azul-simplecss/0.2.3/download), with the corresponding upstream source at [the pinned repository commit](https://github.com/fschutt/simplecss/tree/debf5110c88e6077560417e88b3dd60d09264358). This is a transitive dependency of the production PDF serializer. If a distributed binary includes the MPL-covered code, recipients must be told how to obtain its source as required by MPL-2.0 Sections 3.1–3.2; the versioned published source locator above identifies that code.
 
 ## unicode-properties
 
@@ -46,4 +53,4 @@ These newly added locked manifests use slash-form expressions. Both exact source
 
 ## Bundled Noto Sans face
 
-The repository includes the unmodified static Noto Sans Regular v2.015 face at [assets/fonts/NotoSans-Regular.ttf](assets/fonts/NotoSans-Regular.ttf), SHA-256 `478C558EA716033CD60C03438F628DFA75694DCF6B5F6D505A2F05FD2B4F3823`. The font is Copyright 2022 The Noto Project Authors and is distributed under SIL OFL 1.1; the accompanying full notice is [assets/fonts/OFL.txt](assets/fonts/OFL.txt). The pinned upstream source is [notofonts/latin-greek-cyrillic at `c4a321e123e4d4ff315f57f4e0adf294fe3a95be`](https://github.com/notofonts/latin-greek-cyrillic/tree/c4a321e123e4d4ff315f57f4e0adf294fe3a95be).
+The repository includes the unmodified static Noto Sans Regular v2.015 face at [assets/fonts/NotoSans-Regular.ttf](assets/fonts/NotoSans-Regular.ttf), SHA-256 `478C558EA716033CD60C03438F628DFA75694DCF6B5F6D505A2F05FD2B4F3823`. The font is Copyright 2022 The Noto Project Authors and is distributed under SIL OFL 1.1; the accompanying full notice is [assets/fonts/OFL.txt](assets/fonts/OFL.txt). PDF output embeds a subset of this face. DOCX output sets the font family name but contains no font file. The pinned upstream source is [notofonts/latin-greek-cyrillic at `c4a321e123e4d4ff315f57f4e0adf294fe3a95be`](https://github.com/notofonts/latin-greek-cyrillic/tree/c4a321e123e4d4ff315f57f4e0adf294fe3a95be).

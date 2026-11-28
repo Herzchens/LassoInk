@@ -4379,7 +4379,8 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 expected_head_ref.as_str(),
-                "feat/benchmark-fidelity"
+                "feat/document-exports"
+                    | "feat/benchmark-fidelity"
                     | "feat/benchmark-observability"
                     | "feat/benchmark-resources"
                     | "feat/experimental-convert"
@@ -4389,6 +4390,47 @@ pub(crate) mod tests {
         assert!(std::env::var("GITHUB_EVENT_NAME").is_ok_and(|actual| actual == "pull_request"));
         assert!(std::env::var("GITHUB_HEAD_REF").is_ok_and(|actual| actual == expected_head_ref));
         assert!(std::env::var("RUNNER_ARCH").is_ok_and(|actual| actual == "X64"));
+    }
+
+    #[cfg(windows)]
+    fn safe_provider_error_category(kind: &ProviderErrorKind) -> String {
+        match kind {
+            ProviderErrorKind::InvalidConfiguration(_) => "invalid_configuration".to_owned(),
+            ProviderErrorKind::InvalidRequest(_) => "invalid_request".to_owned(),
+            ProviderErrorKind::InvalidResponse(_) => "invalid_response".to_owned(),
+            ProviderErrorKind::ProtocolVersion { .. } => "protocol_version".to_owned(),
+            ProviderErrorKind::OversizedFrame { .. } => "oversized_frame".to_owned(),
+            ProviderErrorKind::TimedOut(_) => "timed_out".to_owned(),
+            ProviderErrorKind::Cancelled => "cancelled".to_owned(),
+            ProviderErrorKind::SpawnFailed(_) => "spawn_failed".to_owned(),
+            ProviderErrorKind::IoFailed { .. } => "io_failed".to_owned(),
+            ProviderErrorKind::WorkerExited { .. } => "worker_exited".to_owned(),
+            ProviderErrorKind::UnexpectedFrame(_) => "unexpected_frame".to_owned(),
+            ProviderErrorKind::UnsupportedCapability(_) => "unsupported_capability".to_owned(),
+            ProviderErrorKind::ProviderFailure { code, .. } => {
+                let safe_code = !code.is_empty()
+                    && code.len() <= 64
+                    && code
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+                if safe_code {
+                    format!("provider_failure:{code}")
+                } else {
+                    "provider_failure_unsafe_code".to_owned()
+                }
+            }
+            ProviderErrorKind::StaleSourceRevision => "stale_source_revision".to_owned(),
+            ProviderErrorKind::ProviderRequestMismatch => "provider_request_mismatch".to_owned(),
+            ProviderErrorKind::ProviderConfigurationMismatch => {
+                "provider_configuration_mismatch".to_owned()
+            }
+            ProviderErrorKind::WorkerThreadPanicked => "worker_thread_panicked".to_owned(),
+            ProviderErrorKind::UnsupportedPlatform => "unsupported_platform".to_owned(),
+            ProviderErrorKind::WorkerCapacityReached => "worker_capacity_reached".to_owned(),
+            ProviderErrorKind::WorkerSubsystemPoisoned => "worker_subsystem_poisoned".to_owned(),
+            ProviderErrorKind::ProcessCleanupFailed(_) => "process_cleanup_failed".to_owned(),
+            ProviderErrorKind::AllocationFailed => "allocation_failed".to_owned(),
+        }
     }
 
     pub(crate) struct MockWorkerBinary {
@@ -6491,8 +6533,11 @@ pub(crate) mod tests {
 
         let execution =
             run_senocr_worker_request(&python_executable, &worker_script, request.clone())
-                .unwrap_or_else(|_error| {
-                    panic!("the guarded local Raster worker returned a failure")
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "the guarded local Raster worker returned a failure category={}",
+                        safe_provider_error_category(&error.kind)
+                    )
                 });
         let result = &execution.result;
         assert_eq!(result.request_id, request.request_id);
@@ -7198,50 +7243,7 @@ pub(crate) mod tests {
                 Ok(_execution) => panic!("invalid Raster request unexpectedly succeeded"),
                 Err(error) => error,
             };
-            let actual_error_kind_code = match &error.kind {
-                ProviderErrorKind::ProviderFailure { code, .. } => {
-                    let safe_code = !code.is_empty()
-                        && code.len() <= 64
-                        && code.bytes().all(|byte| {
-                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
-                        });
-                    format!(
-                        "provider_failure:{}",
-                        if safe_code {
-                            code.as_str()
-                        } else {
-                            "<redacted>"
-                        }
-                    )
-                }
-                ProviderErrorKind::InvalidConfiguration(_) => "invalid_configuration".to_owned(),
-                ProviderErrorKind::InvalidRequest(_) => "invalid_request".to_owned(),
-                ProviderErrorKind::InvalidResponse(_) => "invalid_response".to_owned(),
-                ProviderErrorKind::ProtocolVersion { .. } => "protocol_version".to_owned(),
-                ProviderErrorKind::OversizedFrame { .. } => "oversized_frame".to_owned(),
-                ProviderErrorKind::TimedOut(_) => "timed_out".to_owned(),
-                ProviderErrorKind::Cancelled => "cancelled".to_owned(),
-                ProviderErrorKind::SpawnFailed(_) => "spawn_failed".to_owned(),
-                ProviderErrorKind::IoFailed { .. } => "io_failed".to_owned(),
-                ProviderErrorKind::WorkerExited { .. } => "worker_exited".to_owned(),
-                ProviderErrorKind::UnexpectedFrame(_) => "unexpected_frame".to_owned(),
-                ProviderErrorKind::UnsupportedCapability(_) => "unsupported_capability".to_owned(),
-                ProviderErrorKind::StaleSourceRevision => "stale_source_revision".to_owned(),
-                ProviderErrorKind::ProviderRequestMismatch => {
-                    "provider_request_mismatch".to_owned()
-                }
-                ProviderErrorKind::ProviderConfigurationMismatch => {
-                    "provider_configuration_mismatch".to_owned()
-                }
-                ProviderErrorKind::WorkerThreadPanicked => "worker_thread_panicked".to_owned(),
-                ProviderErrorKind::UnsupportedPlatform => "unsupported_platform".to_owned(),
-                ProviderErrorKind::WorkerCapacityReached => "worker_capacity_reached".to_owned(),
-                ProviderErrorKind::WorkerSubsystemPoisoned => {
-                    "worker_subsystem_poisoned".to_owned()
-                }
-                ProviderErrorKind::ProcessCleanupFailed(_) => "process_cleanup_failed".to_owned(),
-                ProviderErrorKind::AllocationFailed => "allocation_failed".to_owned(),
-            };
+            let actual_error_kind_code = safe_provider_error_category(&error.kind);
             assert!(
                 matches!(
                     &error.kind,

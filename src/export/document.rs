@@ -29,7 +29,7 @@ pub(super) struct DocumentViewV1 {
 }
 
 /// Projects the already-validated semantic IR into the small content surface
-/// supported by the DOCX and PDF feasibility serializers. It preserves NFD
+/// supported by the DOCX and PDF serializers. It preserves NFD
 /// text and distinguishes `None` from a present empty paragraph.
 pub(super) fn project_region(region: &ExportRegionV1) -> Result<DocumentViewV1, ExportError> {
     if region.schema_version != EXPORT_SCHEMA_VERSION {

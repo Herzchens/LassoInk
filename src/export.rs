@@ -35,11 +35,12 @@ use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileEx
 const EXPORT_SCHEMA_VERSION: u32 = 1;
 const MARKDOWN_FILE_NAME: &str = "document.md";
 const HTML_FILE_NAME: &str = "index.html";
+const DOCX_FILE_NAME: &str = "document.docx";
+const PDF_FILE_NAME: &str = "document.pdf";
 const INK_ASSET_FILE_NAME: &str = "assets/selected-region.png";
 const INK_ASSET_ALT_TEXT: &str = "Original selected ink";
 const MAX_EXPORT_DOCUMENT_BYTES: usize = MAX_JOURNAL_TEXT_BYTES * 8 + 16 * 1024;
-const MAX_EXPORT_BUNDLE_BYTES: usize =
-    MAX_CANONICAL_RASTER_PNG_BYTES + MAX_EXPORT_DOCUMENT_BYTES * 2;
+const MAX_EXPORT_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EXPORT_BINDING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EXPORT_SELECTED_STROKES: usize = 512;
 const MAX_EXPORT_SELECTED_SAMPLES: usize = 4096;
@@ -57,6 +58,136 @@ pub(crate) enum ExportError {
     OutputTooLarge,
     DestinationExists,
     IoFailure,
+    NoFormatsRequested,
+    IncompleteOutputSet,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExportFormat {
+    Markdown,
+    Html,
+    Docx,
+    Pdf,
+}
+
+impl ExportFormat {
+    pub(crate) const fn display_name(self) -> &'static str {
+        match self {
+            Self::Markdown => "Markdown",
+            Self::Html => "HTML",
+            Self::Docx => "DOCX",
+            Self::Pdf => "PDF",
+        }
+    }
+
+    pub(crate) const fn ui_label(self, selected: bool) -> &'static str {
+        match (self, selected) {
+            (Self::Markdown, true) => "[MD*]",
+            (Self::Markdown, false) => "[MD]",
+            (Self::Html, true) => "[HTML*]",
+            (Self::Html, false) => "[HTML]",
+            (Self::Docx, true) => "[DOCX*]",
+            (Self::Docx, false) => "[DOCX]",
+            (Self::Pdf, true) => "[PDF*]",
+            (Self::Pdf, false) => "[PDF]",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExportFormats {
+    pub markdown: bool,
+    pub html: bool,
+    pub docx: bool,
+    pub pdf: bool,
+}
+
+impl ExportFormats {
+    pub(crate) const DEFAULT: Self = Self {
+        markdown: true,
+        html: true,
+        docx: false,
+        pdf: false,
+    };
+
+    pub(crate) const fn any(self) -> bool {
+        self.markdown || self.html || self.docx || self.pdf
+    }
+
+    pub(crate) const fn contains(self, format: ExportFormat) -> bool {
+        match format {
+            ExportFormat::Markdown => self.markdown,
+            ExportFormat::Html => self.html,
+            ExportFormat::Docx => self.docx,
+            ExportFormat::Pdf => self.pdf,
+        }
+    }
+
+    pub(crate) fn toggle(&mut self, format: ExportFormat) -> bool {
+        let another_format_selected = match format {
+            ExportFormat::Markdown => self.html || self.docx || self.pdf,
+            ExportFormat::Html => self.markdown || self.docx || self.pdf,
+            ExportFormat::Docx => self.markdown || self.html || self.pdf,
+            ExportFormat::Pdf => self.markdown || self.html || self.docx,
+        };
+        let selected = match format {
+            ExportFormat::Markdown => &mut self.markdown,
+            ExportFormat::Html => &mut self.html,
+            ExportFormat::Docx => &mut self.docx,
+            ExportFormat::Pdf => &mut self.pdf,
+        };
+        if *selected && !another_format_selected {
+            return false;
+        }
+        *selected = !*selected;
+        true
+    }
+
+    pub(crate) fn selected_names(self) -> String {
+        [
+            ExportFormat::Markdown,
+            ExportFormat::Html,
+            ExportFormat::Docx,
+            ExportFormat::Pdf,
+        ]
+        .into_iter()
+        .filter(|format| self.contains(*format))
+        .map(ExportFormat::display_name)
+        .collect::<Vec<_>>()
+        .join(", ")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExportRequestError {
+    Export(ExportError),
+    Format {
+        format: ExportFormat,
+        error: ExportError,
+    },
+}
+
+impl From<ExportError> for ExportRequestError {
+    fn from(error: ExportError) -> Self {
+        Self::Export(error)
+    }
+}
+
+impl ExportRequestError {
+    #[cfg(test)]
+    fn into_export_error(self) -> ExportError {
+        match self {
+            Self::Export(error) | Self::Format { error, .. } => error,
+        }
+    }
+}
+
+fn format_failure(format: ExportFormat, error: ExportError) -> ExportRequestError {
+    if error == ExportError::Cancelled {
+        ExportRequestError::Export(error)
+    } else {
+        ExportRequestError::Format { format, error }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,8 +284,11 @@ pub(crate) struct ExportRegionV1 {
 #[derive(Debug)]
 pub(crate) struct ExportBundleV1 {
     pub region: ExportRegionV1,
-    pub markdown: Vec<u8>,
-    pub html: Vec<u8>,
+    pub formats: ExportFormats,
+    pub markdown: Option<Vec<u8>>,
+    pub html: Option<Vec<u8>>,
+    pub docx: Option<Vec<u8>>,
+    pub pdf: Option<Vec<u8>>,
     pub selected_ink_png: Vec<u8>,
 }
 
@@ -183,6 +317,7 @@ fn validate_export_target_path(target: &Path) -> bool {
 /// Builds owned output from one writer-acknowledged snapshot. The binding's
 /// source prefix may precede later derived rows; journal validation checks that
 /// its selected samples, captured view, and logical revision remain unchanged.
+#[cfg(test)]
 pub(crate) fn build_selected_region_bundle(
     state: &JournalReplayState,
     projection_id: &str,
@@ -190,11 +325,33 @@ pub(crate) fn build_selected_region_bundle(
     selected_strokes: &[StrokeRef],
     cancelled: &AtomicBool,
 ) -> Result<ExportBundleV1, ExportError> {
+    build_selected_region_bundle_with_formats(
+        state,
+        projection_id,
+        binding,
+        selected_strokes,
+        ExportFormats::DEFAULT,
+        cancelled,
+    )
+    .map_err(ExportRequestError::into_export_error)
+}
+
+pub(crate) fn build_selected_region_bundle_with_formats(
+    state: &JournalReplayState,
+    projection_id: &str,
+    binding: &ProjectionInkBindingV1,
+    selected_strokes: &[StrokeRef],
+    formats: ExportFormats,
+    cancelled: &AtomicBool,
+) -> Result<ExportBundleV1, ExportRequestError> {
+    if !formats.any() {
+        return Err(ExportError::NoFormatsRequested.into());
+    }
     if cancelled.load(Ordering::Acquire) {
-        return Err(ExportError::Cancelled);
+        return Err(ExportError::Cancelled.into());
     }
     if !selected_strokes_match_binding(selected_strokes, &binding.selected_strokes) {
-        return Err(ExportError::InvalidSelection);
+        return Err(ExportError::InvalidSelection.into());
     }
     state
         .validate_export_projection_binding(projection_id, binding)
@@ -268,26 +425,40 @@ pub(crate) fn build_selected_region_bundle(
             raster,
         },
     };
-    finish_export_bundle(region, selected_ink_png, cancelled)
+    finish_export_bundle(region, selected_ink_png, formats, cancelled)
 }
 
 /// Builds a local ink-only export for a durable selection with no stored
 /// recognition projection. This path creates no provider or M4 identities.
+#[cfg(test)]
 pub(crate) fn build_ink_only_bundle(
     state: &JournalReplayState,
     selected_strokes: &[StrokeRef],
     cancelled: &AtomicBool,
 ) -> Result<ExportBundleV1, ExportError> {
+    build_ink_only_bundle_with_formats(state, selected_strokes, ExportFormats::DEFAULT, cancelled)
+        .map_err(ExportRequestError::into_export_error)
+}
+
+pub(crate) fn build_ink_only_bundle_with_formats(
+    state: &JournalReplayState,
+    selected_strokes: &[StrokeRef],
+    formats: ExportFormats,
+    cancelled: &AtomicBool,
+) -> Result<ExportBundleV1, ExportRequestError> {
+    if !formats.any() {
+        return Err(ExportError::NoFormatsRequested.into());
+    }
     if cancelled.load(Ordering::Acquire) {
-        return Err(ExportError::Cancelled);
+        return Err(ExportError::Cancelled.into());
     }
     if selected_strokes.is_empty() || selected_strokes.len() > MAX_EXPORT_SELECTED_STROKES {
-        return Err(ExportError::InvalidSelection);
+        return Err(ExportError::InvalidSelection.into());
     }
     if state.recognition_projections.iter().any(|stored| {
         selected_strokes_match_binding(selected_strokes, &stored.projection.ink.selected_strokes)
     }) {
-        return Err(ExportError::StaleSource);
+        return Err(ExportError::StaleSource.into());
     }
     let (selected_ink_png, raster, canonical_order) =
         render_export_ink(state, selected_strokes, None, cancelled)?;
@@ -308,7 +479,7 @@ pub(crate) fn build_ink_only_bundle(
             continue;
         }
         if source_sample_sequences.len() >= MAX_EXPORT_SELECTED_SAMPLES {
-            return Err(ExportError::OutputTooLarge);
+            return Err(ExportError::OutputTooLarge.into());
         }
         source_sample_sequences
             .try_reserve(1)
@@ -354,7 +525,7 @@ pub(crate) fn build_ink_only_bundle(
             raster,
         },
     };
-    finish_export_bundle(region, selected_ink_png, cancelled)
+    finish_export_bundle(region, selected_ink_png, formats, cancelled)
 }
 
 fn render_export_ink(
@@ -425,25 +596,62 @@ fn render_export_ink(
 fn finish_export_bundle(
     region: ExportRegionV1,
     selected_ink_png: Vec<u8>,
+    formats: ExportFormats,
     cancelled: &AtomicBool,
-) -> Result<ExportBundleV1, ExportError> {
-    let markdown = render_markdown(&region)?;
-    let html = render_html(&region)?;
-    let total_bytes = markdown
-        .len()
-        .checked_add(html.len())
-        .and_then(|size| size.checked_add(selected_ink_png.len()))
-        .ok_or(ExportError::OutputTooLarge)?;
-    if total_bytes > MAX_EXPORT_BUNDLE_BYTES {
-        return Err(ExportError::OutputTooLarge);
+) -> Result<ExportBundleV1, ExportRequestError> {
+    if !formats.any() {
+        return Err(ExportError::NoFormatsRequested.into());
     }
+    let markdown = formats
+        .markdown
+        .then(|| render_markdown(&region))
+        .transpose()
+        .map_err(|error| format_failure(ExportFormat::Markdown, error))?;
     if cancelled.load(Ordering::Acquire) {
-        return Err(ExportError::Cancelled);
+        return Err(ExportError::Cancelled.into());
+    }
+    let html = formats
+        .html
+        .then(|| render_html(&region))
+        .transpose()
+        .map_err(|error| format_failure(ExportFormat::Html, error))?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled.into());
+    }
+    let docx = formats
+        .docx
+        .then(|| docx_serializer::serialize_docx_cancellable(&region, &selected_ink_png, cancelled))
+        .transpose()
+        .map_err(|error| format_failure(ExportFormat::Docx, error))?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled.into());
+    }
+    let pdf = formats
+        .pdf
+        .then(|| pdf_serializer::serialize_pdf_cancellable(&region, &selected_ink_png, cancelled))
+        .transpose()
+        .map_err(|error| format_failure(ExportFormat::Pdf, error))?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled.into());
+    }
+    let _published_set_bytes = checked_published_set_bytes(
+        formats,
+        markdown.as_deref(),
+        html.as_deref(),
+        docx.as_deref(),
+        pdf.as_deref(),
+        &selected_ink_png,
+    )?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ExportError::Cancelled.into());
     }
     Ok(ExportBundleV1 {
         region,
+        formats,
         markdown,
         html,
+        docx,
+        pdf,
         selected_ink_png,
     })
 }
@@ -493,7 +701,7 @@ fn hash_source_binding(binding: &ExportSourceBindingV1) -> Result<String, Export
     hex_sha256(&writer.finish())
 }
 
-fn hex_sha256(bytes: &[u8; 32]) -> Result<String, ExportError> {
+pub(super) fn hex_sha256(bytes: &[u8; 32]) -> Result<String, ExportError> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::new();
     output
@@ -1146,54 +1354,107 @@ where
     if cancelled.load(Ordering::Acquire) {
         return Err(ExportError::Cancelled);
     }
-    let total_bytes = bundle
-        .markdown
-        .len()
-        .checked_add(bundle.html.len())
-        .and_then(|size| size.checked_add(bundle.selected_ink_png.len()))
-        .ok_or(ExportError::OutputTooLarge)?;
-    if total_bytes > MAX_EXPORT_BUNDLE_BYTES
-        || bundle.selected_ink_png.is_empty()
-        || bundle.selected_ink_png.len() > MAX_CANONICAL_RASTER_PNG_BYTES
-    {
-        return Err(ExportError::OutputTooLarge);
-    }
+    let _published_set_bytes = checked_published_set_bytes(
+        bundle.formats,
+        bundle.markdown.as_deref(),
+        bundle.html.as_deref(),
+        bundle.docx.as_deref(),
+        bundle.pdf.as_deref(),
+        &bundle.selected_ink_png,
+    )?;
 
     let mut stage = OwnedStagingDirectory::create(target, export_id)?;
     if cancelled.load(Ordering::Acquire) {
         return Err(ExportError::Cancelled);
     }
-    write_create_new_with_sync(
-        &stage.path.join(MARKDOWN_FILE_NAME),
-        &bundle.markdown,
-        &mut sync_file,
-    )?;
-    if cancelled.load(Ordering::Acquire) {
-        return Err(ExportError::Cancelled);
+    if let Some(markdown) = bundle.markdown.as_deref() {
+        write_create_new_with_sync(
+            &stage.path.join(MARKDOWN_FILE_NAME),
+            markdown,
+            &mut sync_file,
+        )?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ExportError::Cancelled);
+        }
     }
-    write_create_new_with_sync(
-        &stage.path.join(HTML_FILE_NAME),
-        &bundle.html,
-        &mut sync_file,
-    )?;
-    if cancelled.load(Ordering::Acquire) {
-        return Err(ExportError::Cancelled);
+    if let Some(html) = bundle.html.as_deref() {
+        write_create_new_with_sync(&stage.path.join(HTML_FILE_NAME), html, &mut sync_file)?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ExportError::Cancelled);
+        }
     }
     let assets = stage.path.join("assets");
     fs::create_dir(&assets).map_err(|_| ExportError::IoFailure)?;
     write_create_new_with_sync(
-        &assets.join("selected-region.png"),
+        &stage.path.join(INK_ASSET_FILE_NAME),
         &bundle.selected_ink_png,
         &mut sync_file,
     )?;
     if cancelled.load(Ordering::Acquire) {
         return Err(ExportError::Cancelled);
     }
+    if let Some(docx) = bundle.docx.as_deref() {
+        write_create_new_with_sync(&stage.path.join(DOCX_FILE_NAME), docx, &mut sync_file)?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ExportError::Cancelled);
+        }
+    }
+    if let Some(pdf) = bundle.pdf.as_deref() {
+        write_create_new_with_sync(&stage.path.join(PDF_FILE_NAME), pdf, &mut sync_file)?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ExportError::Cancelled);
+        }
+    }
     before_publish(target).map_err(|_| ExportError::IoFailure)?;
     if cancelled.load(Ordering::Acquire) {
         return Err(ExportError::Cancelled);
     }
     stage.publish(target)
+}
+
+fn output_matches_selection(selected: bool, output: Option<&[u8]>, maximum: usize) -> bool {
+    match (selected, output) {
+        (false, None) => true,
+        (true, Some(bytes)) => !bytes.is_empty() && bytes.len() <= maximum,
+        _ => false,
+    }
+}
+
+fn checked_published_set_bytes(
+    formats: ExportFormats,
+    markdown: Option<&[u8]>,
+    html: Option<&[u8]>,
+    docx: Option<&[u8]>,
+    pdf: Option<&[u8]>,
+    selected_ink_png: &[u8],
+) -> Result<usize, ExportError> {
+    if !formats.any() {
+        return Err(ExportError::NoFormatsRequested);
+    }
+    if !output_matches_selection(formats.markdown, markdown, MAX_EXPORT_DOCUMENT_BYTES)
+        || !output_matches_selection(formats.html, html, MAX_EXPORT_DOCUMENT_BYTES)
+        || !output_matches_selection(formats.docx, docx, docx_serializer::MAX_DOCX_BYTES)
+        || !output_matches_selection(formats.pdf, pdf, pdf_serializer::MAX_PDF_BYTES)
+    {
+        return Err(ExportError::IncompleteOutputSet);
+    }
+    if selected_ink_png.is_empty() || selected_ink_png.len() > MAX_CANONICAL_RASTER_PNG_BYTES {
+        return Err(ExportError::OutputTooLarge);
+    }
+    let total_bytes = [
+        markdown.map_or(0, |bytes| bytes.len()),
+        html.map_or(0, |bytes| bytes.len()),
+        docx.map_or(0, |bytes| bytes.len()),
+        pdf.map_or(0, |bytes| bytes.len()),
+        selected_ink_png.len(),
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
+    .ok_or(ExportError::OutputTooLarge)?;
+    if total_bytes > MAX_EXPORT_BUNDLE_BYTES {
+        return Err(ExportError::OutputTooLarge);
+    }
+    Ok(total_bytes)
 }
 
 #[cfg(test)]
@@ -1312,17 +1573,13 @@ fn wide_path(path: &Path) -> Result<Vec<u16>, ExportError> {
     Ok(wide)
 }
 
-// Source-only feasibility scaffold. These serializers remain unavailable to
-// production exports until hosted renderer and text-mapping gates are reviewed.
-#[cfg(test)]
+// The semantic projection and serializers are also used by production exports.
 pub(super) mod document;
 #[cfg(test)]
 mod document_export_tests;
 #[cfg(test)]
 pub(super) mod document_fixtures;
-#[cfg(test)]
 pub(super) mod docx_serializer;
-#[cfg(test)]
 pub(super) mod pdf_serializer;
 
 #[cfg(test)]
@@ -1343,6 +1600,21 @@ mod tests {
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
     static NEXT_PUBLISH_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn published_set_cap_is_16_mib_and_counts_the_png_asset_once() {
+        assert_eq!(MAX_EXPORT_BUNDLE_BYTES, 16 * 1024 * 1024);
+        let formats = ExportFormats {
+            markdown: false,
+            html: false,
+            docx: true,
+            pdf: false,
+        };
+        assert_eq!(
+            checked_published_set_bytes(formats, None, None, Some(b"docx"), None, b"png-bytes",),
+            Ok(b"docx".len() + b"png-bytes".len())
+        );
+    }
 
     struct ExportJournalFixture {
         directory: PathBuf,
@@ -1892,7 +2164,7 @@ mod tests {
             TranscriptOriginV1::NoProviderCandidate
         );
         assert!(absent_bundle.region.paragraph.is_none());
-        let absent_markdown = String::from_utf8(absent_bundle.markdown).unwrap();
+        let absent_markdown = String::from_utf8(absent_bundle.markdown.unwrap()).unwrap();
         assert!(absent_markdown.contains("No provider transcript is available."));
         assert!(absent_markdown.contains("assets/selected-region.png"));
         assert!(
@@ -1948,7 +2220,7 @@ mod tests {
                 panic!("ink-only export fabricated a projection binding")
             }
         }
-        let markdown = String::from_utf8(bundle.markdown).unwrap();
+        let markdown = String::from_utf8(bundle.markdown.unwrap()).unwrap();
         assert!(markdown.contains("ink-only export"));
         assert!(markdown.contains("Binding kind: ink only"));
         assert!(!markdown.contains("Projection identity SHA-256"));
@@ -2132,17 +2404,17 @@ mod tests {
         assert_eq!(bundle.selected_ink_png, bound_source_png);
         assert_ne!(bundle.selected_ink_png, other_source_png);
         assert!(
-            String::from_utf8(bundle.markdown.clone())
+            String::from_utf8(bundle.markdown.as_ref().unwrap().clone())
                 .unwrap()
                 .contains("NFD e\u{301}")
         );
         assert!(
-            String::from_utf8(bundle.html.clone())
+            String::from_utf8(bundle.html.as_ref().unwrap().clone())
                 .unwrap()
                 .contains("NFD e\u{301}")
         );
-        let markdown = String::from_utf8(bundle.markdown.clone()).unwrap();
-        let html = String::from_utf8(bundle.html.clone()).unwrap();
+        let markdown = String::from_utf8(bundle.markdown.as_ref().unwrap().clone()).unwrap();
+        let html = String::from_utf8(bundle.html.as_ref().unwrap().clone()).unwrap();
         assert!(markdown.contains("Projection identity SHA-256"));
         assert!(!markdown.contains(fixture.projection_id.as_str()));
         assert!(markdown.contains("Provider identity SHA-256"));
@@ -2175,6 +2447,127 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn selected_docx_and_pdf_are_published_as_one_durable_no_clobber_set() {
+        let fixture = ExportJournalFixture::new(Some("NFD e\u{301}\nsecond line"));
+        let formats = ExportFormats {
+            markdown: true,
+            html: true,
+            docx: true,
+            pdf: true,
+        };
+        let bundle = build_selected_region_bundle_with_formats(
+            &fixture.state(),
+            &fixture.projection_id,
+            &fixture.binding,
+            std::slice::from_ref(&fixture.target),
+            formats,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(bundle.formats, formats);
+        assert!(bundle.docx.is_some());
+        assert!(bundle.pdf.is_some());
+
+        let parent = std::env::temp_dir().join(format!(
+            "lassoink-all-format-publish-{}-{}",
+            std::process::id(),
+            NEXT_PUBLISH_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let target = parent.join("complete-set");
+        publish_export_bundle(&target, &bundle, 20, &AtomicBool::new(false)).unwrap();
+        assert!(target.join(MARKDOWN_FILE_NAME).is_file());
+        assert!(target.join(HTML_FILE_NAME).is_file());
+        assert!(target.join(DOCX_FILE_NAME).is_file());
+        assert!(target.join(PDF_FILE_NAME).is_file());
+        assert!(target.join(INK_ASSET_FILE_NAME).is_file());
+        assert!(
+            fs::read(target.join(DOCX_FILE_NAME))
+                .unwrap()
+                .starts_with(b"PK\x03\x04")
+        );
+        assert!(
+            fs::read(target.join(PDF_FILE_NAME))
+                .unwrap()
+                .starts_with(b"%PDF-")
+        );
+
+        let collision = parent.join("existing-set");
+        fs::create_dir(&collision).unwrap();
+        fs::write(collision.join("sentinel.txt"), b"preserve me").unwrap();
+        assert_eq!(
+            publish_export_bundle(&collision, &bundle, 21, &AtomicBool::new(false)),
+            Err(ExportError::DestinationExists)
+        );
+        assert_eq!(
+            fs::read(collision.join("sentinel.txt")).unwrap(),
+            b"preserve me"
+        );
+
+        let canceled = parent.join("canceled-set");
+        let cancellation = AtomicBool::new(false);
+        assert_eq!(
+            publish_export_bundle_with_hooks(
+                &canceled,
+                &bundle,
+                22,
+                &cancellation,
+                |file| file.sync_all(),
+                |_| {
+                    cancellation.store(true, Ordering::Release);
+                    Ok(())
+                },
+            ),
+            Err(ExportError::Cancelled)
+        );
+        assert!(!canceled.exists());
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 2);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn single_docx_publication_includes_the_exact_selected_png_asset() {
+        let fixture = ExportJournalFixture::new(Some("single format fixture"));
+        let formats = ExportFormats {
+            markdown: false,
+            html: false,
+            docx: true,
+            pdf: false,
+        };
+        let bundle = build_selected_region_bundle_with_formats(
+            &fixture.state(),
+            &fixture.projection_id,
+            &fixture.binding,
+            std::slice::from_ref(&fixture.target),
+            formats,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let selected_png = bundle.selected_ink_png.clone();
+        let parent = std::env::temp_dir().join(format!(
+            "lassoink-docx-only-publish-{}-{}",
+            std::process::id(),
+            NEXT_PUBLISH_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&parent).unwrap();
+        let target = parent.join("docx-only");
+
+        publish_export_bundle(&target, &bundle, 23, &AtomicBool::new(false)).unwrap();
+
+        assert!(target.join(DOCX_FILE_NAME).is_file());
+        assert_eq!(
+            fs::read(target.join(INK_ASSET_FILE_NAME)).unwrap(),
+            selected_png
+        );
+        assert!(!target.join(MARKDOWN_FILE_NAME).exists());
+        assert!(!target.join(HTML_FILE_NAME).exists());
+        assert!(!target.join(PDF_FILE_NAME).exists());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
     #[cfg(all(test, windows))]
     #[test]
     #[ignore = "guarded hosted Windows export bundle publication and cleanup"]
@@ -2195,6 +2588,27 @@ mod tests {
             NEXT_PUBLISH_TEST_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&parent).unwrap();
+        let mut incomplete_bundle = build_selected_region_bundle(
+            &fixture.state(),
+            &fixture.projection_id,
+            &fixture.binding,
+            std::slice::from_ref(&fixture.target),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        incomplete_bundle.formats.docx = true;
+        let missing_output_target = parent.join("missing-output-set");
+        assert_eq!(
+            publish_export_bundle(
+                &missing_output_target,
+                &incomplete_bundle,
+                19,
+                &AtomicBool::new(false),
+            ),
+            Err(ExportError::IncompleteOutputSet)
+        );
+        assert!(!missing_output_target.exists());
+
         let target = parent.join("new-bundle");
         publish_export_bundle(&target, &bundle, 1, &AtomicBool::new(false)).unwrap();
         let markdown = fs::read(target.join(MARKDOWN_FILE_NAME)).unwrap();
@@ -2305,8 +2719,14 @@ mod tests {
                     let staged_markdown = fs::read(late_stage.join(MARKDOWN_FILE_NAME))?;
                     let staged_html = fs::read(late_stage.join(HTML_FILE_NAME))?;
                     let staged_png = fs::read(late_stage.join(INK_ASSET_FILE_NAME))?;
-                    assert_eq!(staged_markdown.as_slice(), bundle.markdown.as_slice());
-                    assert_eq!(staged_html.as_slice(), bundle.html.as_slice());
+                    assert_eq!(
+                        staged_markdown.as_slice(),
+                        bundle.markdown.as_ref().unwrap().as_slice()
+                    );
+                    assert_eq!(
+                        staged_html.as_slice(),
+                        bundle.html.as_ref().unwrap().as_slice()
+                    );
                     assert_eq!(staged_png.as_slice(), bundle.selected_ink_png.as_slice());
                     fs::create_dir(target)?;
                     fs::write(target.join("sentinel.txt"), b"late destination remains")?;

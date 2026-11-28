@@ -146,6 +146,38 @@ def decode_png_rows(data: bytes, name: str) -> tuple[int, int, int, int, list[by
     return width, height, color_type, channels, rows
 
 
+def inspect_grayscale_antialias_png(data: bytes, name: str) -> dict[str, int]:
+    width, height, color_type, channels, rows = decode_png_rows(data, name)
+    require(color_type == 6 and channels == 4, "grayscale antialias fixture must retain RGBA samples")
+    alpha_values: set[int] = set()
+    midtone_values: set[int] = set()
+    edge_midtone_values: set[int] = set()
+    for row in rows:
+        for offset in range(0, len(row), 4):
+            red, green, blue, alpha = row[offset : offset + 4]
+            require(red == green == blue, "grayscale antialias fixture contains colored pixels")
+            alpha_values.add(alpha)
+            if alpha > 0 and 0 < red < 255:
+                midtone_values.add(red)
+            if alpha == 255 and 128 < red < 255:
+                edge_midtone_values.add(red)
+    require(bool(midtone_values), "grayscale antialias fixture is missing midtone samples")
+    require(alpha_values == {255}, "grayscale antialias fixture must be fully opaque")
+    require(
+        len(edge_midtone_values) >= 2,
+        "grayscale antialias fixture is missing distinct opaque edge-midtone levels",
+    )
+    return {
+        "source_png_width": width,
+        "source_png_height": height,
+        "source_png_color_type": color_type,
+        "source_alpha_min": min(alpha_values),
+        "source_alpha_max": max(alpha_values),
+        "grayscale_midtone_level_count": len(midtone_values),
+        "antialiased_edge_midtone_level_count": len(edge_midtone_values),
+    }
+
+
 def marker_color(pixel: tuple[int, int, int, int]) -> str | None:
     red, green, blue, alpha = pixel
     if alpha < 128:
@@ -670,6 +702,11 @@ def main() -> None:
     )
     require(by_name["nfc-vietnamese"]["source_text"] == "[[NFC: ấ]]", "NFC Vietnamese source scalars changed")
     require(
+        by_name["mixed-normalization-ligatures"]["source_text"]
+        == "[[MIXED: ấ | a\u0302\u0301 | repeated repeated | office fi fl ffi]]",
+        "mixed normalization and ligature fixture changed",
+    )
+    require(
         manifest.get("unsupported_pdf_scalars_rejected")
         == ["U+0001", "U+000B", "U+000C", "U+007F", "U+0085", "U+009F", "U+2028", "U+2029"],
         "PDF control-rejection fixture changed",
@@ -683,13 +720,30 @@ def main() -> None:
     docx_checks: list[dict[str, object]] = []
     docx_paths: list[Path] = []
     docx_state_by_name: dict[str, str] = {}
+    docx_png_hash_by_name: dict[str, str] = {}
     case_by_pdf_name: dict[str, dict[str, object]] = {}
+    grayscale_antialias_image_proof: dict[str, int] | None = None
     for case in manifest["cases"]:
         docx_name = safe_fixture_name(case["docx"])
         docx_path = fixture_root / docx_name
         require(docx_path.is_file() and docx_path.stat().st_size <= MAX_DOCX_BYTES, f"DOCX exceeds the 4 MiB output cap: {docx_name}")
+        case_png_name = safe_fixture_name(case.get("png", manifest["selected_ink_png"]))
+        case_png_bytes = (fixture_root / case_png_name).read_bytes()
+        case_png_hash = case.get("png_sha256", expected_png_hash)
+        require(sha256(case_png_bytes) == case_png_hash, "fixture PNG hash differs from its case manifest")
+        require(len(case_png_bytes) <= MAX_PNG_BYTES, "fixture PNG exceeds the 2 MiB raster cap")
+        if case.get("image_fixture_kind") is not None:
+            require(
+                case.get("image_fixture_kind") == "grayscale-antialiased-midtone"
+                and case["name"] == "grayscale-antialias"
+                and grayscale_antialias_image_proof is None,
+                "grayscale antialias fixture identity changed",
+            )
+            grayscale_antialias_image_proof = inspect_grayscale_antialias_png(
+                case_png_bytes, case_png_name
+            )
         text, page_breaks, relationship_count, paragraph_texts = check_docx(
-            docx_path, case["png_sha256"], fallback_alt_text
+            docx_path, case_png_hash, fallback_alt_text
         )
         expected_text = case["source_text"]
         check_exact_docx_transcript(paragraph_texts, case["state_label"], expected_text, docx_name)
@@ -702,7 +756,13 @@ def main() -> None:
         })
         docx_paths.append(docx_path)
         docx_state_by_name[docx_name] = case["state_label"]
+        docx_png_hash_by_name[docx_name] = case_png_hash
         case_by_pdf_name[case["pdf"]] = case
+
+    require(
+        grayscale_antialias_image_proof is not None,
+        "grayscale antialias PDF image fixture is missing",
+    )
 
     c1_docx_name = safe_fixture_name(manifest["xml_valid_controls_docx"])
     c1_docx_path = fixture_root / c1_docx_name
@@ -723,6 +783,7 @@ def main() -> None:
     })
     docx_paths.append(fixture_root / c1_docx_name)
     docx_state_by_name[c1_docx_name] = c1_state_label
+    docx_png_hash_by_name[c1_docx_name] = expected_png_hash
 
     proof_source = args.proof_source.resolve(strict=True)
     class_dir = scratch / "pdfbox-classes"
@@ -770,6 +831,8 @@ def main() -> None:
     pdf_proofs: list[dict[str, object]] = []
     for pdf_path in generated_pdfs:
         case = case_by_pdf_name[pdf_path.name]
+        case_png_name = safe_fixture_name(case.get("png", manifest["selected_ink_png"]))
+        case_png_hash = case.get("png_sha256", expected_png_hash)
         expected = strict_cases.get(pdf_path.name)
         state_label = case["state_label"]
         expected_path = scratch / f"expected-pdf-{pdf_path.stem}.txt"
@@ -781,7 +844,7 @@ def main() -> None:
             pdf_path,
             expected,
             manifest["pdf_page_limit"],
-            fixture_root / manifest["selected_ink_png"],
+            fixture_root / case_png_name,
             expected_path,
             proof_path,
         )
@@ -816,9 +879,11 @@ def main() -> None:
                 json.dumps(proof, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
+        if case.get("image_fixture_kind") == "grayscale-antialiased-midtone":
+            proof["source_png_grayscale_antialias_fixture"] = grayscale_antialias_image_proof
         provenance_excerpt = check_extracted_text(
             extracted_text,
-            expected_png_hash,
+            case_png_hash,
             expected,
             state_label,
             pdf_path.name,
@@ -847,7 +912,7 @@ def main() -> None:
         docx_name = f"{pdf_path.stem}.docx"
         provenance_excerpt = check_extracted_text(
             extracted_text,
-            expected_png_hash,
+            docx_png_hash_by_name[docx_name],
             None,
             docx_state_by_name[docx_name],
             pdf_path.name,
@@ -885,6 +950,7 @@ def main() -> None:
         "max_input_bytes": manifest["maximum_input_utf8_bytes"],
         "max_logical_lines": manifest["maximum_logical_lines"],
         "pdf_page_limit": manifest["pdf_page_limit"],
+        "grayscale_antialias_image_proof": grayscale_antialias_image_proof,
     }
     summary_path = proof_root / "qa-summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -894,5 +960,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:  # preserve a failing workflow result with concise diagnostics
-        print(f"document-export feasibility QA failed: {error}", file=sys.stderr)
+        print(f"document export QA failed: {error}", file=sys.stderr)
         raise

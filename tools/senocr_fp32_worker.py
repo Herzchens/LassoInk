@@ -537,6 +537,7 @@ def _decode_png_rgb(
 
 SENOCR_E2E_ALLOWED_HEAD_REFS = frozenset(
     {
+        "feat/document-exports",
         "feat/benchmark-fidelity",
         "feat/benchmark-observability",
         "feat/benchmark-resources",

@@ -23,6 +23,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 REPOSITORY = "Herzchens/LassoInk"
 ALLOWED_BRANCHES = frozenset(
     {
+        "feat/document-exports",
         "feat/benchmark-fidelity",
         "feat/benchmark-observability",
         "feat/benchmark-resources",
